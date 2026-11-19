@@ -1304,8 +1304,9 @@ lane planning, the eight-lane cap and card positions still read every declared
 prerequisite. A card therefore does not move when a prerequisite merges.
 
 Selecting a card emphasises its drawn and dashed outstanding arrows and marks
-only the cards at the other end of those connections. Selecting a provider whose
-dependents are all merged marks nothing. To see a provider in a finished row,
+only the cards at the other end of those connections. Selecting a provider that
+is merged on `main` marks no dependent, because its merge satisfies every
+connection to its dependents. To see a provider in a finished row,
 uncheck **Hide terminal rows**.
 
 A card with no outstanding prerequisite turns teal and says "No outstanding
