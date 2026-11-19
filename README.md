@@ -29,13 +29,16 @@ remains available in the [sample walkthrough](examples/sample-specifications/REA
 
 The board brings work from multiple projects into one view, with project columns
 and rows for planning, queued work, implementation, fixes, review, completion,
-and archived work. Dependency connections help you follow relationships within
-and across projects through prerequisite and dependent links on cards.
+and archived work. Dependency arrows follow relationships within and across
+projects. An arrow shows only an outstanding prerequisite: not merged on `main`,
+of unknown merge state, unresolved, or not listed in the served checkouts
+document. The work item panel's **Needs** list names the selected card's
+outstanding prerequisites, with the reason for each.
 
 Search helps you find work by its title, project, or program—a named group of
 related specifications. Mark finished stages in **Board settings** and use
 **Hide terminal rows** to focus on unfinished work. Uncheck it to reveal finished
-rows and their dependency connections.
+rows.
 
 The **Repositories** view, chosen with the switch in the header, shows the git
 state of your configured checkout folders beside the board: a **Needs
@@ -188,11 +191,11 @@ project and stage; its contents supply its title and other recorded information.
 The [workspace guide](docs/workspaces.md) walks through your first specification,
 moving work between stages, and adding dependencies when you need them.
 
-Progress and dependency information comes from your specification files. A card
-shows links to its resolved prerequisite and dependent items, and shows
-**unresolved target** only when a relationship cannot be resolved; a card with
-no relationships has no dependency marker. These links report only recorded
-relationships and do not imply implementation approval or completion.
+Progress and dependency information comes from your specification files. The
+work item panel's **Needs** list names the prerequisites still outstanding for a
+card. It shows **unresolved target** only when a relationship cannot be resolved.
+A card with nothing outstanding has no **Needs** list. The list reports only
+recorded relationships and does not imply implementation approval or completion.
 
 ## Working with coding agents
 

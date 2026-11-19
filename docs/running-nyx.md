@@ -1296,10 +1296,26 @@ values. A difference is a finding to file, not a documentation change.
 ## Read and refresh the board
 
 Use **Search** to search card metadata, including work item titles, projects,
-and program names. Arrows show prerequisite and dependent links; selecting a card
-highlights its connections to other displayed cards, draws every one of them,
-and marks the cards at their other ends. To see a provider in a
-finished row, uncheck **Hide terminal rows**.
+and program names. The board draws an arrow only for a prerequisite that is
+outstanding. A prerequisite is outstanding when it is not merged on `main` or
+its merge state is unknown. It is also outstanding when its target did not
+resolve or the served checkouts document does not list its target. Column depth,
+lane planning, the eight-lane cap and card positions still read every declared
+prerequisite. A card therefore does not move when a prerequisite merges.
+
+Selecting a card emphasises its drawn and dashed outstanding arrows and marks
+only the cards at the other end of those connections. Selecting a provider whose
+dependents are all merged marks nothing. To see a provider in a finished row,
+uncheck **Hide terminal rows**.
+
+A card with no outstanding prerequisite turns teal and says "No outstanding
+prerequisite." as its start text for a screen reader. Neither signal depends on
+what the board displays or on what the search hides. A card with an outstanding
+prerequisite that has no drawn arrow shows one marker, "Prerequisite not
+drawn". It marks an unresolved target or a prerequisite card the board does not
+display, whether **Hide terminal rows** or the search box hides it. It also
+marks an edge without a free lane and a card sharing a Package ID.
+
 Right-click a card to copy the full directory path of its work item. Nyx shows
 a brief confirmation beside the card when the copy succeeds.
 
@@ -1332,11 +1348,11 @@ The **work item panel** on the left shows the selected card in brief. A left or
 right click on a card fills it; a left click on the selected card clears it,
 and a right click never does. Under the title the panel shows the package path
 on one line, which names the project, stage and folder. It then lists the work
-item's status, its program and, when it differs from the project, its target
-folder, each only when the specification declares it; then **Needs** and
-**Blocks**, each relationship a link that selects the card it names; then,
-under **Code**, what the last checkout scan says of the work item, each part
-only when the scan has it: its Code Status, the target repo when the target is
+item's status and program, and its target folder when that differs from the
+project. Each part appears only when the specification declares it. After
+those, **Needs** lists the card's outstanding prerequisites. The **Code** part
+then shows what the last checkout scan says of the work item, each part only
+when the scan has it: its Code Status, the target repo when the target is
 not matched to a clone or worktree, its branch, the attention items that name it,
 the baseline line with its words, and the other checkouts of the work item. The
 **Code** part follows the same rule as the Code Status tag below and is absent
@@ -1350,6 +1366,20 @@ disclosure ends with the baseline line's legend naming `B`, `C`, `M`, the fork, 
 arm, the main count, the ring and its places, `?` and the cached underline. It is not drawn
 when it would hold no row. It stays open or closed as you left it for as long as
 the page is open, across selections and scans, and is not remembered afterwards.
+
+**Needs** names exactly the selected card's outstanding prerequisites, read
+from the full catalog. An entry is a link that selects the prerequisite's card
+when the board displays that card, and plain text when it does not. Each entry
+states its reason: "not merged", "merge state unknown", or "unresolved
+target". A prerequisite in a row that **Hide terminal rows** removes adds "in
+a finished row, hidden" after the merge words. The search box changes neither
+the list nor whether an entry is a link. A card with nothing outstanding has no
+**Needs** list.
+
+A prerequisite whose branch was deleted reads "merge state unknown" while
+GitHub lookup is off. Turning on [GitHub lookup](#inspect-checkouts) lets Nyx
+read the merged pull request, and the word can then clear.
+
 Keyboard focus inside the panel is kept whenever the panel is rewritten: a
 relationship link stays focused and so does the **All fields** summary, and
 focus otherwise returns to the panel title. **Hide details** collapses the panel
@@ -1368,7 +1398,10 @@ folder name, holding the same text `nyx checkouts --json` gives for that package
 Nyx reads it from its last successful checkout scan, and it rescans about once a
 minute while a board page is open, so the line updates on its own;
 **Search** covers it. While Nyx has no scan to serve, no card
-shows a line and the issues panel says `Code Status unavailable`. The lines are
+shows a line and the issues panel says `Code Status unavailable`. With no scan
+served, every declared prerequisite is outstanding. The board then draws every
+arrow, no marker shows, and only a card that declares no prerequisite is teal.
+The lines are
 also hidden, with no message, while the board displays a configuration other
 than the one the scan was made under: for up to about 75 seconds after a Board
 settings save on the same page, until the checkouts read that a checkout folder
@@ -1397,14 +1430,15 @@ changing setup, the catalog, or the saved completion policy.
 
 Search filters cards and their visible dependency rails without changing the
 project and stage axes. Compact view does not override **Hide terminal rows**.
-Each project column reserves at most eight arrow lanes. A relationship that
-gets no arrow lane is drawn, dashed, while either of its cards is selected, and
-the work item panel lists every relationship of the selected card by name.
-Cards do not print their relationships; each carries them as `needs:` and
-`blocks:` screen-reader text, which search does not remove. Only a relationship
-that can never be an arrow is written on its card: a prerequisite Nyx could not
-resolve, as `needs: unresolved target`, and the relationships of cards that
-share a Package ID, as visible `needs:` or `blocks:` text.
+Each project column reserves at most eight arrow lanes.
+
+Lane planning reads every declared relationship, merged or not, so a merged
+relationship can hold a lane that an outstanding one needs. An outstanding
+relationship that gets no arrow lane is drawn, dashed, while either of its
+cards is selected. Its dependent shows the marker. Cards do not print their
+relationships. The work item panel's **Needs** list names every outstanding
+prerequisite of the selected card.
+
 Incomplete or unavailable dimensions remain visible with an
 `incomplete / unavailable` notice; Nyx does not compact them as if they were
 empty. If a refresh returns malformed data, Nyx reports the refresh failure and
@@ -1753,8 +1787,8 @@ repeatable browser session; it does not add a permanent screenshot framework.
   empty rows and columns** to inspect confirmed-empty dimensions. An incomplete
   discovery is reported separately and must not be treated as confirmation that
   a directory is empty.
-- A dependency shows **unresolved target**, or a work item looks wrong: check
-  **Workspace issues** first for an unreadable directory or specification file
+- The panel's **Needs** list shows **unresolved target**, or a work item looks
+  wrong: check **Workspace issues** first for an unreadable directory or specification file
   that made identity coverage incomplete. If it is empty, check that the
   prerequisite UUID and the target's `Package ID` are lowercase version 4 and
   unique, because an invalid or duplicate ID produces no Workspace-issues entry,

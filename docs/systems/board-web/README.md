@@ -11,13 +11,22 @@ README is narrative only.
   the active workspace's checkout folders and GitHub lookup, through
   `application-serving`'s HTTP routes: the board-settings `PUT` and the
   checkout settings `PUT`.
-- Shows each card's title, folder name and tags, and draws relationships as
-  arrows only: a card prints only a relationship that can never be an arrow (an
-  unresolved prerequisite, or any relationship of a card that shares its
-  Package ID), and carries the rest as screen-reader text. Each column plans at most eight arrow
-  lanes; a relationship left without one is drawn while either of its cards is
-  selected, and the cards at the other end of the selected card's relationships
-  are marked.
+- Shows each card's title, folder name and tags. It draws an arrow only for an
+  outstanding prerequisite. A prerequisite is outstanding when it is not merged
+  on `main` or its merge state is unknown. It is also outstanding when its
+  target is unresolved or the served checkouts document does not list that
+  target. Column depth, lane planning, the eight-lane cap and card positions
+  read every declared relationship, so a card does not move when a prerequisite
+  merges. A card with no outstanding prerequisite takes the teal surface and the
+  start text "No outstanding prerequisite." together. These two signals ignore
+  what the board shows and what the search hides. A card whose outstanding
+  prerequisite has no drawn arrow shows one marker, "Prerequisite not drawn".
+  It covers an unresolved target and a prerequisite card the board does not
+  show. It also covers an edge without a free lane and a card sharing a Package
+  ID. Each column plans at most eight arrow lanes. An outstanding relationship
+  left without one is drawn, dashed, while either of its cards is selected.
+  Selecting a card emphasises its outstanding arrows, drawn or dashed, and
+  marks only the cards at the other end of those connections.
 - Installs a changed catalog itself at the next ten-second check, or at once
   when the page becomes visible or the window regains focus, with no button and
   no pending state. It keeps the reader's place across an install: the selected
@@ -32,8 +41,9 @@ README is narrative only.
   on a card (a right click also copies the directory path and never clears the
   selection): under the title the package path on one line, then the default
   fields (Status, Program, and Target Folder only when it differs from the
-  project, each only when declared), the relationships as links that select the
-  card they name, and, from the served checkout document, a Code section of
+  project, each only when declared), the **Needs** list of the card's
+  outstanding prerequisites, and, from the served checkout document, a Code
+  section of
   Code Status, the target repo only when it is not matched to a clone or
   worktree, the branch, the attention items that name the work item, the
   baseline line with its words, and where it applies the other checkouts.
@@ -47,6 +57,14 @@ README is narrative only.
   panel is written only when its markup changes, opening or closing the
   disclosure never rewrites it, and whether the panel is open is a
   browser-local preference.
+- Names the card's outstanding prerequisites in the **Needs** list, read from
+  the full catalog. An entry is a link when the board shows the prerequisite's
+  card, and plain text otherwise. An unresolved prerequisite reads its reason
+  word alone. Each entry states its reason: "not merged", "merge state unknown"
+  or "unresolved target". A prerequisite in a row that **Hide terminal rows**
+  removes adds "in a finished row, hidden" after the merge words. The search
+  box changes neither the list nor whether an entry is a link, and a card with
+  nothing outstanding has no **Needs** list.
 - Reads the checkouts document those routes serve, and shows each card's
   Code Status tag, the check mark of a baseline line whose `C`, `M` and `B` are
   all green, one tag per attention item naming the card (all but an
