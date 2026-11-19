@@ -6636,6 +6636,7 @@ READINESS_UNLISTED_ID = "123e4567-e89b-42d3-a456-426614174b09"
 READINESS_UNLISTED_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0a"
 READINESS_MISSING_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0b"
 READINESS_ENTRYLESS_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0c"
+READINESS_COMPLETION_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b11"
 READINESS_TWIN_ID = "123e4567-e89b-42d3-a456-426614174b0d"
 READINESS_HIDDEN_ID = "123e4567-e89b-42d3-a456-426614174b0e"
 READINESS_HIDDEN_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0f"
@@ -6672,6 +6673,7 @@ READINESS_READY = READINESS_UNDECLARED | {
     "Alpha/Queue/merged-dependent",
     "Alpha/Queue/satisfied-dependent",
     "Alpha/Queue/entryless-dependent",
+    "Alpha/Queue/completion-dependent",
 }
 # Every card whose outstanding prerequisite the board does not draw.
 READINESS_MARKED = {
@@ -6686,6 +6688,7 @@ READINESS_PLANNED = {
     (READINESS_MERGED_ID, READINESS_MERGED_DEPENDENT_ID),
     (READINESS_MERGED_ID, READINESS_SATISFIED_DEPENDENT_ID),
     (READINESS_MERGED_ID, READINESS_ENTRYLESS_DEPENDENT_ID),
+    (READINESS_MERGED_ID, READINESS_COMPLETION_DEPENDENT_ID),
     (READINESS_UNMERGED_ID, READINESS_UNMERGED_DEPENDENT_ID),
     (READINESS_UNMERGED_ID, READINESS_OPEN_DEPENDENT_ID),
     (READINESS_UNKNOWN_ID, READINESS_UNKNOWN_DEPENDENT_ID),
@@ -6720,9 +6723,10 @@ def readiness_payload():
     """One column whose every declared prerequisite states its own merge outcome.
 
     The prerequisites cover a merged target reached by a plain and by a
-    satisfied claim, a ``not_merged`` and an ``unknown`` target, one edge whose
-    reason is no claim outcome, a target in a hidden finished row, a target the
-    scan does not list, an absent UUID and two cards sharing a Package ID.
+    satisfied claim and by a completion edge, a ``not_merged`` and an ``unknown``
+    target, one edge whose reason is no claim outcome, a target in a hidden
+    finished row, a target the scan does not list, an absent UUID and two cards
+    sharing a Package ID.
     """
     entries = [
         _entry(READINESS_MERGED_ID, "Alpha/Queue/merged-provider", "queue",
@@ -6760,6 +6764,9 @@ def readiness_payload():
         _entry(READINESS_ENTRYLESS_DEPENDENT_ID, "Alpha/Queue/entryless-dependent", "queue",
                "Entryless dependent", "Alpha",
                [_readiness_edge(READINESS_MERGED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_COMPLETION_DEPENDENT_ID, "Alpha/Queue/completion-dependent",
+               "queue", "Completion dependent", "Alpha",
+               [_completion_edge(READINESS_MERGED_ID)]),
         _entry(READINESS_TWIN_ID, "Alpha/Queue/twin-one", "queue", "Twin one", "Alpha",
                [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
         _entry(READINESS_TWIN_ID, "Alpha/Queue/twin-two", "queue", "Twin two", "Alpha",
@@ -7017,7 +7024,7 @@ def test_prerequisite_readiness_waits_for_and_follows_each_scan(open_page):
     double.fail("checkouts_failed")
     fire_checkouts_poll(page)
     playwright.expect(page.locator(
-        f'.connection[data-source="{READINESS_MERGED_ID}"]')).to_have_count(3)
+        f'.connection[data-source="{READINESS_MERGED_ID}"]')).to_have_count(4)
     assert connection_pairs(page) == READINESS_PLANNED
     assert_ready_signals(page, ready=READINESS_UNDECLARED, marked=set())
     assert card_layout(page) == layout
