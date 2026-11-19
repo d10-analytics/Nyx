@@ -23,7 +23,7 @@ from test_checkouts import (
     isolate_git,
     make_remote,
     redigest,
-    repill,
+    refresh_merge_facts,
 )
 from test_server import embedded_put, raw_catalog, reported_contract_cases
 
@@ -5958,7 +5958,7 @@ def checkouts_document_mutations():
     mutation rather than a digest that mutation invalidated.
     """
     def previous_schema(document):
-        document["schema_version"] = models.CHECKOUTS_SCHEMA_VERSION - 1
+        document["schema_version"] = 11
 
     def extra_top_level_key(document):
         document["unexpected"] = 1
@@ -6008,23 +6008,14 @@ def checkouts_document_mutations():
     def non_string_code_status_text(document):
         document["packages"][0]["code_status"]["text"] = 7
 
-    def text_prerequisites(document):
-        document["packages"][0]["prerequisites"] = "No prerequisites"
+    def prerequisites_key_present(document):
+        document["packages"][0]["prerequisites"] = None
 
-    def extra_prerequisites_key(document):
-        document["packages"][0]["prerequisites"]["unexpected"] = 1
+    def missing_merged_on_main(document):
+        del document["packages"][0]["merged_on_main"]
 
-    def unknown_prerequisites_state(document):
-        document["packages"][0]["prerequisites"]["state"] = "maybe"
-
-    def control_prerequisites_text(document):
-        document["packages"][0]["prerequisites"]["text"] = "No prerequisites\u0007"
-
-    def extra_prerequisite_item_key(document):
-        document["packages"][1]["prerequisites"]["items"][0]["unexpected"] = 1
-
-    def unknown_prerequisite_checkout_fact(document):
-        document["packages"][1]["prerequisites"]["items"][0]["in_checkout"] = "maybe"
+    def unknown_merged_on_main(document):
+        document["packages"][0]["merged_on_main"] = "maybe"
 
     return [
         {"id": "previous-schema", "mutate": previous_schema, "reseal": True},
@@ -6046,16 +6037,10 @@ def checkouts_document_mutations():
          "reseal": True},
         {"id": "non-string-code-status-text", "mutate": non_string_code_status_text,
          "reseal": True},
-        {"id": "text-prerequisites", "mutate": text_prerequisites, "reseal": True},
-        {"id": "extra-prerequisites-key", "mutate": extra_prerequisites_key, "reseal": True},
-        {"id": "unknown-prerequisites-state", "mutate": unknown_prerequisites_state,
+        {"id": "prerequisites-key-present", "mutate": prerequisites_key_present,
          "reseal": True},
-        {"id": "control-prerequisites-text", "mutate": control_prerequisites_text,
-         "reseal": True},
-        {"id": "extra-prerequisite-item-key", "mutate": extra_prerequisite_item_key,
-         "reseal": True},
-        {"id": "unknown-prerequisite-checkout-fact",
-         "mutate": unknown_prerequisite_checkout_fact, "reseal": True},
+        {"id": "missing-merged-on-main", "mutate": missing_merged_on_main, "reseal": True},
+        {"id": "unknown-merged-on-main", "mutate": unknown_merged_on_main, "reseal": True},
     ]
 
 
@@ -6090,6 +6075,8 @@ def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
     settle_frames(page)
     summary = page.locator(".checkouts-issue-summary")
     assert summary.count() == 0
+    # The served document draws its lines, so each refusal below hides a line.
+    assert page.locator(".card-code-status").count() > 0
     card = page.locator(f'.card[data-package-id="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]')
     card.click()
     kept = card.element_handle()
@@ -6110,11 +6097,13 @@ def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
         playwright.expect(summary).to_have_text(
             "Code Status unavailable: checkouts_protocol_error"
         )
-        # Only the notice changes: the catalog, its selection and the button stay.
+        # Only the notice changes: the catalog, its selection and the button stay,
+        # and every checkout line goes with the document the browser refused.
         assert summary.count() == 1, case["id"]
         assert page.locator("#refresh").count() == 0, case["id"]
         assert page.evaluate("window.removedCards") == 0, case["id"]
         assert card_paths(page) == shown, case["id"]
+        assert page.locator(".card-code-status, .card-baseline").count() == 0, case["id"]
         assert kept.evaluate("node => node.isConnected && node === document.activeElement"), (
             case["id"]
         )
@@ -7709,7 +7698,6 @@ def checkout_word_requirements():
         (("packageBranchStatus",), set(models._PACKAGE_BRANCH_STATUSES)),
         (("baselineStatus",), set(models._BASELINE_STATUSES)),
         (("prerequisiteMain",), set(models.PREREQUISITE_MAIN_FACTS)),
-        (("prerequisiteCheckout",), set(models.PREREQUISITE_CHECKOUT_FACTS)),
         (("attentionClass",), {name for name, _ in models._ATTENTION_CODES}),
         (("attentionCode",), {code for _, code in models._ATTENTION_CODES}),
         (("availabilityState",), availability["named"]),
@@ -8038,13 +8026,14 @@ def checkout_raw_variant(document, mutate):
 def checkout_variant(document, mutate):
     """One re-digested capture with ``mutate`` applied; the parser must accept it.
 
-    A mutation of a targeted worktree's head or status, or of a package's target or
-    finished flag, changes what each pill derives, so every pill is recomputed from the
-    mutated facts (``repill``) before the document is sealed and parsed.
+    A mutation of a targeted worktree's head or status, or of a package's target,
+    branch or finished flag, changes what each package's merge fact derives, so
+    every merge fact is recomputed from the mutated facts (``refresh_merge_facts``)
+    before the document is sealed and parsed.
     """
     variant = copy.deepcopy(document)
     mutate(variant)
-    variant = reseal_checkouts(repill(variant))
+    variant = reseal_checkouts(refresh_merge_facts(variant))
     models.parse_checkouts(json.dumps(variant))
     return variant
 
@@ -12910,8 +12899,7 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     package = next(
         item for item in document["packages"] if item["package_path"] == "Repo/Drafts/alpha")
     rows = panel_code_rows(page)
-    assert list(rows) == ["Code Status", "Branch", "Prerequisites"]
-    assert rows["Prerequisites"] == models.prerequisites_text(package["prerequisites"]["state"])
+    assert list(rows) == ["Code Status", "Branch"]
     assert rows["Code Status"] == CHECKOUTS_CODE_STATUS_TEXTS["Repo/Drafts/alpha"]
     assert rows["Branch"] == package["branch"]["name"]
     catalog_entry = next(
@@ -13076,19 +13064,8 @@ def comparison(relation, ahead=None, behind=None):
     }
 
 
-def prerequisites_pill(state, items=()):
-    """One served prerequisites pill with the collector's words for ``state``."""
-    return {
-        "state": state, "text": models.prerequisites_text(state), "checkout_sha": "c" * 40,
-        "items": [dict(item) for item in items],
-    }
-
-
-def with_baseline_facts(document, states, pills=None):
+def with_baseline_facts(document, states):
     """One capture where each path in ``states`` has a declared Baseline and checkout.
-
-    Each package given facts also serves a green ``none`` pill, or the state
-    ``pills`` names for its path, so the check mark follows the three tones alone.
 
     ``states`` maps a package path to ``(drift, vs_baseline, vs_base)``, or to
     ``None`` for a package served without a checkout.  The variant is served
@@ -13105,8 +13082,6 @@ def with_baseline_facts(document, states, pills=None):
                 package["baseline"]["checkout"] = None
                 continue
             drift, versus, against = state
-            package["prerequisites"] = prerequisites_pill(
-                (pills or {}).get(package["package_path"], "none"))
             package["baseline"]["status"] = "declared"
             package["baseline"]["sha"] = BASELINE_LINE_SHA
             package["baseline"]["drift"] = drift
@@ -13116,9 +13091,9 @@ def with_baseline_facts(document, states, pills=None):
     return checkout_raw_variant(document, mutate)
 
 
-def serve_baseline_states(page, double, states, pills=None):
+def serve_baseline_states(page, double, states):
     """Deliver one poll whose packages carry ``states`` and let the cards settle."""
-    double.serve(checkouts_envelope(with_baseline_facts(double.document, states, pills)))
+    double.serve(checkouts_envelope(with_baseline_facts(double.document, states)))
     fire_checkouts_poll(page)
     settle_frames(page)
 
@@ -13273,14 +13248,6 @@ def test_baseline_line_tones_follow_the_one_rule(
     assert line["M"]["tone"] == "red"
     assert line["link"] == {"tone": "grey", "line": "dashed", "style": "dashed"}
     assert line["C"]["tone"] == "green" and not line["C"]["check"]
-    # An all-green line keeps its check mark only under a green pill: a grey or a
-    # red pill removes it and changes no tone.
-    path = BASELINE_LINE_CARDS[0]
-    for state in ("none", "met", "unknown", "not_in_main", "not_in_checkout"):
-        serve_baseline_states(page, double, {path: (EQUAL, EQUAL, EQUAL)}, {path: state})
-        line = baseline_line(page, path)
-        assert [line[name]["tone"] for name in "BCM"] == ["green"] * 3
-        assert line["C"]["check"] is (state in ("none", "met")), state
     # One marker per tone is drawn in its token's computed colour.
     for tone, token in BASELINE_LINE_TONE_COLORS.items():
         expected = baseline_token_color(page, token)
@@ -13573,140 +13540,37 @@ def test_baseline_line_check_mark_needs_the_baseline_against_main_green(
     assert line["C"]["check"] is False
 
 
-PREREQUISITES_PILL_TONES = {
-    "none": "green", "met": "green", "not_in_main": "red", "not_in_checkout": "red",
-    "unknown": "grey",
-}
-
-
-def card_pills(page):
-    """Each card's pills as ``(path, [(text, label, tone)])``, for every rendered card."""
-    return {
-        path: pills for path, pills in page.locator(".card[data-package-path]").evaluate_all(
-            """cards => cards.map(card => [card.dataset.packagePath,
-              [...card.querySelectorAll('.card-prerequisites')].map(pill => [
-                pill.textContent, pill.getAttribute('aria-label'), pill.dataset.tone,
-                getComputedStyle(pill).color])])""")
-    }
-
-
-def test_prerequisites_pill_follows_the_served_state_everywhere(open_page, real_checkouts):
-    """One pill per card with a served pill, the check mark, search and panel all read it."""
-    alpha, beta, delta, epsilon = BASELINE_LINE_CARDS
-    gamma = "Repo/Shipped/gamma"
-    ids = CHECKOUTS_PACKAGE_IDS
-    titles = {
-        entry["package_id"]: entry["declared"]["title"] or entry["package_path"]
-        for entry in real_checkouts.catalog["entries"]
-    }
-    items = [
-        {"target_package_id": ids["alpha"], "merged_on_main": "merged", "in_checkout": "yes"},
-        {"target_package_id": None, "merged_on_main": "unknown", "in_checkout": "unknown"},
-    ]
-    green = [(EQUAL, EQUAL, EQUAL)] * 4
-    states = dict(zip(BASELINE_LINE_CARDS, green))
-
-    def poll(document, pills, pill_items=None):
-        def mutate(variant):
-            for package in variant["packages"]:
-                path = package["package_path"]
-                if path in pills:
-                    package["prerequisites"] = (
-                        None if pills[path] is None
-                        else prerequisites_pill(pills[path], (pill_items or {}).get(path, ())))
-        return checkout_raw_variant(document, mutate)
-
+def test_a_prerequisite_that_is_not_merged_leaves_the_check_mark_and_no_pill(
+    open_page, real_checkouts
+):
+    """The check mark reads the three tones alone, and no pill or its wording remains."""
+    alpha, beta = BASELINE_LINE_CARDS[0], BASELINE_LINE_CARDS[1]
+    alpha_package = next(
+        item for item in real_checkouts.document_zero["packages"]
+        if item["package_path"] == alpha)
+    # beta's own Completion Prerequisite names alpha, and the served fact says it
+    # did not land: the card is still checked and shows no pill.
+    assert alpha_package["merged_on_main"] == "not_merged"
     page, double = baseline_line_page(open_page, real_checkouts)
-    wording = models.prerequisites_text
-    first = {alpha: "none", beta: "met", delta: "not_in_main", epsilon: "not_in_checkout"}
-    served_a = poll(with_baseline_facts(real_checkouts.document_zero, states, first), first,
-                    {beta: items})
-    served_b = poll(served_a, {alpha: "unknown", delta: "met"})
-    green_color = baseline_token_color(page, "--state-done")
-    red_color = baseline_token_color(page, "--state-failed")
-
-    def expect_pills(expected):
-        pills = card_pills(page)
-        assert pills.pop(gamma) == []
-        assert set(pills) == set(expected)
-        for path, state in expected.items():
-            (shown, label, tone, color), = pills[path]
-            assert (shown, label) == (wording(state), wording(state)), path
-            assert tone == PREREQUISITES_PILL_TONES[state], path
-            if tone != "grey":
-                assert color == (green_color if tone == "green" else red_color), path
-            check = baseline_line(page, path)["C"]["check"]
-            assert check is (tone == "green"), (path, state)
-
-    def search(expected):
-        for state, path in expected.items():
-            assert visible_card_paths(page, wording(state)) == [path], state
-        page.fill("#filter", "")
-
-    def rebuild():
-        page.get_by_label("Hide terminal rows", exact=True).check()
-        page.get_by_label("Hide terminal rows", exact=True).uncheck()
-        settle_frames(page)
-
-    double.serve(checkouts_envelope(served_a))
-    fire_checkouts_poll(page)
-    settle_frames(page)
-    expect_pills(first)
-    first_search = {"none": alpha, "met": beta, "not_in_main": delta, "not_in_checkout": epsilon}
-    search(first_search)
-    rebuild()
-    expect_pills(first)
-    search(first_search)
-
-    # The panel of beta names the pill and each prerequisite with its two facts.
-    code_status_card(page, beta).click()
-    # Under the green pill the lines are folded under All fields.
-    assert panel_code_rows(page)["Prerequisites"] == wording("met")
-    assert [label for label, _ in panel_all_fields(page)] == [
-        "Branch", "Package ID", "Target repo", "Remote copy", "Verdict", "Pull requests",
-        "Baseline", "Each prerequisite", "Baseline line legend",
-    ]
-    row = dict(panel_all_fields(page))["Each prerequisite"]
-    assert f"{titles[ids['alpha']]}: merged on main, in this checkout" in row
-    assert "A prerequisite that cannot be read" in row
-    assert "unknown" not in row.split("A prerequisite")[0]
-    # The panel of alpha follows a poll that changes its pill.
-    code_status_card(page, alpha).click()
-    assert panel_code_rows(page)["Prerequisites"] == wording("none")
-
-    second = {alpha: "unknown", beta: "met", delta: "met", epsilon: "not_in_checkout"}
-    double.serve(checkouts_envelope(served_b))
-    fire_checkouts_poll(page)
-    settle_frames(page)
-    expect_pills(second)
-    assert panel_code_rows(page)["Prerequisites"] == wording("unknown")
-    assert visible_card_paths(page, wording("unknown")) == [alpha]
+    serve_baseline_states(page, double, {beta: (EQUAL, EQUAL, EQUAL)})
+    line = baseline_line(page, beta)
+    assert [line[name]["tone"] for name in "BCM"] == ["green"] * 3
+    assert line["C"]["check"] is True
+    # No card carries a pill, and no card's search text holds a pill's wording.
+    assert page.locator(".card-prerequisites").count() == 0
+    assert visible_card_paths(page, "Prerequisites not met") == []
+    # The same search reaches the card by its own path, so the empty result is the
+    # retired wording's and not a broken search.
+    assert visible_card_paths(page, "Repo/Drafts/beta") == [beta]
     page.fill("#filter", "")
-    rebuild()
-    assert visible_card_paths(page, wording("unknown")) == [alpha]
-    page.fill("#filter", "")
-    expect_pills(second)
-
-    # A prerequisite the catalog does not list is named by its ID.
-    stranger = "123e4567-e89b-42d3-a456-426614174aff"
-    # Under a red pill the lines show in the visible row and the disclosure has none.
-    served_c = poll(served_b, {beta: "not_in_main"},
-                    {beta: [dict(items[0], target_package_id=stranger)]})
-    double.serve(checkouts_envelope(served_c))
-    fire_checkouts_poll(page)
+    # The panel's Code rows and its folded rows name no pill and no prerequisite.
     code_status_card(page, beta).click()
-    assert f"{stranger}: merged on main, in this checkout" in panel_code_rows(page)["Prerequisites"]
-    assert "Each prerequisite" not in dict(panel_all_fields(page))
-
-    # A null pill removes the card's pill and its panel row.
-    code_status_card(page, epsilon).click()
-    assert "Prerequisites" in panel_code_rows(page)
-    served_d = poll(served_c, {epsilon: None})
-    double.serve(checkouts_envelope(served_d))
-    fire_checkouts_poll(page)
-    settle_frames(page)
-    assert card_pills(page)[epsilon] == []
-    assert "Prerequisites" not in panel_code_rows(page)
+    rows = panel_code_rows(page)
+    folded = [label for label, _ in panel_all_fields(page)]
+    assert "Code Status" in rows
+    assert "Prerequisites" not in rows
+    assert "Baseline" in folded
+    assert "Each prerequisite" not in folded
 
 
 def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_checkout(
@@ -13807,7 +13671,7 @@ def test_baseline_line_poll_updates_the_count_and_keeps_the_other_tags(open_page
           const card = document.querySelector(`.card[data-package-path="${path}"]`);
           window.otherTags = [...card.querySelectorAll('.card-facts > :not(.card-baseline)')];
         }""", alpha)
-    assert page.evaluate("window.otherTags.length") >= 2
+    assert page.evaluate("window.otherTags.length") >= 1
 
     def other_tags_kept():
         return page.evaluate(

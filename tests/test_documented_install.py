@@ -184,18 +184,23 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
-PREREQUISITES_PILL_MARKERS = {
-    "docs/running-nyx.md": (
-        "a prerequisites pill, and, when the checkout can be placed, a baseline line",
-        "whose card's prerequisites pill is green or absent",
-        "a grey pill takes the check mark away",
-        "with one line per prerequisite shown only when the pill is not green",
-    ),
-    "docs/systems/board-web/README.md": (
-        "its prerequisites pill (the five wordings the document carries",
-        "a prerequisites row with the pill and its per-prerequisite lines only when the pill is not green",
-    ),
-}
+# The pill sentence, its five wordings and the panel rows it filled: the board
+# and its guide carry none of them.
+PREREQUISITES_PILL_DOCUMENTS = ("docs/running-nyx.md", "docs/systems/board-web/README.md")
+PREREQUISITES_PILL_RETIRED = (
+    "a prerequisites pill",
+    "card's prerequisites pill",
+    "The prerequisites pill is green for `No prerequisites` and `Prerequisites met`",
+    "Prerequisites not met in main",
+    "Prerequisites not met in checkout",
+    "Prerequisites unknown",
+    "a grey pill takes the check mark away",
+    "its prerequisites row",
+    "one line per prerequisite shown only when the pill is not green",
+    "the prerequisite lines under a green pill",
+    "its prerequisites pill (the five wordings the document carries",
+    "a prerequisites row with the pill and its per-prerequisite lines only when the pill is not green",
+)
 
 CHECKOUT_RETIRED_WORDING = (
     "A branch created at the default branch's head with no commit of its own is "
@@ -853,11 +858,12 @@ def test_documents_publish_the_checkout_contract():
             assert marker in document, (name, marker)
 
 
-def test_documents_publish_the_prerequisites_pill_sentences_once():
-    for name, markers in PREREQUISITES_PILL_MARKERS.items():
+def test_documents_drop_the_prerequisites_pill_sentences():
+    """Neither the board README nor the guide keeps a pill sentence or its wordings."""
+    for name in PREREQUISITES_PILL_DOCUMENTS:
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
-        for marker in markers:
-            assert document.count(marker) == 1, (name, marker)
+        for sentence in PREREQUISITES_PILL_RETIRED:
+            assert sentence not in document, (name, sentence)
     # The checkouts README no longer derives a pill: it serves one merge fact per package.
     checkouts = re.sub(
         r"\s+",
@@ -2187,7 +2193,9 @@ def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
         board,
         (
             "and a moved base, which the baseline line draws",
-            "the prerequisite lines under a green pill and the baseline line's legend",
+            "and the other Code rows (remote copy, verdict, pull requests, "
+            "Baseline drift and the baseline line's legend), not drawn when it would hold "
+            "no row",
         ),
         "docs/systems/board-web/README.md",
     )
