@@ -184,21 +184,23 @@ COMPLETION_GUIDANCE_MARKERS = {
         "recorded workflow assertion",
     ),
 }
-PREREQUISITES_PILL_MARKERS = {
-    "docs/running-nyx.md": (
-        "a prerequisites pill, and, when the checkout can be placed, a baseline line",
-        "whose card's prerequisites pill is green or absent",
-        "a grey pill takes the check mark away",
-        "with one line per prerequisite shown only when the pill is not green",
-    ),
-    "docs/systems/checkouts/README.md": (
-        "Derives each unfinished package's prerequisites pill once",
-    ),
-    "docs/systems/board-web/README.md": (
-        "its prerequisites pill (the five wordings the document carries",
-        "a prerequisites row with the pill and its per-prerequisite lines only when the pill is not green",
-    ),
-}
+# The pill sentence, its five wordings and the panel rows it filled: the board
+# and its guide carry none of them.
+PREREQUISITES_PILL_DOCUMENTS = ("docs/running-nyx.md", "docs/systems/board-web/README.md")
+PREREQUISITES_PILL_RETIRED = (
+    "a prerequisites pill",
+    "card's prerequisites pill",
+    "The prerequisites pill is green for `No prerequisites` and `Prerequisites met`",
+    "Prerequisites not met in main",
+    "Prerequisites not met in checkout",
+    "Prerequisites unknown",
+    "a grey pill takes the check mark away",
+    "its prerequisites row",
+    "one line per prerequisite shown only when the pill is not green",
+    "the prerequisite lines under a green pill",
+    "its prerequisites pill (the five wordings the document carries",
+    "a prerequisites row with the pill and its per-prerequisite lines only when the pill is not green",
+)
 
 CHECKOUT_RETIRED_WORDING = (
     "A branch created at the default branch's head with no commit of its own is "
@@ -856,11 +858,21 @@ def test_documents_publish_the_checkout_contract():
             assert marker in document, (name, marker)
 
 
-def test_documents_publish_the_prerequisites_pill_sentences_once():
-    for name, markers in PREREQUISITES_PILL_MARKERS.items():
+def test_documents_drop_the_prerequisites_pill_sentences():
+    """Neither the board README nor the guide keeps a pill sentence or its wordings."""
+    for name in PREREQUISITES_PILL_DOCUMENTS:
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
-        for marker in markers:
-            assert document.count(marker) == 1, (name, marker)
+        for sentence in PREREQUISITES_PILL_RETIRED:
+            assert sentence not in document, (name, sentence)
+    # The checkouts README no longer derives a pill: it serves one merge fact per package.
+    checkouts = re.sub(
+        r"\s+",
+        " ",
+        (REPOSITORY_ROOT / "docs" / "systems" / "checkouts" / "README.md").read_text(
+            encoding="utf-8"
+        ),
+    )
+    assert "Derives each unfinished package's prerequisites pill once" not in checkouts
 
 
 def test_checkout_documentation_drops_the_cached_only_wording():
@@ -1127,11 +1139,35 @@ def _section(name: str, heading: str) -> str:
     return re.sub(r"\s+", " ", section)
 
 
+# The four user documents that describe the board's relationships.
+RELATIONSHIP_DOCUMENTS = (
+    "README.md", "docs/running-nyx.md", "docs/specification-reference.md",
+    "docs/systems/board-web/README.md",
+)
+# Wording for the card relationship text, the dependent list and the selection
+# the board replaced: none of the relationship documents may keep it.
+RETIRED_RELATIONSHIP_TEXT = (
+    "shows links to its resolved prerequisite and dependent items",
+    "draws every one of them, and marks the cards at their other ends",
+    "`needs:`",
+    "`blocks:`",
+    "**Blocks**",
+)
+
+
 def test_dependency_and_completion_policy_text_matches_the_board():
     readme = _normalized("README.md")
     assert "satisfied, waiting, unknown, or unavailable" not in readme
-    assert "shows links to its resolved prerequisite and dependent items" in readme
+    assert "Dependency arrows follow relationships within and across projects." in readme
+    assert ("An arrow shows only an outstanding prerequisite: not merged on `main`, "
+            "of unknown merge state, unresolved, or not listed in the served "
+            "checkouts document.") in readme
+    assert ("The work item panel's **Needs** list names the selected card's "
+            "outstanding prerequisites, with the reason for each.") in readme
     assert "**unresolved target** only when a relationship cannot be resolved" in readme
+    for name in RELATIONSHIP_DOCUMENTS:
+        for retired in RETIRED_RELATIONSHIP_TEXT:
+            assert retired not in _normalized(name), (name, retired)
     assert "asks you to configure completed stages" not in _normalized("docs/workspaces.md")
     assert "actionable configuration explanation" not in _normalized(
         "docs/specification-reference.md")
@@ -1143,6 +1179,74 @@ def test_dependency_and_completion_policy_text_matches_the_board():
             "or explanation") in _normalized("docs/workspaces.md")
     assert ("a completion dependency is **unknown**; the board shows no prompt "
             "or explanation") in _normalized("docs/specification-reference.md")
+
+
+def test_board_relationship_text_matches_the_outstanding_filter():
+    guide = _normalized("docs/running-nyx.md")
+    for marker in (
+        "The board draws an arrow only for a prerequisite that is outstanding.",
+        "A prerequisite is outstanding when it is not merged on `main` or its merge "
+        "state is unknown.",
+        "Column depth, lane planning, the eight-lane cap and card positions still "
+        "read every declared prerequisite.",
+        "Selecting a card emphasises its drawn and dashed outstanding arrows and "
+        "marks only the cards at the other end of those connections.",
+        "Selecting a provider that is merged on `main` marks no dependent, because "
+        "its merge satisfies every connection to its dependents.",
+        "A card with no outstanding prerequisite turns teal and says \"No outstanding "
+        "prerequisite.\" as its start text for a screen reader.",
+        "Neither signal depends on what the board displays or on what the search hides.",
+        "A card with an outstanding prerequisite that has no drawn arrow shows one "
+        "marker, \"Prerequisite not drawn\".",
+        "It marks an unresolved target or a prerequisite card the board does not "
+        "display, whether **Hide terminal rows** or the search box hides it.",
+        "It also marks an edge without a free lane and a card sharing a Package ID.",
+        "**Needs** names exactly the selected card's outstanding prerequisites, read "
+        "from the full catalog.",
+        "An entry is a link that selects the prerequisite's card when the board "
+        "displays that card, and plain text when it does not.",
+        "states its reason: \"not merged\", \"merge state unknown\", or \"unresolved "
+        "target\"",
+        "adds \"in a finished row, hidden\" after the merge words",
+        "The search box changes neither the list nor whether an entry is a link.",
+        "A card with nothing outstanding has no **Needs** list.",
+        "With no scan served, every declared prerequisite is outstanding.",
+        "The board then draws every arrow, no marker shows, and only a card that "
+        "declares no prerequisite is teal.",
+    ):
+        assert marker in guide, marker
+    # The marking reads the provider's merge fact, never the dependents' state.
+    assert "whose dependents are all merged" not in guide
+    # A prerequisite whose branch is gone reads an unknown merge fact, and GitHub
+    # lookup is the documented remedy that can clear the word.
+    assert ("A prerequisite whose branch was deleted reads \"merge state unknown\" "
+            "while GitHub lookup is off.") in guide
+    assert ("Turning on [GitHub lookup](#inspect-checkouts) lets Nyx read the merged "
+            "pull request, and the word can then clear.") in guide
+    board = _normalized("docs/systems/board-web/README.md")
+    for marker in (
+        "It draws an arrow only for an outstanding prerequisite.",
+        "takes the teal surface and the start text \"No outstanding prerequisite.\" "
+        "together",
+        "It covers an unresolved target and a prerequisite card the board does not show.",
+        "Each column plans at most eight arrow lanes.",
+        "An outstanding relationship left without one is drawn, dashed, while either "
+        "of its cards is selected.",
+        "marks only the cards at the other end of those connections",
+        "Names the card's outstanding prerequisites in the **Needs** list, read from "
+        "the full catalog.",
+        "An entry is a link when the board shows the prerequisite's card, and plain "
+        "text otherwise.",
+    ):
+        assert marker in board, marker
+    reference = _normalized("docs/specification-reference.md")
+    for marker in (
+        "cards draw an arrow only for an outstanding prerequisite",
+        "The work item panel's **Needs** list names every outstanding prerequisite of "
+        "the card.",
+        "appears in the dependent card's **Needs** list as **unresolved target**",
+    ):
+        assert marker in reference, marker
 
 
 def test_configuration_unavailable_recovery_is_one_fence_free_bullet():
@@ -1490,14 +1594,14 @@ def test_checkout_system_readme_states_the_folder_rule_and_the_suggestion_rule()
 def test_protocols_readme_states_the_checkout_schema_and_its_two_fields():
     readme = _normalized("docs/systems/protocols/README.md")
     for marker in (
-        "The checkout document is schema 11, and its two whole-document fields are part of "
+        "The checkout document is schema 12, and its two whole-document fields are part of "
         "the digest",
         "`configuration_revision` is `null` or one lowercase 64-character SHA-256 digest",
         "`folder_suggestions` holds entries of exactly `{path, package_count}`",
         "strictly increasing in natural path order, never a configured folder",
         "the list is empty while the package scan is unavailable",
-        "`derive_prerequisites` is the single derivation of every prerequisites pill's state",
-        "`parse_checkouts` recomputes them from the pill's own items",
+        "`prerequisite_main_fact` is the single mapping from a package's Code Status state",
+        "`parse_checkouts` refuses a fact its own package's Code Status contradicts",
     ):
         assert marker in readme, marker
 
@@ -2181,7 +2285,9 @@ def test_checkout_position_is_documented_and_the_stale_card_example_is_gone():
         board,
         (
             "and a moved base, which the baseline line draws",
-            "the prerequisite lines under a green pill and the baseline line's legend",
+            "and the other Code rows (remote copy, verdict, pull requests, "
+            "Baseline drift and the baseline line's legend), not drawn when it would hold "
+            "no row",
         ),
         "docs/systems/board-web/README.md",
     )

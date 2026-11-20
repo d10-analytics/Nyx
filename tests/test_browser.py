@@ -23,7 +23,7 @@ from test_checkouts import (
     isolate_git,
     make_remote,
     redigest,
-    repill,
+    refresh_merge_facts,
 )
 from test_server import embedded_put, raw_catalog, reported_contract_cases
 
@@ -1457,7 +1457,7 @@ def coherent_refresh_payload():
     return value
 
 
-def test_successful_save_updates_needs_blocks_selection_and_rail_pairs_together(open_page):
+def test_successful_save_updates_needs_selection_and_arrows_together(open_page):
     client = SequenceClient([dependency_state_payload("unsatisfied"), coherent_refresh_payload()])
     settings = BrowserSettings()
     page = open_page(client, settings=settings)
@@ -1468,17 +1468,19 @@ def test_successful_save_updates_needs_blocks_selection_and_rail_pairs_together(
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
 
-    step_two = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    # The refreshed board arrives after the save message, so wait for its text.
-    playwright.expect(step_two.locator(".card-rail-text").last).to_have_text(
-        re.compile(r"^blocks: .*loose package \(Beta\)"))
-    assert step_two.locator(".card-links").count() == 0
+    # The refreshed board arrives after the save message, so wait for the arrow
+    # the new edge draws before reading the panel the same render fills.
+    playwright.expect(page.locator(
+        f'.connection[data-source="{STEP_TWO}"][data-dependent="{LOOSE}"]'
+    )).to_have_count(1)
     loose = page.locator(f'.card[data-package-id="{LOOSE}"]')
-    assert loose.locator(".card-links").count() == 0
-    assert loose.locator(".card-rail-text").all_text_contents() == ["needs: Dependent step (Alpha)"]
     assert loose.get_attribute("aria-pressed") == "true"
     assert loose.locator(".card-filepath").get_attribute("aria-label") == "Filepath: Beta/Under_Development/loose"
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_TWO, LOOSE)}
+    # No checkouts document is served, so the panel states the merge fact it has.
+    assert panel_needs(page) == [{
+        "title": "Dependent step", "linked": True, "project": "Alpha",
+        "reason": "merge state unknown"}]
 
 
 def test_real_producer_completion_policy_save_hides_finished_target_and_rail(open_page, tmp_path):
@@ -1489,9 +1491,6 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
 
     source = page.locator(f'.card[data-package-id="{source_id}"]')
     target = page.locator(f'.card[data-package-id="{target_id}"]')
-    assert source.locator(".card-rail-text").all_text_contents() == ["needs: Target (Alpha)"]
-    assert target.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent (Beta)"]
-    assert page.locator(".card-links").count() == 0
     assert connection_pairs(page) == {(target_id, source_id)}
     before = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
                   if entry["package_id"] == source_id)
@@ -1499,20 +1498,28 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
     assert (edge["resolved_state"], edge["reason"]) == ("unsatisfied", "completion_unsatisfied")
 
     source.click()
+    assert panel_needs(page) == [{
+        "title": "Target", "linked": True, "project": "Alpha",
+        "reason": "merge state unknown"}]
 
     open_stage_editor(page)
     page.get_by_role("checkbox", name="Counts as finished: Queue").check()
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     # Queue now counts as finished, so the refreshed board hides its row and
-    # the arrow from the target while terminal rows are hidden.
+    # the arrow from the target while terminal rows are hidden; the panel keeps
+    # the prerequisite, now plainly and saying where its card went.
     playwright.expect(target).to_have_count(0, timeout=15000)
     assert connection_pairs(page) == set()
+    playwright.expect(page.locator(
+        '#work-item-panel-body .panel-needs-title')).to_have_text("Target")
+    assert panel_needs(page) == [{
+        "title": "Target", "linked": False, "project": "Alpha",
+        "reason": "merge state unknown, in a finished row, hidden"}]
     after = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
                  if entry["package_id"] == source_id)
     edge = next(edge for edge in after["relationship"]["prerequisites"] if edge["kind"] == "completion")
     assert (edge["resolved_state"], edge["reason"]) == ("satisfied", "completion_satisfied")
-    assert source.locator(".link.unresolved").count() == 0
     assert source.get_attribute("aria-pressed") == "true"
 
     page.get_by_label("Hide terminal rows", exact=True).uncheck()
@@ -1530,8 +1537,11 @@ def test_real_producer_terminal_gated_completion_target_reveals_card_and_rail(op
     assert page.locator(f'.card[data-package-id="{source_id}"]').count() == 1
     assert connection_pairs(page) == set()
     page.locator(f'.card[data-package-id="{source_id}"]').click()
-    source = page.locator(f'.card[data-package-id="{source_id}"]')
-    assert source.locator(".link.unresolved").count() == 0
+    # The satisfied completion edge points at a card Hide terminal rows removes,
+    # so the board draws no arrow and the panel names that card as plain text.
+    assert panel_needs(page) == [{
+        "title": "Target", "linked": False, "project": "Alpha",
+        "reason": "merge state unknown, in a finished row, hidden"}]
     value = client.fetch_catalog().as_dict()
     dependent = next(entry for entry in value["entries"] if entry["package_id"] == source_id)
     completion = next(edge for edge in dependent["relationship"]["prerequisites"] if edge["kind"] == "completion")
@@ -1570,7 +1580,10 @@ def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_pa
     for package_id in (source_id, "123e4567-e89b-42d3-a456-426614174014"):
         card = page.locator(f'.card[data-package-id="{package_id}"]')
         playwright.expect(card).to_have_count(1)
-        playwright.expect(card.locator(".link.unresolved")).to_have_text("unresolved target")
+        card.click()
+        assert panel_needs(page) == [{
+            "title": "unresolved target", "linked": False, "project": "",
+            "reason": ""}]
 
 
 CLAIM_EDGE_REASONS = [
@@ -1803,15 +1816,18 @@ def test_dependency_connectors_are_drawn_inside_a_project_column(open_page):
 
 def test_cross_project_arrows_retain_inline_names(open_page):
     page = open_page(StaticClient(board_payload()))
-    loose = page.locator('.card[data-package-path="Beta/Under_Development/loose"]')
-    assert "needs:" in loose.inner_text()
-    assert "Foundation step" in loose.inner_text()
-    assert "Alpha" in loose.inner_text()
-    step_one = page.locator('.card[data-package-path="Alpha/Under_Development/step-one"]')
-    assert "blocks:" in step_one.inner_text()
-    assert "Beta" in step_one.inner_text()
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
     assert_readable_arrows(page)
+    # The drawn cross-project arrow is named once, in the panel: the
+    # prerequisite's title and the project it lives in.
+    page.locator(f'.card[data-package-id="{LOOSE}"]').click()
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "Alpha",
+        "reason": "merge state unknown"}]
+    # A provider declares no prerequisite, so its panel has no list at all and
+    # nothing repeats its dependents back to it.
+    page.locator(f'.card[data-package-id="{STEP_ONE}"]').click()
+    assert page.locator("#work-item-panel-body .panel-links").count() == 0
 
 
 def test_board_labels_and_toolbar_follow_both_scroll_directions(open_page):
@@ -1960,15 +1976,11 @@ def test_long_unbroken_names_wrap_within_their_column(open_page):
     _reseal(value)
     page = open_page(StaticClient(value))
     alpha = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    beta = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
     assert alpha.locator(".card-title").inner_text() == token
     assert alpha.locator(".card-project").get_attribute("aria-label") == f"Target Folder: {token}"
     assert alpha.locator(".card-project").inner_text() == token
     assert alpha.locator(".card-filepath").get_attribute("aria-label") == f"Filepath: Alpha/Queue/{token}"
     assert alpha.locator(".card-filepath").inner_text() == token
-    assert alpha.locator(".card-rail-text").all_text_contents() == [f"needs: {token} (Beta)"]
-    assert beta.locator(".card-rail-text").all_text_contents() == [f"blocks: {token} (Alpha)"]
-    assert page.locator(".card-links").count() == 0
     assert page.locator(".column-head").all_text_contents() == projects
 
     measurements = page.locator(
@@ -3416,7 +3428,10 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
 
     page.fill("#filter", "Dependent step")
     assert connection_pairs(page) == set()
-    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == NO_INCOMING_CARD
+    # A search hides the prerequisite card but leaves the prerequisite
+    # outstanding, so the dependent keeps the plain surface: only the drawn
+    # arrows follow what the search shows.
+    assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == DARK_CARD
 
     page.fill("#filter", "")
     assert (STEP_ONE, STEP_TWO) in connection_pairs(page)
@@ -3427,51 +3442,59 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
     assert dependent.evaluate("el => getComputedStyle(el).backgroundColor") == LIGHT_CARD
 
 
-def test_same_project_relationship_text_is_available_to_screen_readers(open_page):
+def test_same_project_needs_entries_name_their_card_and_escape_their_title(open_page):
     page = open_page(SequenceClient([
         dependency_state_payload("unsatisfied"),
         dependency_state_payload("unsatisfied", titles={"loose": "Retitled loose"}),
     ]))
-    expected = {
-        STEP_TWO: ["needs: Foundation step", "blocks: Gate step"],
-        STEP_ONE: [f"blocks: Dependent step · {XSS_TITLE} (Beta)"],
-        GATE: ["needs: Dependent step"],
-        LOOSE: ["needs: Foundation step (Alpha)"],
-    }
-    # Every relationship here has an arrow, so no card prints one.
-    visible = {STEP_ONE: 0, LOOSE: 0, STEP_TWO: 0, GATE: 0}
-    for package_id, texts in expected.items():
-        card = page.locator(f'.card[data-package-id="{package_id}"]')
-        spans = card.locator(".card-rail-text")
-        assert spans.all_text_contents() == texts
-        assert card.locator(".card-links").count() == visible[package_id]
-        for span in spans.all():
-            assert span.evaluate("node => node.childNodes.length === 1 && node.firstChild.nodeType === Node.TEXT_NODE")
-            box = span.bounding_box()
-            assert 0 < box["width"] <= 1 and 0 < box["height"] <= 1
-    assert page.locator("#board img").count() == 0
+    body = page.locator("#work-item-panel-body")
     dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
-    playwright.expect(page.locator(f'.card[data-package-id="{LOOSE}"]')).not_to_have_accessible_name(
-        re.compile("blocks:")
-    )
-    assert page.locator("#board").get_by_text("Foundation step", exact=True).count() == 1
+    # A prerequisite in the same project is named by its title alone and a
+    # cross-project one adds its project; a card that declares none has no list.
+    dependent.click()
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "",
+        "reason": "merge state unknown"}]
+    page.locator(f'.card[data-package-id="{GATE}"]').click()
+    assert panel_needs(page) == [{
+        "title": "Dependent step", "linked": True, "project": "",
+        "reason": "merge state unknown"}]
+    page.locator(f'.card[data-package-id="{STEP_ONE}"]').click()
+    assert body.locator(".panel-links").count() == 0
+    # The panel entry is the link that selects the card it names.
+    page.locator(f'.card[data-package-id="{LOOSE}"]').click()
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "Alpha",
+        "reason": "merge state unknown"}]
+    body.get_by_role("button", name="Foundation step", exact=True).click()
+    assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').get_attribute(
+        "aria-pressed") == "true"
 
-    page.fill("#filter", "Dependent step")
+    # A search hides the prerequisite's card but removes no entry, and the entry
+    # still selects it: the board's own cards decide, not what the search shows.
+    page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     kept = dependent.element_handle()
+    page.fill("#filter", "Dependent step")
     return_check(page)
     page.wait_for_function("node => !node.isConnected", arg=kept)
     assert page.locator(f'.card[data-package-id="{LOOSE}"] .card-title').text_content() == "Retitled loose"
     assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').is_hidden()
     assert page.locator(".rail").count() == 0
-    assert dependent.locator(".card-rail-text").all_text_contents() == expected[STEP_TWO]
-    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "",
+        "reason": "merge state unknown"}]
+    page.fill("#filter", "")
+    body.get_by_role("button", name="Foundation step", exact=True).click()
+    assert page.locator(f'.card[data-package-id="{STEP_ONE}"]').get_attribute(
+        "aria-pressed") == "true"
 
+    # A title is shown as text, never as markup.
     escaped = open_page(StaticClient(dependency_state_payload("unsatisfied", titles={"step_one": XSS_TITLE})))
-    assert escaped.locator(f'.card[data-package-id="{STEP_TWO}"] .card-rail-text').all_text_contents() == [
-        f"needs: {XSS_TITLE}", "blocks: Gate step",
-    ]
-    assert escaped.locator("#board img").count() == 0
+    escaped.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
+    assert panel_needs(escaped) == [{
+        "title": XSS_TITLE, "linked": True, "project": "",
+        "reason": "merge state unknown"}]
+    assert escaped.locator("#board img, #work-item-panel-body img").count() == 0
 
 
 @pytest.mark.parametrize("source_project", ["Alpha", "Beta"])
@@ -3495,20 +3518,13 @@ def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_
     page = open_page(ScanningClient(tmp_path))
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO)}
     dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    if source_project == "Alpha":
-        assert dependent.locator(".card-rail-text").all_text_contents() == ["needs: Foundation step"]
-        assert source.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent step"]
-        assert dependent.locator(".card-links").count() == 0
-        assert source.locator(".card-links").count() == 0
-    else:
-        assert dependent.locator(".card-rail-text").all_text_contents() == ["needs: Foundation step (Beta)"]
-        assert source.locator(".card-rail-text").all_text_contents() == ["blocks: Dependent step (Alpha)"]
-        assert dependent.locator(".card-links").count() == 0
-        assert source.locator(".card-links").count() == 0
-    playwright.expect(dependent).to_have_accessible_name(re.compile("needs: Foundation step"))
-    assert dependent.text_content().count("Foundation step") == 1
-    assert source.text_content().count("Dependent step") == 1
+    # The malformed declaration must not hide the valid relationship to the same
+    # item: the panel names it once, with the project only when they differ.
+    dependent.click()
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True,
+        "project": "" if source_project == "Alpha" else "Beta",
+        "reason": "merge state unknown"}]
 
 
 @pytest.mark.parametrize("provider_project", ["Alpha", "Beta"])
@@ -3532,54 +3548,65 @@ def test_shared_identity_cards_keep_valid_relationship_text(open_page, tmp_path,
     page = open_page(ScanningClient(tmp_path))
     assert connection_pairs(page) == set()
     cross = provider_project != "Alpha"
-    needs = "needs: Provider Beta" if cross else "needs: Provider"
+    needs = {"title": "Provider", "linked": True,
+             "project": "Beta" if cross else "", "reason": "merge state unknown"}
     provider = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
     for title in ("First twin", "Second twin"):
         card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
         assert card.count() == 1
-        assert card.locator(".card-links").all_text_contents() == [needs]
-        assert card.locator(".card-links em").count() == int(cross)
+        # Two cards sharing one Package ID draw no arrow, and their panel still
+        # lists the prerequisite their valid edge names.
+        card.click()
+        assert panel_needs(page) == [needs]
         assert "no-incoming-arrow" not in card.get_attribute("class").split()
         assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
         assert card.locator(".card-start-text").text_content() == ""
-        playwright.expect(card).not_to_have_accessible_name(re.compile("No prerequisite shown"))
-    suffix = " Alpha" if cross else ""
-    assert provider.locator(".card-links").all_text_contents() == [
-        f"blocks: First twin{suffix} · Second twin{suffix}"
-    ]
-    assert provider.locator(".card-start-text").text_content() == "No prerequisite shown."
+        playwright.expect(card).not_to_have_accessible_name(re.compile("No outstanding prerequisite"))
+    # The provider declares no prerequisite, so its panel has no list at all.
+    provider.click()
+    assert page.locator("#work-item-panel-body .panel-links").count() == 0
+    assert provider.locator(".card-start-text").text_content() == "No outstanding prerequisite."
 
-    # A relationship counts only while its prerequisite card is visible.
+    # Search hides the prerequisite card but changes nothing else: the twins
+    # keep the plain surface and their entry, because the prerequisite is still
+    # outstanding and the search never removes an entry.
     page.fill("#filter", "twin")
     for title in ("First twin", "Second twin"):
         card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
-        assert card.locator(".card-links").all_text_contents() == [needs]
-        assert "no-incoming-arrow" in card.get_attribute("class").split()
-        assert card.locator(".card-start-text").text_content() == "No prerequisite shown."
+        card.click()
+        assert panel_needs(page) == [needs]
+        assert "no-incoming-arrow" not in card.get_attribute("class").split()
+        assert card.locator(".card-start-text").text_content() == ""
     page.fill("#filter", "")
     for title in ("First twin", "Second twin"):
         card = page.locator(".card").filter(has=page.locator(".card-title", has_text=title))
         assert card.locator(".card-start-text").text_content() == ""
+    assert provider.locator(".card-start-text").text_content() == "No outstanding prerequisite."
 
 
-def test_no_incoming_text_follows_search_like_the_color(open_page):
+def test_no_incoming_text_matches_the_color_and_ignores_search(open_page):
     page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
 
     def assert_text_matches_color():
         for card in page.locator(".card").all():
             start = card.locator(".card-start-text")
             assert start.count() == 1
-            expected = "No prerequisite shown." if "no-incoming-arrow" in card.get_attribute("class").split() else ""
+            expected = (
+                "No outstanding prerequisite."
+                if "no-incoming-arrow" in card.get_attribute("class").split() else ""
+            )
             assert start.text_content() == expected
+            # No scan is served here, so no card carries the marker.
+            assert card.locator(".card-not-drawn:not([hidden])").count() == 0
 
     source = page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-start-text')
     dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"] .card-start-text')
     assert_text_matches_color()
-    assert source.text_content() == "No prerequisite shown."
+    assert source.text_content() == "No outstanding prerequisite."
     assert dependent.text_content() == ""
     page.fill("#filter", "Dependent step")
     assert_text_matches_color()
-    assert dependent.text_content() == "No prerequisite shown."
+    assert dependent.text_content() == ""
     page.fill("#filter", "")
     assert_text_matches_color()
     assert dependent.text_content() == ""
@@ -3950,24 +3977,20 @@ def test_rail_lanes_are_capped_and_overflow_is_drawn_for_the_selected_card(open_
         _entry(ids[index], f"Alpha/Queue/{index:02d}-dependent", "queue", f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
         for index in range(1, 13)
     ]
+    # A served scan can only match a catalog whose configuration it was taken under.
+    value["configuration_revision"] = READINESS_REVISION
     _reseal(value)
     page = open_page(StaticClient(value))
     assert page.locator(".cell").evaluate_all("cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["132px"]
     assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:9]}
     for index, package_id in enumerate(ids[1:], start=1):
         card = page.locator(f'.card[data-package-id="{package_id}"]')
-        # With or without a lane, the relationship is screen-reader text only.
-        assert card.locator(".card-rail-text").all_text_contents() == ["needs: Hub"]
-        assert card.locator(".card-links").count() == 0
+        # With or without a lane, the relationship is the panel's to name.
         if index > 8:
             assert "no-incoming-arrow" not in card.get_attribute("class").split()
             assert card.evaluate("node => getComputedStyle(node).backgroundColor") == DARK_CARD
             assert card.locator(".card-start-text").text_content() == ""
     hub = page.locator(f'.card[data-package-id="{ids[0]}"]')
-    assert hub.locator(".card-links").count() == 0
-    assert hub.locator(".card-rail-text").all_text_contents() == [
-        "blocks: " + " · ".join(f"Dependent {index:02d}" for index in range(1, 13))
-    ]
     assert_readable_arrows(page)
     assert_rail_lanes_do_not_overlap(page)
 
@@ -3977,6 +4000,10 @@ def test_rail_lanes_are_capped_and_overflow_is_drawn_for_the_selected_card(open_
     overflow = page.locator(f'.card[data-package-id="{ids[10]}"]')
     overflow.click()
     assert connection_pairs(page) == planned | {(ids[0], ids[10])}
+    # The panel names the prerequisite the lane cap left undrawn.
+    assert panel_needs(page) == [{
+        "title": "Hub", "linked": True, "project": "",
+        "reason": "merge state unknown"}]
     assert page.locator(".connection.overflow").evaluate_all(
         "groups => groups.map(g => [g.dataset.source, g.dataset.dependent, g.classList.contains('emphasized')])"
     ) == [[ids[0], ids[10], True]]
@@ -3992,6 +4019,50 @@ def test_rail_lanes_are_capped_and_overflow_is_drawn_for_the_selected_card(open_
     assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]}
     assert page.locator(".connection.overflow").count() == 4
     assert page.locator(".card.related").count() == 12
+
+    # A served scan whose every target is unmerged keeps the same lanes, and the
+    # dependent of the connection that found none carries the marker: a
+    # connection drawn only while selected is still one the board does not draw.
+    served = open_page(
+        StaticClient(value),
+        settings=BrowserSettings(revision=READINESS_REVISION),
+        checkouts=BrowserCheckouts(sealed_checkouts_document(
+            {entry["package_path"]: "not_merged" for entry in value["entries"]})),
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+    wait_for_responses(served, "checkoutsResponses", 1)
+    settle_frames(served)
+    assert served.locator(".cell").evaluate_all(
+        "cells => cells.map(cell => getComputedStyle(cell).paddingLeft)") == ["132px"]
+    assert connection_pairs(served) == {(ids[0], dependent) for dependent in ids[1:9]}
+    # The hub declares no prerequisite, so it is ready; every dependent waits on
+    # the unmerged hub, so none is, and only the ones drawn by the selection
+    # carry the marker.
+    hub_served = served.locator(f'.card[data-package-id="{ids[0]}"]')
+    assert "no-incoming-arrow" in hub_served.get_attribute("class").split()
+    assert hub_served.locator(".card-start-text").text_content() == (
+        "No outstanding prerequisite.")
+    assert hub_served.locator(".card-not-drawn").is_hidden()
+    for index, package_id in enumerate(ids[1:], start=1):
+        card = served.locator(f'.card[data-package-id="{package_id}"]')
+        assert "no-incoming-arrow" not in card.get_attribute("class").split()
+        assert card.locator(".card-start-text").text_content() == ""
+        assert card.locator(".card-not-drawn").is_hidden() is (index <= 8)
+    assert served.locator(".card-not-drawn:not([hidden])").all_text_contents() == [
+        "Prerequisite not drawn"] * 4
+    # Selected, the lane-less connection is dashed and its dependent keeps the
+    # marker, which says the board draws it only for the selection.
+    served.locator(f'.card[data-package-id="{ids[10]}"]').click()
+    assert connection_pairs(served) == planned | {(ids[0], ids[10])}
+    assert served.locator(".connection.overflow").count() == 1
+    assert "emphasized" in served.locator(".connection.overflow").get_attribute(
+        "class").split()
+    assert served.locator(".connection.overflow .rail").evaluate(
+        "rail => getComputedStyle(rail).strokeDasharray") != "none"
+    assert served.locator(".card.related").evaluate_all(
+        "cards => cards.map(card => card.dataset.packageId)") == [ids[0]]
+    assert served.locator(f'.card[data-package-id="{ids[10]}"] .card-not-drawn').is_visible()
 
 
 def test_upward_edge_rails_use_separate_lanes(open_page):
@@ -4049,8 +4120,6 @@ def test_cross_project_rail_needs_a_lane_in_both_columns(open_page):
     ) == ["132px", "132px"]
     assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]}
     card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    assert card.locator(".card-rail-text").all_text_contents() == ["needs: S (Beta)"]
-    assert card.locator(".card-links").count() == 0
     assert "no-incoming-arrow" not in card.get_attribute("class").split()
     assert card.locator(".card-start-text").text_content() == ""
     assert page.locator('.board-row[data-lifecycle="Under_Development"] .connection-band').count() == 0
@@ -4060,6 +4129,10 @@ def test_cross_project_rail_needs_a_lane_in_both_columns(open_page):
     # without a band being added to the row.
     card.click()
     assert connection_pairs(page) == {(ids[0], dependent) for dependent in ids[1:]} | {(STEP_TWO, STEP_ONE)}
+    # The panel names the cross-project prerequisite the lane cap left undrawn.
+    assert panel_needs(page) == [{
+        "title": "S", "linked": True, "project": "Beta",
+        "reason": "merge state unknown"}]
     assert page.locator(".connection.overflow.emphasized").count() == 1
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"]').get_attribute("class").split().count("related") == 1
     assert page.locator('.board-row[data-lifecycle="Under_Development"] .connection-band').count() == 0
@@ -4074,7 +4147,6 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
     assert connection_pairs(page) == expected
     assert page.locator(f'.card[data-package-id="{far}"]').count() == 0
     assert page.locator(f'.card[data-package-id="{unknown}"]').count() == 1
-    assert page.locator(f'.card[data-package-id="{unknown}"] .card-links').count() == 0
     assert all(far not in pair for pair in connection_pairs(page))
     assert_readable_arrows(page)
     for width in (650, 1800):
@@ -4120,8 +4192,10 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
         assert connection_pairs(page) == {(STEP_TWO, GATE)}
     else:
         assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE)}
-    assert "unresolved target" in page.locator(f'.card[data-package-id="{LOOSE}"]').inner_text()
-    assert page.locator(f'.card[data-package-id="{STEP_ONE}"] .card-links').count() == 0
+    # A target that did not resolve is listed as the unresolved reason word.
+    page.locator(f'.card[data-package-id="{LOOSE}"]').click()
+    assert panel_needs(page) == [{
+        "title": "unresolved target", "linked": False, "project": "", "reason": ""}]
 
 
 def test_multiple_claims_share_one_arrow_and_one_cross_project_name(open_page):
@@ -4131,10 +4205,11 @@ def test_multiple_claims_share_one_arrow_and_one_cross_project_name(open_page):
     page = open_page(StaticClient(value))
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
     assert page.locator(".rail").count() == 3
-    source = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    assert source.locator(".card-links").count() == 0
-    [blocks] = source.locator(".card-rail-text").all_text_contents()
-    assert blocks.count("(Beta)") == 1
+    # Two claims on one prerequisite name it once, with one cross-project name.
+    page.locator(f'.card[data-package-id="{LOOSE}"]').click()
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "Alpha",
+        "reason": "merge state unknown"}]
     assert_readable_arrows(page)
 
 
@@ -4540,7 +4615,7 @@ def test_successful_changed_poll_clears_previous_error_and_installs(open_page):
     assert client.calls == 3
 
 
-def test_real_producer_renders_all_seven_rows_and_finished_done_hides_provider_links_and_rail(
+def test_real_producer_renders_all_seven_rows_and_hidden_done_prerequisite_keeps_no_rail(
     open_page, tmp_path,
 ):
     root = tmp_path / "seven-stages"
@@ -4573,7 +4648,11 @@ def test_real_producer_renders_all_seven_rows_and_finished_done_hides_provider_l
     hidden_page.fill("#filter", "Done target")
     assert hidden_page.locator("#board .card:visible").count() == 0
     hidden_page.fill("#filter", "")
-    assert queue.locator(".card-links").count() == 0
+    # The hidden finished provider draws no arrow, and the panel names it by its
+    # catalog title as plain text, saying why it is not displayed.
+    assert panel_needs(hidden_page) == [{
+        "title": "Done target", "linked": False, "project": "",
+        "reason": "merge state unknown, in a finished row, hidden"}]
     assert hidden_page.locator(
         f'.connection[data-source="{STAGE_IDS["Done"]}"]'
     ).count() == 0
@@ -5180,7 +5259,9 @@ def test_real_unresolved_targets_do_not_draw_connections(open_page, tmp_path, du
     assert edge["reason"] == ("duplicate_target" if duplicate else "missing_target")
     page = open_page(ScanningClient(tmp_path))
     card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
-    assert "unresolved target" in card.inner_text()
+    card.click()
+    assert panel_needs(page) == [{
+        "title": "unresolved target", "linked": False, "project": "", "reason": ""}]
     assert connection_pairs(page) == set()
     page.fill("#filter", "partial")
     playwright.expect(card).to_be_hidden()
@@ -5958,7 +6039,7 @@ def checkouts_document_mutations():
     mutation rather than a digest that mutation invalidated.
     """
     def previous_schema(document):
-        document["schema_version"] = models.CHECKOUTS_SCHEMA_VERSION - 1
+        document["schema_version"] = 11
 
     def extra_top_level_key(document):
         document["unexpected"] = 1
@@ -6008,23 +6089,14 @@ def checkouts_document_mutations():
     def non_string_code_status_text(document):
         document["packages"][0]["code_status"]["text"] = 7
 
-    def text_prerequisites(document):
-        document["packages"][0]["prerequisites"] = "No prerequisites"
+    def prerequisites_key_present(document):
+        document["packages"][0]["prerequisites"] = None
 
-    def extra_prerequisites_key(document):
-        document["packages"][0]["prerequisites"]["unexpected"] = 1
+    def missing_merged_on_main(document):
+        del document["packages"][0]["merged_on_main"]
 
-    def unknown_prerequisites_state(document):
-        document["packages"][0]["prerequisites"]["state"] = "maybe"
-
-    def control_prerequisites_text(document):
-        document["packages"][0]["prerequisites"]["text"] = "No prerequisites\u0007"
-
-    def extra_prerequisite_item_key(document):
-        document["packages"][1]["prerequisites"]["items"][0]["unexpected"] = 1
-
-    def unknown_prerequisite_checkout_fact(document):
-        document["packages"][1]["prerequisites"]["items"][0]["in_checkout"] = "maybe"
+    def unknown_merged_on_main(document):
+        document["packages"][0]["merged_on_main"] = "maybe"
 
     return [
         {"id": "previous-schema", "mutate": previous_schema, "reseal": True},
@@ -6046,16 +6118,10 @@ def checkouts_document_mutations():
          "reseal": True},
         {"id": "non-string-code-status-text", "mutate": non_string_code_status_text,
          "reseal": True},
-        {"id": "text-prerequisites", "mutate": text_prerequisites, "reseal": True},
-        {"id": "extra-prerequisites-key", "mutate": extra_prerequisites_key, "reseal": True},
-        {"id": "unknown-prerequisites-state", "mutate": unknown_prerequisites_state,
+        {"id": "prerequisites-key-present", "mutate": prerequisites_key_present,
          "reseal": True},
-        {"id": "control-prerequisites-text", "mutate": control_prerequisites_text,
-         "reseal": True},
-        {"id": "extra-prerequisite-item-key", "mutate": extra_prerequisite_item_key,
-         "reseal": True},
-        {"id": "unknown-prerequisite-checkout-fact",
-         "mutate": unknown_prerequisite_checkout_fact, "reseal": True},
+        {"id": "missing-merged-on-main", "mutate": missing_merged_on_main, "reseal": True},
+        {"id": "unknown-merged-on-main", "mutate": unknown_merged_on_main, "reseal": True},
     ]
 
 
@@ -6090,6 +6156,8 @@ def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
     settle_frames(page)
     summary = page.locator(".checkouts-issue-summary")
     assert summary.count() == 0
+    # The served document draws its lines, so each refusal below hides a line.
+    assert page.locator(".card-code-status").count() > 0
     card = page.locator(f'.card[data-package-id="{CHECKOUTS_PACKAGE_IDS["alpha"]}"]')
     card.click()
     kept = card.element_handle()
@@ -6110,11 +6178,13 @@ def test_checkouts_validator_refuses_each_mutation(open_page, real_checkouts):
         playwright.expect(summary).to_have_text(
             "Code Status unavailable: checkouts_protocol_error"
         )
-        # Only the notice changes: the catalog, its selection and the button stay.
+        # Only the notice changes: the catalog, its selection and the button stay,
+        # and every checkout line goes with the document the browser refused.
         assert summary.count() == 1, case["id"]
         assert page.locator("#refresh").count() == 0, case["id"]
         assert page.evaluate("window.removedCards") == 0, case["id"]
         assert card_paths(page) == shown, case["id"]
+        assert page.locator(".card-code-status, .card-baseline").count() == 0, case["id"]
         assert kept.evaluate("node => node.isConnected && node === document.activeElement"), (
             case["id"]
         )
@@ -6570,6 +6640,474 @@ def test_code_status_waits_for_the_card_the_scan_names(open_page, real_checkouts
     assert code_status_line(page, "Repo/Shipped/alpha") == (
         f"Code Status: {package_text(real_checkouts.document_three, 'Repo/Shipped/alpha')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Prerequisite readiness: the ready signal, the marker and the drawn arrows
+# ---------------------------------------------------------------------------
+
+# The configuration the synthetic catalog below and every scan served to it were
+# taken under, so a scan can match the board it is served to.
+READINESS_REVISION = CHECKOUTS_REVISION
+READINESS_MERGED_ID = "123e4567-e89b-42d3-a456-426614174b01"
+READINESS_MERGED_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b02"
+READINESS_SATISFIED_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b03"
+READINESS_UNMERGED_ID = "123e4567-e89b-42d3-a456-426614174b04"
+READINESS_UNMERGED_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b05"
+READINESS_OPEN_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b06"
+READINESS_UNKNOWN_ID = "123e4567-e89b-42d3-a456-426614174b07"
+READINESS_UNKNOWN_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b08"
+READINESS_UNLISTED_ID = "123e4567-e89b-42d3-a456-426614174b09"
+READINESS_UNLISTED_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0a"
+READINESS_MISSING_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0b"
+READINESS_ENTRYLESS_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0c"
+READINESS_COMPLETION_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b11"
+READINESS_TWIN_ID = "123e4567-e89b-42d3-a456-426614174b0d"
+READINESS_HIDDEN_ID = "123e4567-e89b-42d3-a456-426614174b0e"
+READINESS_HIDDEN_DEPENDENT_ID = "123e4567-e89b-42d3-a456-426614174b0f"
+# A prerequisite UUID no catalog entry holds.
+READINESS_ABSENT_ID = "123e4567-e89b-42d3-a456-426614174b10"
+
+# The four cards of the column that declare no prerequisite at all, so they are
+# ready whether or not a scan is served.
+READINESS_UNDECLARED = {
+    "Alpha/Queue/merged-provider",
+    "Alpha/Queue/zebra-provider",
+    "Alpha/Queue/unknown-provider",
+    "Alpha/Queue/unlisted-provider",
+}
+# Every path the first served scan lists, except the unlisted provider and the
+# dependent with no document entry.
+READINESS_SCAN_PATHS = (
+    "Alpha/Done/hidden-provider",
+    "Alpha/Queue/merged-dependent",
+    "Alpha/Queue/merged-provider",
+    "Alpha/Queue/missing-dependent",
+    "Alpha/Queue/open-dependent",
+    "Alpha/Queue/satisfied-dependent",
+    "Alpha/Queue/twin-one",
+    "Alpha/Queue/twin-two",
+    "Alpha/Queue/unlisted-dependent",
+    "Alpha/Queue/unknown-dependent",
+    "Alpha/Queue/unknown-provider",
+    "Alpha/Queue/zebra-dependent",
+    "Alpha/Queue/zebra-provider",
+)
+# Every card that declares no outstanding prerequisite while that scan is served.
+READINESS_READY = READINESS_UNDECLARED | {
+    "Alpha/Queue/merged-dependent",
+    "Alpha/Queue/satisfied-dependent",
+    "Alpha/Queue/entryless-dependent",
+    "Alpha/Queue/completion-dependent",
+}
+# Every card whose outstanding prerequisite the board does not draw.
+READINESS_MARKED = {
+    "Alpha/Queue/missing-dependent",
+    "Alpha/Queue/twin-one",
+    "Alpha/Queue/twin-two",
+    "Alpha/Queue/hidden-dependent",
+}
+# The connections that resolve at all, which is what the board draws while no
+# scan is served.
+READINESS_PLANNED = {
+    (READINESS_MERGED_ID, READINESS_MERGED_DEPENDENT_ID),
+    (READINESS_MERGED_ID, READINESS_SATISFIED_DEPENDENT_ID),
+    (READINESS_MERGED_ID, READINESS_ENTRYLESS_DEPENDENT_ID),
+    (READINESS_MERGED_ID, READINESS_COMPLETION_DEPENDENT_ID),
+    (READINESS_UNMERGED_ID, READINESS_UNMERGED_DEPENDENT_ID),
+    (READINESS_UNMERGED_ID, READINESS_OPEN_DEPENDENT_ID),
+    (READINESS_UNKNOWN_ID, READINESS_UNKNOWN_DEPENDENT_ID),
+    (READINESS_UNLISTED_ID, READINESS_UNLISTED_DEPENDENT_ID),
+}
+# The connections whose prerequisite the first served scan leaves outstanding.
+READINESS_OUTSTANDING_PAIRS = {
+    (READINESS_UNMERGED_ID, READINESS_UNMERGED_DEPENDENT_ID),
+    (READINESS_UNMERGED_ID, READINESS_OPEN_DEPENDENT_ID),
+    (READINESS_UNKNOWN_ID, READINESS_UNKNOWN_DEPENDENT_ID),
+    (READINESS_UNLISTED_ID, READINESS_UNLISTED_DEPENDENT_ID),
+}
+# The connections the scan that merges the shown unmerged target leaves.
+READINESS_SETTLED_PAIRS = {
+    (READINESS_UNKNOWN_ID, READINESS_UNKNOWN_DEPENDENT_ID),
+    (READINESS_UNLISTED_ID, READINESS_UNLISTED_DEPENDENT_ID),
+}
+
+
+def _readiness_edge(target_id, reason, *, resolved_state="unsatisfied", claim_name="input"):
+    """One claim edge with the reason the catalog reports for that outcome."""
+    edge = _edge(target_id, claim_name)
+    edge.update(
+        reason=reason,
+        resolved_state=resolved_state,
+        observed_state="satisfied" if resolved_state == "satisfied" else resolved_state,
+    )
+    return edge
+
+
+def readiness_payload():
+    """One column whose every declared prerequisite states its own merge outcome.
+
+    The prerequisites cover a merged target reached by a plain and by a
+    satisfied claim and by a completion edge, a ``not_merged`` and an ``unknown``
+    target, one edge whose reason is no claim outcome, a target in a hidden
+    finished row, a target the scan does not list, an absent UUID and two cards
+    sharing a Package ID.
+    """
+    entries = [
+        _entry(READINESS_MERGED_ID, "Alpha/Queue/merged-provider", "queue",
+               "Merged provider", "Alpha"),
+        _entry(READINESS_MERGED_DEPENDENT_ID, "Alpha/Queue/merged-dependent", "queue",
+               "Merged dependent", "Alpha",
+               [_readiness_edge(READINESS_MERGED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_SATISFIED_DEPENDENT_ID, "Alpha/Queue/satisfied-dependent", "queue",
+               "Satisfied dependent", "Alpha",
+               [_readiness_edge(READINESS_MERGED_ID, "claim_satisfied",
+                                resolved_state="satisfied")]),
+        _entry(READINESS_UNMERGED_ID, "Alpha/Queue/zebra-provider", "queue",
+               "Zebra provider", "Alpha"),
+        _entry(READINESS_UNMERGED_DEPENDENT_ID, "Alpha/Queue/zebra-dependent", "queue",
+               "Aardvark zebra dependent", "Alpha",
+               [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_OPEN_DEPENDENT_ID, "Alpha/Queue/open-dependent", "queue",
+               "Badger open dependent", "Alpha",
+               [_readiness_edge(READINESS_UNMERGED_ID, "missing_claim")]),
+        _entry(READINESS_UNKNOWN_ID, "Alpha/Queue/unknown-provider", "queue",
+               "Unknown provider", "Alpha"),
+        _entry(READINESS_UNKNOWN_DEPENDENT_ID, "Alpha/Queue/unknown-dependent", "queue",
+               "Unknown dependent", "Alpha",
+               [_readiness_edge(READINESS_UNKNOWN_ID, "claim_unknown",
+                                resolved_state="unknown")]),
+        _entry(READINESS_UNLISTED_ID, "Alpha/Queue/unlisted-provider", "queue",
+               "Unlisted provider", "Alpha"),
+        _entry(READINESS_UNLISTED_DEPENDENT_ID, "Alpha/Queue/unlisted-dependent", "queue",
+               "Unlisted dependent", "Alpha",
+               [_readiness_edge(READINESS_UNLISTED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_MISSING_DEPENDENT_ID, "Alpha/Queue/missing-dependent", "queue",
+               "Missing dependent", "Alpha",
+               [_readiness_edge(READINESS_ABSENT_ID, "missing_target",
+                                resolved_state="unknown")]),
+        _entry(READINESS_ENTRYLESS_DEPENDENT_ID, "Alpha/Queue/entryless-dependent", "queue",
+               "Entryless dependent", "Alpha",
+               [_readiness_edge(READINESS_MERGED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_COMPLETION_DEPENDENT_ID, "Alpha/Queue/completion-dependent",
+               "queue", "Completion dependent", "Alpha",
+               [_completion_edge(READINESS_MERGED_ID)]),
+        _entry(READINESS_TWIN_ID, "Alpha/Queue/twin-one", "queue", "Twin one", "Alpha",
+               [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_TWIN_ID, "Alpha/Queue/twin-two", "queue", "Twin two", "Alpha",
+               [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
+        _entry(READINESS_HIDDEN_ID, "Alpha/Done/hidden-provider", "done",
+               "Hidden provider", "Alpha"),
+        _entry(READINESS_HIDDEN_DEPENDENT_ID, "Alpha/Queue/hidden-dependent", "queue",
+               "Hidden dependent", "Alpha",
+               [_readiness_edge(READINESS_HIDDEN_ID, "claim_unsatisfied")]),
+    ]
+    entries.sort(key=lambda entry: entry["package_path"])
+    value = json.loads(board_payload())
+    value["entries"] = entries
+    value["inventory"] = {
+        "projects": [{"name": "Alpha", "availability": "complete"}],
+        "stages": [
+            {"project": "Alpha", "stage": "Done", "availability": "complete"},
+            {"project": "Alpha", "stage": "Queue", "availability": "complete"},
+        ],
+    }
+    value["terminal_stages"] = ["Done"]
+    value["configuration_revision"] = READINESS_REVISION
+    _reseal(value)
+    return value
+
+
+def readiness_scan(*, merged=()):
+    """The merge facts of one scan of the readiness board, by package path.
+
+    ``merged`` names further packages the scan reports merged.  Neither the
+    unlisted provider nor the dependent with no scan entry is listed at all.
+    """
+    facts = {path: "not_merged" for path in READINESS_SCAN_PATHS}
+    facts["Alpha/Queue/merged-provider"] = "merged"
+    facts["Alpha/Queue/unknown-provider"] = "unknown"
+    for path in merged:
+        facts[path] = "merged"
+    return facts
+
+
+def sealed_checkouts_document(facts):
+    """One sealed scan listing ``facts`` (package path to merge fact) alone.
+
+    The board reads a package's path and its merge fact; the panel also reads
+    its target, branch and baseline rows, so each entry states a package with no
+    checkout, no branch, no Baseline and no Code Status.
+    """
+    document = copy.deepcopy(empty_checkouts_document())
+    document["configuration_revision"] = READINESS_REVISION
+    document["packages"] = [
+        {
+            "package_path": path,
+            "package_id": None,
+            "finished": False,
+            "superseded": None,
+            "target": {
+                "status": "missing", "clone": None, "worktree": None,
+                "within_folders": False,
+            },
+            "branch": {"status": "absent", "name": None},
+            "baseline": {"status": "absent", "sha": None, "drift": None, "checkout": None},
+            "code_status": None,
+            "merged_on_main": fact,
+        }
+        for path, fact in sorted(facts.items())
+    ]
+    return redigest(document)
+
+
+def readiness_states(page):
+    """Each rendered card's ready signal: its teal class, start text and marker."""
+    return page.locator(".card[data-package-path]").evaluate_all("""cards => {
+      return Object.fromEntries(cards.map(card => [card.dataset.packagePath, {
+        teal: card.classList.contains('no-incoming-arrow'),
+        start: card.querySelector('.card-start-text').textContent,
+        marker: !card.querySelector('.card-not-drawn').hidden,
+      }]));
+    }""")
+
+
+def assert_ready_signals(page, *, ready, marked):
+    """Every card is ready exactly when named, with one marker exactly where named.
+
+    The teal class and the start text are one signal: a card is ready when it
+    carries nothing outstanding, and it reads so in both places together.
+    """
+    states = readiness_states(page)
+    assert set(ready) | set(marked) <= set(states)
+    for path, state in states.items():
+        assert state["teal"] is (path in ready), path
+        assert state["start"] == (
+            "No outstanding prerequisite." if path in ready else ""), path
+        assert state["marker"] is (path in marked), path
+
+
+def card_layout(page):
+    """Each card's order and its box, measured from the first card's corner."""
+    return page.locator(".card[data-package-path]").evaluate_all("""cards => {
+      const origin = cards[0].getBoundingClientRect();
+      const round = (value) => Math.round(value * 10) / 10;
+      return cards.map((card) => {
+        const box = card.getBoundingClientRect();
+        return [card.dataset.packagePath, round(box.left - origin.left),
+                round(box.top - origin.top), round(box.width), round(box.height)];
+      });
+    }""")
+
+
+def card_facts_and_search(page):
+    """Each card's served facts markup and its search text, by package path."""
+    return page.locator(".card[data-package-path]").evaluate_all(
+        """cards => Object.fromEntries(cards.map((card) => [card.dataset.packagePath, [
+             card.querySelector('.card-facts').innerHTML, card.dataset.search]]))""")
+
+
+def column_tracks(page):
+    """The board's column track list, which one reserved lane widens."""
+    return page.locator("#board").evaluate(
+        "board => board.style.getPropertyValue('--column-tracks')")
+
+
+def readiness_page(launch, double, *, client=None):
+    """Open one fake-clock page over the readiness board and its scan."""
+    return launch(
+        client or StaticClient(readiness_payload()),
+        settings=BrowserSettings(revision=READINESS_REVISION),
+        checkouts=double,
+        fake_clock=True,
+        init_script=RESPONSE_RECORDER,
+    )
+
+
+def test_prerequisite_readiness_follows_the_served_scan(open_page):
+    """Only an outstanding prerequisite is drawn, and it decides the ready signal."""
+    double = BrowserCheckouts(sealed_checkouts_document(readiness_scan()))
+    page = readiness_page(open_page, double)
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    assert connection_pairs(page) == READINESS_OUTSTANDING_PAIRS
+    assert_ready_signals(page, ready=READINESS_READY, marked=READINESS_MARKED)
+    assert page.locator(".card-not-drawn:not([hidden])").all_text_contents() == [
+        "Prerequisite not drawn"] * len(READINESS_MARKED)
+    # The marker is one small line of that wording, readable in both themes, and
+    # it takes no room in its card: it is in the corner, not in the flow.
+    marked_card = page.locator('.card[data-package-path="Alpha/Queue/hidden-dependent"]')
+    card_box = marked_card.bounding_box()
+    for theme in ("dark", "light"):
+        page.get_by_label("Theme", exact=True).select_option(theme)
+        marker = marked_card.locator(".card-not-drawn")
+        assert marker.is_visible()
+        assert marker.inner_text() == "Prerequisite not drawn"
+        marker_box = marker.bounding_box()
+        assert marker_box["height"] < card_box["height"] / 4, (theme, marker_box)
+        colors = marker.evaluate(
+            "node => [getComputedStyle(node).color, getComputedStyle(node).backgroundColor]")
+        assert contrast_ratio(colors[0], colors[1]) >= 4.5, (theme, colors)
+    page.get_by_label("Theme", exact=True).select_option("dark")
+    # Order, boxes and the reserved lanes come from every declared edge, merged
+    # or not, so they are what a later merge must leave alone.
+    layout = card_layout(page)
+    facts = card_facts_and_search(page)
+    tracks = column_tracks(page)
+
+    # A search hides the unmerged provider the dependent waits on, and nothing
+    # else: the dependent gains the marker and keeps the plain surface.
+    before = readiness_states(page)
+    page.fill("#filter", "aardvark")
+    after = readiness_states(page)
+    assert {path: (state["teal"], state["start"]) for path, state in after.items()} == {
+        path: (state["teal"], state["start"]) for path, state in before.items()}
+    # The search hides every outstanding prerequisite, so each dependent whose
+    # connection it hides gains the marker and no card changes colour.
+    assert {path for path, state in after.items() if state["marker"]} == READINESS_MARKED | {
+        "Alpha/Queue/zebra-dependent", "Alpha/Queue/open-dependent",
+        "Alpha/Queue/unknown-dependent", "Alpha/Queue/unlisted-dependent"}
+    assert connection_pairs(page) == set()
+    page.fill("#filter", "")
+    assert_ready_signals(page, ready=READINESS_READY, marked=READINESS_MARKED)
+
+    # Needs is the one text list of a card's outstanding prerequisites: the
+    # title the full catalog holds, a link when its card is displayed and plain
+    # text when Hide terminal rows removed it, then the reason words.  Reading
+    # every card of the board proves each list is exactly its own prerequisites.
+    needs_cases = [
+        ("Alpha/Queue/zebra-dependent", [("Zebra provider", True, "", "not merged")]),
+        ("Alpha/Queue/open-dependent", [("Zebra provider", True, "", "not merged")]),
+        ("Alpha/Queue/unknown-dependent", [("Unknown provider", True, "", "merge state unknown")]),
+        ("Alpha/Queue/unlisted-dependent", [("Unlisted provider", True, "", "merge state unknown")]),
+        ("Alpha/Queue/missing-dependent", [("unresolved target", False, "", "")]),
+        ("Alpha/Queue/twin-one", [("Zebra provider", True, "", "not merged")]),
+        ("Alpha/Queue/twin-two", [("Zebra provider", True, "", "not merged")]),
+        ("Alpha/Queue/hidden-dependent",
+         [("Hidden provider", False, "", "not merged, in a finished row, hidden")]),
+        ("Alpha/Queue/merged-dependent", []),
+        ("Alpha/Queue/satisfied-dependent", []),
+        ("Alpha/Queue/entryless-dependent", []),
+        ("Alpha/Queue/completion-dependent", []),
+        ("Alpha/Queue/merged-provider", []),
+    ]
+    for path, entries in needs_cases:
+        page.locator(f'.card[data-package-path="{path}"]').click()
+        assert panel_needs(page) == [
+            {"title": title, "linked": linked, "project": project, "reason": reason}
+            for title, linked, project, reason in entries], path
+        if not entries:
+            assert page.locator("#work-item-panel-body .panel-links").count() == 0, path
+    # The last click leaves that provider selected: no card carries a
+    # relationship as text, spoken or written, and a provider's panel has no
+    # list repeating what waits on it.
+    assert page.locator(
+        ".card .card-links, .card .card-rail-text, .card .link.unresolved").count() == 0
+    assert page.locator('#work-item-panel-body [data-relation="blocks"]').count() == 0
+
+    # Selection marks the cards at the other end of the outstanding
+    # connections: the unmerged provider marks both dependents, the merged one
+    # has nothing outstanding to mark and no arrow to emphasize.
+    page.locator(f'.card[data-package-id="{READINESS_UNMERGED_ID}"]').click()
+    assert {tuple(pair) for pair in page.locator(".connection.emphasized").evaluate_all(
+        "groups => groups.map((group) => [group.dataset.source, group.dataset.dependent])"
+    )} == {
+        (READINESS_UNMERGED_ID, READINESS_UNMERGED_DEPENDENT_ID),
+        (READINESS_UNMERGED_ID, READINESS_OPEN_DEPENDENT_ID),
+    }
+    assert page.locator(".card.related").evaluate_all(
+        "cards => cards.map((card) => card.dataset.packagePath)") == [
+        "Alpha/Queue/zebra-dependent", "Alpha/Queue/open-dependent"]
+    page.locator(f'.card[data-package-id="{READINESS_UNMERGED_ID}"]').click()
+    page.locator(f'.card[data-package-id="{READINESS_MERGED_ID}"]').click()
+    assert page.locator(".card.related").count() == 0
+    assert page.locator(".connection.emphasized").count() == 0
+    page.locator(f'.card[data-package-id="{READINESS_MERGED_ID}"]').click()
+
+    # A scan that merges the shown unmerged target and the hidden finished one
+    # rewrites no displayed card's facts or search text, and still redraws.
+    double.serve(checkouts_envelope(sealed_checkouts_document(readiness_scan(
+        merged=("Alpha/Queue/zebra-provider", "Alpha/Done/hidden-provider")))))
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(
+        f'.connection[data-source="{READINESS_UNMERGED_ID}"]')).to_have_count(0)
+    settle_frames(page)
+    assert connection_pairs(page) == READINESS_SETTLED_PAIRS
+    assert_ready_signals(page, ready=READINESS_READY | {
+        "Alpha/Queue/zebra-dependent", "Alpha/Queue/open-dependent",
+        "Alpha/Queue/twin-one", "Alpha/Queue/twin-two",
+        "Alpha/Queue/hidden-dependent",
+    }, marked={"Alpha/Queue/missing-dependent"})
+    assert card_facts_and_search(page) == facts
+    assert card_layout(page) == layout
+    assert column_tracks(page) == tracks
+
+    # A rebuild keeps the order, the boxes and the reserved lanes: hiding and
+    # showing the finished row plans lanes from the same edges.
+    page.get_by_label("Hide terminal rows", exact=True).uncheck()
+    playwright.expect(page.locator(
+        '.card[data-package-path="Alpha/Done/hidden-provider"]')).to_be_visible()
+    assert connection_pairs(page) == READINESS_SETTLED_PAIRS
+    assert_ready_signals(page, ready=READINESS_READY | {
+        "Alpha/Queue/zebra-dependent", "Alpha/Queue/open-dependent",
+        "Alpha/Queue/twin-one", "Alpha/Queue/twin-two",
+        "Alpha/Queue/hidden-dependent", "Alpha/Done/hidden-provider",
+    }, marked={"Alpha/Queue/missing-dependent"})
+    page.get_by_label("Hide terminal rows", exact=True).check()
+    playwright.expect(page.locator(
+        '.card[data-package-path="Alpha/Done/hidden-provider"]')).to_have_count(0)
+    assert card_layout(page) == layout
+    assert column_tracks(page) == tracks
+    assert connection_pairs(page) == READINESS_SETTLED_PAIRS
+
+
+def test_prerequisite_readiness_waits_for_and_follows_each_scan(open_page):
+    """A held, a settled, a failed and a settled scan each leave every card in place."""
+    double = BrowserCheckouts(sealed_checkouts_document(readiness_scan()))
+    gate = double.hold()
+    page = readiness_page(open_page, double)
+    assert double.entered.wait(timeout=10)
+    # The first scan is still in flight, so none is served: every declared
+    # prerequisite is outstanding, every arrow is drawn and no card is marked.
+    assert page.evaluate("window.checkoutsResponses") == []
+    assert connection_pairs(page) == READINESS_PLANNED
+    assert_ready_signals(page, ready=READINESS_UNDECLARED, marked=set())
+    layout = card_layout(page)
+    # No merge fact is served while the first scan is held, so every declared
+    # prerequisite is outstanding and the panel reads an unknown merge state
+    # even for the one this scan will report merged.
+    page.locator(f'.card[data-package-id="{READINESS_MERGED_DEPENDENT_ID}"]').click()
+    assert panel_needs(page) == [{
+        "title": "Merged provider", "linked": True, "project": "",
+        "reason": "merge state unknown"}]
+    page.locator(f'.card[data-package-id="{READINESS_MERGED_DEPENDENT_ID}"]').click()
+
+    # The release settles it: only the outstanding prerequisites stay drawn.
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    playwright.expect(page.locator(
+        f'.connection[data-source="{READINESS_MERGED_ID}"]')).to_have_count(0)
+    assert connection_pairs(page) == READINESS_OUTSTANDING_PAIRS
+    assert_ready_signals(page, ready=READINESS_READY, marked=READINESS_MARKED)
+    assert card_layout(page) == layout
+
+    # A failed read falls back to the state with no scan served at all.
+    double.fail("checkouts_failed")
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(
+        f'.connection[data-source="{READINESS_MERGED_ID}"]')).to_have_count(4)
+    assert connection_pairs(page) == READINESS_PLANNED
+    assert_ready_signals(page, ready=READINESS_UNDECLARED, marked=set())
+    assert card_layout(page) == layout
+
+    # A good read after the failure settles the board again.
+    double.serve(checkouts_envelope(sealed_checkouts_document(readiness_scan())))
+    fire_checkouts_poll(page)
+    playwright.expect(page.locator(
+        f'.connection[data-source="{READINESS_MERGED_ID}"]')).to_have_count(0)
+    assert connection_pairs(page) == READINESS_OUTSTANDING_PAIRS
+    assert_ready_signals(page, ready=READINESS_READY, marked=READINESS_MARKED)
+    assert card_layout(page) == layout
 
 
 # ---------------------------------------------------------------------------
@@ -7709,7 +8247,6 @@ def checkout_word_requirements():
         (("packageBranchStatus",), set(models._PACKAGE_BRANCH_STATUSES)),
         (("baselineStatus",), set(models._BASELINE_STATUSES)),
         (("prerequisiteMain",), set(models.PREREQUISITE_MAIN_FACTS)),
-        (("prerequisiteCheckout",), set(models.PREREQUISITE_CHECKOUT_FACTS)),
         (("attentionClass",), {name for name, _ in models._ATTENTION_CODES}),
         (("attentionCode",), {code for _, code in models._ATTENTION_CODES}),
         (("availabilityState",), availability["named"]),
@@ -8038,13 +8575,14 @@ def checkout_raw_variant(document, mutate):
 def checkout_variant(document, mutate):
     """One re-digested capture with ``mutate`` applied; the parser must accept it.
 
-    A mutation of a targeted worktree's head or status, or of a package's target or
-    finished flag, changes what each pill derives, so every pill is recomputed from the
-    mutated facts (``repill``) before the document is sealed and parsed.
+    A mutation of a targeted worktree's head or status, or of a package's target,
+    branch or finished flag, changes what each package's merge fact derives, so
+    every merge fact is recomputed from the mutated facts (``refresh_merge_facts``)
+    before the document is sealed and parsed.
     """
     variant = copy.deepcopy(document)
     mutate(variant)
-    variant = reseal_checkouts(repill(variant))
+    variant = reseal_checkouts(refresh_merge_facts(variant))
     models.parse_checkouts(json.dumps(variant))
     return variant
 
@@ -12683,11 +13221,24 @@ def panel_code_rows(page):
         " row.querySelector('dd').innerText])"))
 
 
-def panel_links(page, relation):
-    """The link words one relationship list of the panel shows."""
+def panel_needs(page):
+    """Each Needs entry of the panel: its title, link, project and reason words.
+
+    ``linked`` is true when the entry is the link that selects the prerequisite's
+    card; a prerequisite whose card the board does not display is plain text.
+    """
     return page.locator(
-        f'#work-item-panel-body .panel-links[data-relation="{relation}"] li'
-    ).all_inner_texts()
+        '#work-item-panel-body .panel-links[data-relation="needs"] li'
+    ).evaluate_all("""items => items.map((item) => {
+      const link = item.querySelector('button.panel-link');
+      const plain = item.querySelector('.panel-needs-title, .link.unresolved');
+      return {
+        title: String((link || plain).textContent).trim(),
+        linked: link !== null,
+        project: String((item.querySelector('.panel-link-project') || {}).textContent || '').trim(),
+        reason: String((item.querySelector('.panel-needs-reason') || {}).textContent || '').trim(),
+      };
+    })""")
 
 
 def test_work_item_panel_follows_left_and_right_clicks(open_page):
@@ -12728,7 +13279,9 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     labels = body.locator(".panel-row dt").all_text_contents()
     assert not {"Stage", "Project", "Filepath"} & set(labels)
     # The relationship an arrow draws is named here, with the other project.
-    assert panel_links(page, "needs") == ["Foundation step Alpha"]
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "Alpha",
+        "reason": "merge state unknown"}]
     assert body.locator('.panel-links[data-relation="blocks"]').count() == 0
     # No checkout document is served, so the panel has no Code part.
     assert body.locator(".panel-code").count() == 0
@@ -12751,8 +13304,9 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     assert body.locator(".panel-title").inner_text() == "Dependent step"
     assert list(panel_rows(page)) == ["Status"]
     assert body.locator("details.panel-all-fields").evaluate("node => node.open")
-    assert panel_links(page, "needs") == ["Foundation step"]
-    assert panel_links(page, "blocks") == ["Gate step"]
+    assert panel_needs(page) == [{
+        "title": "Foundation step", "linked": True, "project": "",
+        "reason": "merge state unknown"}]
     step_two.click(button="right")
     assert step_two.get_attribute("aria-pressed") == "true"
     assert body.locator(".panel-title").inner_text() == "Dependent step"
@@ -12763,7 +13317,8 @@ def test_work_item_panel_follows_left_and_right_clicks(open_page):
     assert step_one.get_attribute("aria-pressed") == "true"
     assert step_two.get_attribute("aria-pressed") == "false"
     assert body.locator(".panel-title").inner_text() == "Foundation step"
-    assert panel_links(page, "blocks") == ["Dependent step", f"{XSS_TITLE} Beta"]
+    # A card that declares nothing outstanding has no Needs list at all.
+    assert body.locator(".panel-links").count() == 0
     assert page.evaluate("document.activeElement.id") == "work-item-panel-heading"
     assert body.locator("details.panel-all-fields").evaluate("node => node.open")
 
@@ -12819,7 +13374,9 @@ def test_install_moves_focus_to_the_panel_heading_when_its_link_is_gone(open_pag
     assert link.inner_text().startswith("Foundation step")
     link.focus()
     fire_poll(page)
-    playwright.expect(body.locator(".panel-link").first).not_to_contain_text("Foundation step")
+    # The new panel has no entry for the deleted prerequisite, so the link the
+    # focus was on is gone.
+    playwright.expect(body.locator(".panel-link")).to_have_count(0)
     assert page.evaluate("document.activeElement.id") == "work-item-panel-heading"
 
 
@@ -12910,8 +13467,7 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     package = next(
         item for item in document["packages"] if item["package_path"] == "Repo/Drafts/alpha")
     rows = panel_code_rows(page)
-    assert list(rows) == ["Code Status", "Branch", "Prerequisites"]
-    assert rows["Prerequisites"] == models.prerequisites_text(package["prerequisites"]["state"])
+    assert list(rows) == ["Code Status", "Branch"]
     assert rows["Code Status"] == CHECKOUTS_CODE_STATUS_TEXTS["Repo/Drafts/alpha"]
     assert rows["Branch"] == package["branch"]["name"]
     catalog_entry = next(
@@ -12932,7 +13488,6 @@ def test_work_item_panel_shows_the_served_checkout_facts(open_page, real_checkou
     assert disclosure.evaluate(
         "node => node === document.querySelector('#work-item-panel-body').lastElementChild"
         " && node.previousElementSibling.classList.contains('panel-code')")
-    assert panel_links(page, "blocks") == ["Beta"]
 
     # A checkout held only elsewhere is the last Code row, and only then.
     code_status_card(page, "Repo/Drafts/beta").click()
@@ -13076,19 +13631,8 @@ def comparison(relation, ahead=None, behind=None):
     }
 
 
-def prerequisites_pill(state, items=()):
-    """One served prerequisites pill with the collector's words for ``state``."""
-    return {
-        "state": state, "text": models.prerequisites_text(state), "checkout_sha": "c" * 40,
-        "items": [dict(item) for item in items],
-    }
-
-
-def with_baseline_facts(document, states, pills=None):
+def with_baseline_facts(document, states):
     """One capture where each path in ``states`` has a declared Baseline and checkout.
-
-    Each package given facts also serves a green ``none`` pill, or the state
-    ``pills`` names for its path, so the check mark follows the three tones alone.
 
     ``states`` maps a package path to ``(drift, vs_baseline, vs_base)``, or to
     ``None`` for a package served without a checkout.  The variant is served
@@ -13105,8 +13649,6 @@ def with_baseline_facts(document, states, pills=None):
                 package["baseline"]["checkout"] = None
                 continue
             drift, versus, against = state
-            package["prerequisites"] = prerequisites_pill(
-                (pills or {}).get(package["package_path"], "none"))
             package["baseline"]["status"] = "declared"
             package["baseline"]["sha"] = BASELINE_LINE_SHA
             package["baseline"]["drift"] = drift
@@ -13116,9 +13658,9 @@ def with_baseline_facts(document, states, pills=None):
     return checkout_raw_variant(document, mutate)
 
 
-def serve_baseline_states(page, double, states, pills=None):
+def serve_baseline_states(page, double, states):
     """Deliver one poll whose packages carry ``states`` and let the cards settle."""
-    double.serve(checkouts_envelope(with_baseline_facts(double.document, states, pills)))
+    double.serve(checkouts_envelope(with_baseline_facts(double.document, states)))
     fire_checkouts_poll(page)
     settle_frames(page)
 
@@ -13273,14 +13815,6 @@ def test_baseline_line_tones_follow_the_one_rule(
     assert line["M"]["tone"] == "red"
     assert line["link"] == {"tone": "grey", "line": "dashed", "style": "dashed"}
     assert line["C"]["tone"] == "green" and not line["C"]["check"]
-    # An all-green line keeps its check mark only under a green pill: a grey or a
-    # red pill removes it and changes no tone.
-    path = BASELINE_LINE_CARDS[0]
-    for state in ("none", "met", "unknown", "not_in_main", "not_in_checkout"):
-        serve_baseline_states(page, double, {path: (EQUAL, EQUAL, EQUAL)}, {path: state})
-        line = baseline_line(page, path)
-        assert [line[name]["tone"] for name in "BCM"] == ["green"] * 3
-        assert line["C"]["check"] is (state in ("none", "met")), state
     # One marker per tone is drawn in its token's computed colour.
     for tone, token in BASELINE_LINE_TONE_COLORS.items():
         expected = baseline_token_color(page, token)
@@ -13573,140 +14107,37 @@ def test_baseline_line_check_mark_needs_the_baseline_against_main_green(
     assert line["C"]["check"] is False
 
 
-PREREQUISITES_PILL_TONES = {
-    "none": "green", "met": "green", "not_in_main": "red", "not_in_checkout": "red",
-    "unknown": "grey",
-}
-
-
-def card_pills(page):
-    """Each card's pills as ``(path, [(text, label, tone)])``, for every rendered card."""
-    return {
-        path: pills for path, pills in page.locator(".card[data-package-path]").evaluate_all(
-            """cards => cards.map(card => [card.dataset.packagePath,
-              [...card.querySelectorAll('.card-prerequisites')].map(pill => [
-                pill.textContent, pill.getAttribute('aria-label'), pill.dataset.tone,
-                getComputedStyle(pill).color])])""")
-    }
-
-
-def test_prerequisites_pill_follows_the_served_state_everywhere(open_page, real_checkouts):
-    """One pill per card with a served pill, the check mark, search and panel all read it."""
-    alpha, beta, delta, epsilon = BASELINE_LINE_CARDS
-    gamma = "Repo/Shipped/gamma"
-    ids = CHECKOUTS_PACKAGE_IDS
-    titles = {
-        entry["package_id"]: entry["declared"]["title"] or entry["package_path"]
-        for entry in real_checkouts.catalog["entries"]
-    }
-    items = [
-        {"target_package_id": ids["alpha"], "merged_on_main": "merged", "in_checkout": "yes"},
-        {"target_package_id": None, "merged_on_main": "unknown", "in_checkout": "unknown"},
-    ]
-    green = [(EQUAL, EQUAL, EQUAL)] * 4
-    states = dict(zip(BASELINE_LINE_CARDS, green))
-
-    def poll(document, pills, pill_items=None):
-        def mutate(variant):
-            for package in variant["packages"]:
-                path = package["package_path"]
-                if path in pills:
-                    package["prerequisites"] = (
-                        None if pills[path] is None
-                        else prerequisites_pill(pills[path], (pill_items or {}).get(path, ())))
-        return checkout_raw_variant(document, mutate)
-
+def test_a_prerequisite_that_is_not_merged_leaves_the_check_mark_and_no_pill(
+    open_page, real_checkouts
+):
+    """The check mark reads the three tones alone, and no pill or its wording remains."""
+    alpha, beta = BASELINE_LINE_CARDS[0], BASELINE_LINE_CARDS[1]
+    alpha_package = next(
+        item for item in real_checkouts.document_zero["packages"]
+        if item["package_path"] == alpha)
+    # beta's own Completion Prerequisite names alpha, and the served fact says it
+    # did not land: the card is still checked and shows no pill.
+    assert alpha_package["merged_on_main"] == "not_merged"
     page, double = baseline_line_page(open_page, real_checkouts)
-    wording = models.prerequisites_text
-    first = {alpha: "none", beta: "met", delta: "not_in_main", epsilon: "not_in_checkout"}
-    served_a = poll(with_baseline_facts(real_checkouts.document_zero, states, first), first,
-                    {beta: items})
-    served_b = poll(served_a, {alpha: "unknown", delta: "met"})
-    green_color = baseline_token_color(page, "--state-done")
-    red_color = baseline_token_color(page, "--state-failed")
-
-    def expect_pills(expected):
-        pills = card_pills(page)
-        assert pills.pop(gamma) == []
-        assert set(pills) == set(expected)
-        for path, state in expected.items():
-            (shown, label, tone, color), = pills[path]
-            assert (shown, label) == (wording(state), wording(state)), path
-            assert tone == PREREQUISITES_PILL_TONES[state], path
-            if tone != "grey":
-                assert color == (green_color if tone == "green" else red_color), path
-            check = baseline_line(page, path)["C"]["check"]
-            assert check is (tone == "green"), (path, state)
-
-    def search(expected):
-        for state, path in expected.items():
-            assert visible_card_paths(page, wording(state)) == [path], state
-        page.fill("#filter", "")
-
-    def rebuild():
-        page.get_by_label("Hide terminal rows", exact=True).check()
-        page.get_by_label("Hide terminal rows", exact=True).uncheck()
-        settle_frames(page)
-
-    double.serve(checkouts_envelope(served_a))
-    fire_checkouts_poll(page)
-    settle_frames(page)
-    expect_pills(first)
-    first_search = {"none": alpha, "met": beta, "not_in_main": delta, "not_in_checkout": epsilon}
-    search(first_search)
-    rebuild()
-    expect_pills(first)
-    search(first_search)
-
-    # The panel of beta names the pill and each prerequisite with its two facts.
-    code_status_card(page, beta).click()
-    # Under the green pill the lines are folded under All fields.
-    assert panel_code_rows(page)["Prerequisites"] == wording("met")
-    assert [label for label, _ in panel_all_fields(page)] == [
-        "Branch", "Package ID", "Target repo", "Remote copy", "Verdict", "Pull requests",
-        "Baseline", "Each prerequisite", "Baseline line legend",
-    ]
-    row = dict(panel_all_fields(page))["Each prerequisite"]
-    assert f"{titles[ids['alpha']]}: merged on main, in this checkout" in row
-    assert "A prerequisite that cannot be read" in row
-    assert "unknown" not in row.split("A prerequisite")[0]
-    # The panel of alpha follows a poll that changes its pill.
-    code_status_card(page, alpha).click()
-    assert panel_code_rows(page)["Prerequisites"] == wording("none")
-
-    second = {alpha: "unknown", beta: "met", delta: "met", epsilon: "not_in_checkout"}
-    double.serve(checkouts_envelope(served_b))
-    fire_checkouts_poll(page)
-    settle_frames(page)
-    expect_pills(second)
-    assert panel_code_rows(page)["Prerequisites"] == wording("unknown")
-    assert visible_card_paths(page, wording("unknown")) == [alpha]
+    serve_baseline_states(page, double, {beta: (EQUAL, EQUAL, EQUAL)})
+    line = baseline_line(page, beta)
+    assert [line[name]["tone"] for name in "BCM"] == ["green"] * 3
+    assert line["C"]["check"] is True
+    # No card carries a pill, and no card's search text holds a pill's wording.
+    assert page.locator(".card-prerequisites").count() == 0
+    assert visible_card_paths(page, "Prerequisites not met") == []
+    # The same search reaches the card by its own path, so the empty result is the
+    # retired wording's and not a broken search.
+    assert visible_card_paths(page, "Repo/Drafts/beta") == [beta]
     page.fill("#filter", "")
-    rebuild()
-    assert visible_card_paths(page, wording("unknown")) == [alpha]
-    page.fill("#filter", "")
-    expect_pills(second)
-
-    # A prerequisite the catalog does not list is named by its ID.
-    stranger = "123e4567-e89b-42d3-a456-426614174aff"
-    # Under a red pill the lines show in the visible row and the disclosure has none.
-    served_c = poll(served_b, {beta: "not_in_main"},
-                    {beta: [dict(items[0], target_package_id=stranger)]})
-    double.serve(checkouts_envelope(served_c))
-    fire_checkouts_poll(page)
+    # The panel's Code rows and its folded rows name no pill and no prerequisite.
     code_status_card(page, beta).click()
-    assert f"{stranger}: merged on main, in this checkout" in panel_code_rows(page)["Prerequisites"]
-    assert "Each prerequisite" not in dict(panel_all_fields(page))
-
-    # A null pill removes the card's pill and its panel row.
-    code_status_card(page, epsilon).click()
-    assert "Prerequisites" in panel_code_rows(page)
-    served_d = poll(served_c, {epsilon: None})
-    double.serve(checkouts_envelope(served_d))
-    fire_checkouts_poll(page)
-    settle_frames(page)
-    assert card_pills(page)[epsilon] == []
-    assert "Prerequisites" not in panel_code_rows(page)
+    rows = panel_code_rows(page)
+    folded = [label for label, _ in panel_all_fields(page)]
+    assert "Code Status" in rows
+    assert "Prerequisites" not in rows
+    assert "Baseline" in folded
+    assert "Each prerequisite" not in folded
 
 
 def test_baseline_line_is_drawn_once_for_every_fact_state_and_never_without_a_checkout(
@@ -13807,7 +14238,7 @@ def test_baseline_line_poll_updates_the_count_and_keeps_the_other_tags(open_page
           const card = document.querySelector(`.card[data-package-path="${path}"]`);
           window.otherTags = [...card.querySelectorAll('.card-facts > :not(.card-baseline)')];
         }""", alpha)
-    assert page.evaluate("window.otherTags.length") >= 2
+    assert page.evaluate("window.otherTags.length") >= 1
 
     def other_tags_kept():
         return page.evaluate(
@@ -14191,3 +14622,7 @@ def signal_quiet_serves_a_finished_work_item_with_code_status(document):
         "state": "merged", "text": "merged", "pull_request": None, "push": None,
         "unpushed": None, "cleanup": {"worktrees": 0, "branches": 0},
         "checked_out_elsewhere": []}
+
+
+
+

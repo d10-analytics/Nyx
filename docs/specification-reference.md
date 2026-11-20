@@ -87,9 +87,10 @@ Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 ```
 
 The providing item records those outcomes with separate `Claim` rows. The file
-syntax remains unchanged while the board shows prerequisite and dependent links
-on cards. A provider in a finished row appears when **Hide terminal rows** is
-unchecked.
+syntax remains unchanged while the board draws an arrow only for an outstanding
+prerequisite. The work item panel's **Needs** list names every outstanding
+prerequisite of the card. A provider in a finished row appears when **Hide
+terminal rows** is unchecked.
 
 Other header lines of the form `Name: value`, such as `Owner Note: waiting for
 venue confirmation`, are retained as reported text. The name may be bold, as in
@@ -213,10 +214,11 @@ appear together on one dependent item. Completion never uses a magic claim name,
 does not rewrite claim state, and does not verify the claim's evidence.
 
 Progress and dependency information comes from your specification files. Board
-cards show prerequisite and dependent links without a dependency status line.
-Missing, ambiguous, or malformed information can leave a relationship unknown
-or unavailable; it is not treated as satisfied. Moving a work item to `Done`
-does not satisfy its claims automatically.
+cards draw an arrow only for an outstanding prerequisite, and the work item
+panel's **Needs** list names every outstanding prerequisite. Missing, ambiguous,
+or malformed information can leave a relationship unknown or unavailable. It is
+not treated as satisfied. Moving a work item to `Done` does not satisfy its
+claims automatically.
 
 The completion policy is configured in the collapsed **Board settings** panel by
 selecting literal stage names beside **Counts as finished**. It is saved per
@@ -274,9 +276,10 @@ includes the resolved program title in search. Board columns remain projects.
 
 **Workspace issues** lists unreadable directories, unreadable or invalid
 `spec.md` files, and invalid or duplicate program descriptors. A prerequisite
-that cannot be resolved to exactly one work item shows on the dependent card as
-**unresolved target**. When one appears, check **Workspace issues** first for an
-unreadable directory or specification file that made identity coverage
+that cannot be resolved to exactly one work item appears in the dependent card's
+**Needs** list as **unresolved target**. When one appears, check **Workspace
+issues** first for an unreadable directory or specification file that made
+identity coverage
 incomplete; if it is empty, check that the prerequisite UUID and the target's
 `Package ID` are lowercase version 4 and unique, because an invalid or duplicate
 ID produces no Workspace-issues entry, then inspect the affected specification
@@ -284,8 +287,7 @@ headers rather than inferring completion from an incomplete view. Nyx keeps its
 conservative all-or-nothing resolution: while identity coverage is incomplete,
 every resolved relationship shows **unresolved target**. Descriptor problems
 affect programs only and do not make identity coverage incomplete. Uncheck **Hide
-terminal rows** to show providers in finished rows and their connections to
-dependent cards.
+terminal rows** to show the providers in finished rows.
 
 Discovery diagnostics also distinguish a safely identified but incomplete
 project or stage from a confirmed empty one. Inspect the affected directory and

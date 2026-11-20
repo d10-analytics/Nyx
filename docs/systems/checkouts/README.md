@@ -84,15 +84,16 @@ README is narrative only.
   comparisons are null exactly when the drift is and are never saved. A package target
   that is missing or not a git checkout also records `within_folders`, true when
   its path lies in or under a configured checkout folder.
-- Derives each unfinished package's prerequisites pill once, for a clone or worktree
-  target, from the Code Status of the packages its `Completion Prerequisite:` rows
-  name and the checked-out commit C, read for every such package whether or not it
-  declares a Baseline. Each merged prerequisite takes one read-only `merge-base
-  --is-ancestor` check of its evidence tips against C, memoised per collection in
-  the containment step's per-clone job. A prerequisite merged through a pull
-  request is in C when its tip or the request's merge commit is. A saved
-  pull-request lookup keeps no merge commit. The pill is recomputed on every run,
-  never saved, and the parser recomputes it from the same facts.
+- Serves each listed package's merge fact on main, `merged_on_main`, once, from
+  that package's own Code Status. `merged` is `merged`, and `in_progress`,
+  `pr_open`, `awaiting_merge`, `no_commits_yet` and `superseded` are
+  `not_merged`. `unknown` is `unknown`.
+- Without a Code Status, a package reads `merged` when the highest-numbered
+  merged request into its repository's base names its declared branch. It reads
+  `unknown` otherwise, and when the package declares no branch on a clone or
+  worktree target.
+- A finished package and a package whose target is not a clone or a worktree carry
+  the fact too. Nyx recomputes it on every run and never saves it.
 - Calls `derive_attention` after the join and stores the clone availability,
   each repository's free clones and the attention list it returns.
 - `nyx/checkout_join.py` holds the matching rules over plain facts and makes no
@@ -147,7 +148,7 @@ never through this system. It
   [protocols invariants](../protocols/README.md#cross-system-invariants).
 - Calls `code_status_text`; see
   [protocols invariants](../protocols/README.md#cross-system-invariants).
-- Calls `derive_attention`, `derive_prerequisites` and `prerequisites_text`;
+- Calls `derive_attention` and `prerequisite_main_fact`;
   see [protocols invariants](../protocols/README.md#cross-system-invariants).
 
 ## Cross-system invariants

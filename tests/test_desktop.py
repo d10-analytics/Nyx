@@ -5358,7 +5358,7 @@ _BOARD_JSON_SNAPSHOT_SCRIPT = """
     refreshIssue: '',
     titles: [],
     rows: [],
-    links: [],
+    connections: [],
     compact: null,
     stored: null,
   };
@@ -5370,7 +5370,13 @@ _BOARD_JSON_SNAPSHOT_SCRIPT = """
     result.refreshIssue = document.querySelector('#board-issues summary')?.textContent || '';
     result.titles = [...document.querySelectorAll('.card-title')].map((node) => String(node.textContent));
     result.rows = [...document.querySelectorAll('.board-row')].map((node) => String(node.dataset.lifecycle));
-    result.links = [...document.querySelectorAll('.card-links, .card-rail-text')].map((node) => String(node.textContent));
+    result.connections = [...document.querySelectorAll('.connection')].map((node) => {
+      const title = (id) => {
+        const card = document.querySelector('.card[data-package-id="' + id + '"] .card-title');
+        return card === null ? null : String(card.textContent);
+      };
+      return [title(node.dataset.source), title(node.dataset.dependent)];
+    });
     result.compact = document.querySelector('#compact-view') ? !!document.querySelector('#compact-view').checked : null;
     result.stored = window.localStorage.getItem('spec-tracker-compact-view');
   } catch (error) {
@@ -5800,7 +5806,7 @@ def test_board_json_observation_parses_strings_and_rejects_missing_results():
             "refreshIssue": "",
             "titles": ["Alpha delivery", "Beta design"],
             "rows": ["in-progress", "planned"],
-            "links": ["needs: Beta design"],
+            "connections": [["Beta design", "Alpha delivery"]],
             "compact": False,
             "stored": "false",
         }
@@ -5809,7 +5815,7 @@ def test_board_json_observation_parses_strings_and_rejects_missing_results():
     snapshot = _wait_for_json_board(object(), page, timeout=1.0)
     assert snapshot["titles"] == ["Alpha delivery", "Beta design"]
     assert snapshot["rows"] == ["in-progress", "planned"]
-    assert snapshot["links"] == ["needs: Beta design"]
+    assert snapshot["connections"] == [["Beta design", "Alpha delivery"]]
     assert snapshot["compact"] is False
     assert snapshot["stored"] == "false"
     assert "JSON.stringify" in page.scripts[0], (
@@ -5918,10 +5924,7 @@ def test_required_native_embedded_board_renders_content_gated_finished_stage_and
                 assert "Beta design" in snapshot["titles"]
                 assert "Completed work" not in snapshot["titles"]
                 assert "done" not in snapshot["rows"]
-                assert any(
-                    "needs:" in link and "Beta design" in link
-                    for link in snapshot["links"]
-                )
+                assert ["Beta design", "Alpha delivery"] in snapshot["connections"]
                 shared.catalog_admitted = False
                 _eval_js(application, page, "window.dispatchEvent(new Event('focus'))")
                 assert "Latest refresh issue:" in _wait_for_refresh_issue(application, page)

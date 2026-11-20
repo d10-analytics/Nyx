@@ -1136,20 +1136,6 @@ class BaselineHead:
 
 
 @dataclass(frozen=True)
-class CompletionPrerequisiteHead:
-    """One ``Completion Prerequisite:`` row as the catalog resolves it.
-
-    ``target_path`` is the target's package path when the row resolves to one
-    package; otherwise it is ``None`` and ``reason`` is the catalog's
-    unresolved reason for the row.
-    """
-
-    target_package_id: str | None
-    target_path: str | None
-    reason: str | None
-
-
-@dataclass(frozen=True)
 class PackageHead:
     """The header facts of one package that a checkout can be joined to."""
 
@@ -1160,7 +1146,6 @@ class PackageHead:
     target_repo: TargetRepoHead
     branch: BranchHead
     baseline: BaselineHead
-    completion_prerequisites: tuple[CompletionPrerequisiteHead, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1247,33 +1232,6 @@ def finished_policy(
     return "configured" if _finished_stages(completed_stage_names) else "not_configured"
 
 
-def _completion_heads(
-    record: dict[str, object],
-    index: dict[str, list[dict[str, object]]],
-    identity_complete: bool,
-) -> tuple[CompletionPrerequisiteHead, ...]:
-    relationship = record["relationship"]
-    if not relationship:
-        return ()
-    heads = []
-    for row in relationship["prerequisites"]:
-        if row.get("kind") != "completion":
-            continue
-        target, reason = _resolve_edge_target(record, row, index, identity_complete)
-        heads.append(
-            CompletionPrerequisiteHead(
-                target_package_id=row["target_package_id"],
-                target_path=(
-                    str(target["package_path"])
-                    if reason is None and target is not None
-                    else None
-                ),
-                reason=reason,
-            )
-        )
-    return tuple(heads)
-
-
 def scan_packages(spec_root: Path) -> PackageScan:
     """Return one record per package the catalog lists under one root.
 
@@ -1313,8 +1271,6 @@ def scan_package_heads(
     """
     finished_stages = _finished_stages(completed_stage_names)
     scan = _scan_specification_root(Path(spec_root))
-    index = _build_candidate_index(scan.records)
-    identity_complete = not scan.identity_diagnostics
     heads = []
     for record in sorted(scan.records, key=lambda item: str(item["package_path"])):
         relationship = record["relationship"]
@@ -1331,9 +1287,6 @@ def scan_package_heads(
                 target_repo=_target_repo_head(join["target_repo"]),
                 branch=_branch_head(join["branch"]),
                 baseline=_baseline_head(join["baseline"]),
-                completion_prerequisites=_completion_heads(
-                    record, index, identity_complete
-                ),
             )
         )
     return PackageHeads(
