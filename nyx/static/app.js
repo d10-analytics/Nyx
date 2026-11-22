@@ -438,7 +438,7 @@
       "foldersDraftMatches": "The checkout folders match the saved list.",
       "foldersSaving": "Saving checkout folders…",
       "foldersSaved": "Checkout folders saved.",
-      "foldersLookupOff": "With no folders the pull-request lookup is off.",
+      "foldersLookupOff": "With no folders the pull-request lookup setting is not kept.",
       "foldersInvalid": "The checkout folders were not saved. Fix the marked folders and save again.",
       "foldersConflict": "Save not applied: the checkout folders changed elsewhere. Reload checkout folders to replace this unsaved draft and try again.",
       "foldersChangedElsewhere": "The checkout folders changed elsewhere. Reload checkout folders to replace this unsaved draft.",
@@ -558,7 +558,11 @@
   // served; a draft is null until the reader changes something, and an open
   // with a draft held shows it instead of loading.  The auto-open is page
   // memory only.
-  let foldersSaved = {folders: [], github_lookup: false};
+  // Before the first read the editor shows the lookup setting of a workspace
+  // with no saved checkout settings; it equals `DEFAULT_CHECKOUT_GITHUB_LOOKUP`
+  // in `nyx/state.py`.
+  const DEFAULT_GITHUB_LOOKUP = true;
+  let foldersSaved = {folders: [], github_lookup: DEFAULT_GITHUB_LOOKUP};
   let foldersDraft = null;
   let foldersReloadAvailable = false;
   let foldersRequestSerial = 0;

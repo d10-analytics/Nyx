@@ -28,9 +28,9 @@ README is narrative only.
   so the rule reads no file, runs no git, and its list cannot change with git's
   availability.
 - A read-only collector: networked by default through one `git ls-remote` per
-  distinct remote, which transfers no objects, and, when the workspace turns
-  GitHub lookup on, one optional `gh` request per GitHub repository for its pull
-  requests; `--no-network` skips both.
+  distinct remote, which transfers no objects, and, when the workspace has
+  GitHub lookup on (the default), one `gh` request per GitHub repository for its
+  pull requests; `--no-network` skips both.
 - Keeps the last successful remote checks (the `ls-remote` answer and the pull
   requests) in the verdict cache file, and answers from them, labelled
   `recorded`, when a run is offline or a check fails; a clone's own newer

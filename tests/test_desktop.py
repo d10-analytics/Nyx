@@ -4472,7 +4472,7 @@ def test_desktop_runtime_serves_and_saves_the_active_checkout_settings():
                 status, listed = request_checkout_settings()
                 assert status == 200
                 assert listed["folders"] == []
-                assert listed["github_lookup"] is False
+                assert listed["github_lookup"] is True
                 assert isinstance(listed["revision"], str)
 
                 saved_status, saved = request_checkout_settings(

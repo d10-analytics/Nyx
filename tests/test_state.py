@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -1746,11 +1747,19 @@ def test_an_owned_save_with_an_empty_folder_list_removes_only_the_active_entry()
                 str(other.resolve()): record["checkout_settings"][str(other.resolve())]
             }
             assert saved.checkout_folders == ()
-            assert saved.checkout_github_lookup is False
+            assert saved.checkout_github_lookup is True
             assert state.load_configuration(paths).checkout_folders == ()
             assert state.load_configuration(paths).checkout_settings[
                 str(other.resolve())
             ].folders
+
+
+def test_the_browser_editor_starts_from_the_default_lookup_the_state_owner_defines():
+    script = (Path(state.__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+    declared = re.findall(r"const DEFAULT_GITHUB_LOOKUP = (true|false);", script)
+    assert declared == [("true" if state.DEFAULT_CHECKOUT_GITHUB_LOOKUP else "false")]
+    assert "github_lookup: DEFAULT_GITHUB_LOOKUP}" in script
+    assert "github_lookup: false" not in script
 
 
 def test_candidate_validation_applies_the_checkout_keywords_without_writing():

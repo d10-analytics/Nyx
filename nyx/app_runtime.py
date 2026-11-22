@@ -99,7 +99,9 @@ def _checkout_settings_request(
     if problems:
         raise InvalidCheckoutFolders(problems)
     if not stored:
-        return (), False
+        # An empty list removes the workspace's entry, so the lookup request is
+        # not kept and the workspace falls back to the default.
+        return (), state.DEFAULT_CHECKOUT_GITHUB_LOOKUP
     return tuple(sorted(stored)), github_lookup
 
 
@@ -282,7 +284,11 @@ class ApplicationRuntime:
         """The checkout settings body every read and every outcome answers."""
 
         if configuration is None:
-            return {"folders": [], "github_lookup": False, "revision": None}
+            return {
+            "folders": [],
+            "github_lookup": state.DEFAULT_CHECKOUT_GITHUB_LOOKUP,
+            "revision": None,
+        }
         return {
             "folders": list(configuration.checkout_folders),
             "github_lookup": configuration.checkout_github_lookup,

@@ -38,6 +38,7 @@ from nyx.server import (
     _create_application_server,
     create_server,
 )
+from nyx.state import DEFAULT_CHECKOUT_GITHUB_LOOKUP
 
 playwright = pytest.importorskip("playwright.sync_api")
 
@@ -501,9 +502,13 @@ class BrowserSettings:
             raise CatalogError("settings_unavailable")
         return {
             "folders": list(self.folders),
-            "github_lookup": self.github_lookup,
+            "github_lookup": self._served_lookup(),
             "revision": self.revision,
         }
+
+    def _served_lookup(self):
+        """The saved switch, or the default for a workspace with no saved folders."""
+        return self.github_lookup if self.folders else DEFAULT_CHECKOUT_GITHUB_LOOKUP
 
     def get_settings(self):
         self.get_calls += 1
@@ -538,7 +543,7 @@ class BrowserSettings:
 
     def _folder_answer(self, outcome):
         return {
-            "folders": list(self.folders), "github_lookup": self.github_lookup,
+            "folders": list(self.folders), "github_lookup": self._served_lookup(),
             "revision": self.revision, "outcome": outcome,
         }
 
@@ -555,15 +560,15 @@ class BrowserSettings:
         if self.folder_reload_needed:
             self.folder_reload_needed = False
             # The runtime's null state: no record to compare, so no revision.
-            return {"folders": [], "github_lookup": False, "revision": None,
-                    "outcome": "reload-needed"}
+            return {"folders": [], "github_lookup": DEFAULT_CHECKOUT_GITHUB_LOOKUP,
+                    "revision": None, "outcome": "reload-needed"}
         if self.fail_next:
             self.fail_next = False
             return self._folder_answer("failure")
         if revision != self.revision:
             return self._folder_answer("conflict")
         self.folders = sorted(set(folders))
-        self.github_lookup = github_lookup and bool(self.folders)
+        self.github_lookup = github_lookup
         # One revision for both kinds of save, never one an earlier save made.
         self.revision = f"{0xF0000 + len(self.folder_calls) + len(self.calls):064x}"
         if self.checkouts is not None:
@@ -11804,12 +11809,14 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     assert page.evaluate("document.activeElement.id") == "checkout-folders-path"
     # The checkbox takes Space, and Cancel takes Enter, then focus stays in the panel.
     tab_until(page, "document.activeElement.id === 'checkout-folders-github'")
+    # With no saved settings the box starts at the default, on, so Space clears it
+    # and Cancel returns it to the default.
     page.keyboard.press("Space")
-    assert page.locator("#checkout-folders-github").is_checked()
+    assert not page.locator("#checkout-folders-github").is_checked()
     tab_until(page, "document.activeElement.id === 'checkout-folders-save'")
     tab_until(page, "document.activeElement.id === 'checkout-folders-cancel'")
     page.keyboard.press("Enter")
-    assert not page.locator("#checkout-folders-github").is_checked()
+    assert page.locator("#checkout-folders-github").is_checked()
     assert page.evaluate(
         "document.activeElement.closest('#checkout-folders-editor') !== null")
     tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
@@ -12211,7 +12218,9 @@ def test_checkout_folders_edits_are_ignored_while_the_saved_folders_load(
         page.get_by_role("button", name="Add /work/aaa (1 work item)", exact=True).click(force=True)
         lookup.click(force=True)
         assert folder_paths(page) == []
-        assert not lookup.is_checked()
+        # Until the first answer the editor shows the default of a workspace
+        # with no saved checkout settings, and the held click changed nothing.
+        assert lookup.is_checked()
         playwright.expect(save).to_be_disabled()
         # The dimmed control keeps the focus the reader gave it.
         playwright.expect(lookup).to_be_focused()
@@ -12549,21 +12558,36 @@ def test_checkout_folders_save_sends_the_draft_and_shows_the_servers_answer(
     first = settings.revision
     assert first != CHECKOUTS_REVISION
 
-    # Clearing every folder with the box checked: the answer unchecks it, and
-    # the message says why; the page does not predict that itself.
+    # Clearing every folder with the box unchecked: the workspace has no saved
+    # settings again, so the answer is the default (on), and the message says the
+    # choice was not kept; the page does not predict that itself.
     for path in ("/work/alpha", "/work/mid", "/work/zeta"):
         page.get_by_role("button", name=f"Remove checkout folder {path}").click()
-    assert lookup.is_checked()
+    lookup.uncheck()
     folders_save_button(page).click()
     playwright.expect(status).to_have_text(
-        "Checkout folders saved. With no folders the pull-request lookup is off."
+        "Checkout folders saved. With no folders the pull-request lookup setting is not kept."
     )
     assert folder_paths(page) == []
-    assert not lookup.is_checked()
+    assert lookup.is_checked()
     assert settings.folder_calls[1] == {
-        "revision": first, "folders": [], "github_lookup": True,
+        "revision": first, "folders": [], "github_lookup": False,
     }
-    assert settings.revision not in (CHECKOUTS_REVISION, first)
+    second = settings.revision
+    assert second not in (CHECKOUTS_REVISION, first)
+
+    # With the box left on, the same clearing is kept as asked, so the plain message.
+    add_folder(page, "/work/alpha")
+    folders_save_button(page).click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
+    assert settings.folder_calls[2]["github_lookup"] is True
+    page.get_by_role("button", name="Remove checkout folder /work/alpha").click()
+    folders_save_button(page).click()
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_count(0)
+    playwright.expect(status).to_have_text("Checkout folders saved.")
+    assert lookup.is_checked()
+    assert settings.folder_calls[3]["folders"] == []
+    assert settings.folder_calls[3]["github_lookup"] is True
 
 
 def test_checkout_folders_save_marks_each_refused_folder_with_its_problem(
@@ -12900,8 +12924,8 @@ def test_checkout_folders_failed_save_advances_no_revision(open_page, attention_
             self.folder_calls.append(
                 {"revision": revision, "folders": list(folders), "github_lookup": github_lookup}
             )
-            return {"folders": [], "github_lookup": False, "revision": "9" * 64,
-                    "outcome": "failure"}
+            return {"folders": [], "github_lookup": DEFAULT_CHECKOUT_GITHUB_LOOKUP,
+                    "revision": "9" * 64, "outcome": "failure"}
 
     settings = FailureNamesOtherRevision(revision=CHECKOUTS_REVISION)
     settings.folders = ["/work/alpha"]

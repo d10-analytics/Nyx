@@ -12,7 +12,10 @@ README is narrative only.
   default so a save of any other setting carries the stored entry forward. A
   non-empty folder list requires a boolean switch and stores canonical absolute
   folders in sorted order with no duplicates; an empty list removes the active
-  workspace's entry, and every other workspace's entry survives either save.
+  workspace's entry, and every other workspace's entry survives either save. A
+  workspace with no entry has no folders and the lookup default,
+  `DEFAULT_CHECKOUT_GITHUB_LOOKUP` (on); a saved entry always carries its own
+  explicit value.
 
 ## Outside this boundary
 
