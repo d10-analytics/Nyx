@@ -14,9 +14,19 @@ TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "docs" / "template_spec.md
 FICTIONAL_UUID = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
 FICTIONAL_COMMIT = "a" * 40
 _DIAGNOSED_SENTENCE = "Invalid values are diagnosed"
-_UNINTERPRETED_SENTENCE = (
-    "An invalid value is not interpreted: Nyx leaves the affected relationship "
-    "unresolved or unknown, and the validator does not check these fields."
+_ONE_ROW_SENTENCE = (
+    "Each `Completion Prerequisite:` row names exactly one package UUID; a value "
+    "that is not exactly one UUID leaves the relationship unresolved."
+)
+_REJECTION_SENTENCE = (
+    "The validator rejects a retired `Prerequisite:` or `Claim:` header line in a "
+    "live lifecycle folder."
+)
+_RETIRED_ROW_TEXTS = (
+    "Prerequisite: <package UUID> |",
+    "Claim: <name",
+    "<claim-name>",
+    "typed-provenance",
 )
 
 
@@ -91,7 +101,12 @@ class SpecificationTemplateTests(unittest.TestCase):
         paragraph = collapse(section)
         self.assertNotIn(_DIAGNOSED_SENTENCE, collapse(template))
         self.assertNotIn("diagnosed", paragraph)
-        self.assertIn(_UNINTERPRETED_SENTENCE, paragraph)
+        self.assertIn(_ONE_ROW_SENTENCE, paragraph)
+        self.assertIn(_REJECTION_SENTENCE, paragraph)
+        self.assertIn("`Completion Prerequisite: <package UUID>`", paragraph)
+        for retired in _RETIRED_ROW_TEXTS:
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, paragraph)
 
     def test_scaffold_passes_structural_checks_as_a_queue_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -106,7 +121,7 @@ class SpecificationTemplateTests(unittest.TestCase):
             )
             errors = spec_validation.validate_spec(spec, root / "Specs")
         self.assertEqual([], [e for e in errors if "missing required section" in e], errors)
-        for fragment in ("Sanity", "Branch:", "Critique contract"):
+        for fragment in ("Sanity", "Branch:", "Critique contract", "retired header"):
             self.assertEqual([], [e for e in errors if fragment in e], errors)
 
     def test_scaffold_fails_when_a_required_section_or_branch_line_is_removed(self) -> None:
