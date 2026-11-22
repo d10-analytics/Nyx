@@ -1207,7 +1207,7 @@ def test_dependency_and_completion_policy_text_matches_the_board():
             "outstanding prerequisites, with the reason for each.") in readme
     assert "**unresolved target** only when a relationship cannot be resolved" in readme
     # The sample paragraph names two whole work items and no per-claim outcome.
-    assert "the separate API implementation work item" in readme
+    assert "The API contract and its implementation are separate whole work items." in readme
     assert "recorded outcomes" not in readme
     for name in RELATIONSHIP_DOCUMENTS:
         for retired in RETIRED_RELATIONSHIP_TEXT + RETIRED_COMPLETION_WORDING:
