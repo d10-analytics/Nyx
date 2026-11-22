@@ -9,8 +9,9 @@ README is narrative only.
   the BOM-aware UTF-8 header text, the single-value metadata lines, and the
   package-owned relationship rows (`Package ID`, `Program Membership`,
   `Superseded By`, `Completion Prerequisite`). The retired `Prerequisite` and
-  `Claim` labels are not header labels: a header line carrying one is read as
-  ordinary text and adds no relationship row.
+  `Claim` labels are not header labels: a header line carrying one adds no
+  relationship row. The catalog also keeps such a line out of the reported
+  fields, so it is not searchable text.
 - Owns the lexical rules of a git branch name. Callers add their own bounds and
   normalisation before calling it.
 - Owns the parsing of specification text in `nyx/spec_body.py`: section bodies,

@@ -97,7 +97,13 @@ the table above (`Package ID`, `Status`, `Target repo`, `Program Membership`,
 become additional reported text, in any capitalization. `Branch` and `Baseline`
 are not in that list: although each has a row in the table, its value also
 stays searchable reported text, retained under the same rules as any other
-reported field.
+reported field. The retired relationship labels Prerequisite and Claim also
+never become reported text, in any capitalization. On the board, a header line
+with either label adds no prerequisite and no entry in **Workspace issues**. The
+package validator rejects such a line in a work item under `Under_Development`,
+`Queue`, `In_Progress`, `Needs_Fixes`, `Awaiting_Retrospective` or `.pipeline`.
+It accepts the line in `Done`, `Archive` and `Reference`, so a finished work
+item keeps its text.
 Nyx ignores a line whose
 name breaks these rules; it does not shorten a long name. Names are compared
 case-insensitively for `A`–`Z`; the first occurrence with a nonempty value wins.
