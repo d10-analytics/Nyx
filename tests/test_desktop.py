@@ -4995,13 +4995,12 @@ def _board_workspace(root: Path) -> Path:
             "# Alpha delivery\n"
             "Target repo: Alpha\n"
             "Package ID: 11111111-1111-4111-8111-111111111111\n"
-            "Prerequisite: 22222222-2222-4222-8222-222222222222 | design-ready\n"
+            "Completion Prerequisite: 22222222-2222-4222-8222-222222222222\n"
         ),
         ("Beta", "Under_Development", "design"): (
             "# Beta design\n"
             "Target repo: Beta\n"
             "Package ID: 22222222-2222-4222-8222-222222222222\n"
-            "Claim: design-ready | satisfied | sha256:" + "f" * 64 + "\n"
         ),
         ("Gamma", "Done", "finished"): (
             "# Completed work\n"
@@ -5340,9 +5339,10 @@ def test_desktop_first_catalog_request_uses_the_canonical_shared_runtime():
                     for entry in payload["entries"]
                     if entry["declared"]["title"] == "Alpha delivery"
                 )
-                edge = alpha["relationship"]["prerequisites"][0]
-                assert edge["target_package_id"] == "22222222-2222-4222-8222-222222222222"
-                assert edge["resolved_state"] == "satisfied"
+                assert alpha["relationship"]["prerequisites"] == [{
+                    "target_package_id": "22222222-2222-4222-8222-222222222222",
+                    "reason": "resolved",
+                }]
             finally:
                 session.close()
 

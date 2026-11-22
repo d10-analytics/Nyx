@@ -28,8 +28,6 @@ OWNED_DEFINITIONS = frozenset(
         "_HEADER_LABELS",
         "RETIRED_HEADER_LABELS",
         "_HEADER_FIELD",
-        "_CLAIM_NAME",
-        "_PROVENANCE",
         "_CANONICAL_UUID",
         "_uuid",
         "_uuid_candidates",
@@ -41,14 +39,9 @@ HEADER_LABELS = (
     "Package ID",
     "Program Membership",
     "Superseded By",
-    "Prerequisite",
     "Completion Prerequisite",
-    "Claim",
 )
 RETIRED_HEADER_LABELS = ("Prerequisite", "Claim")
-# The wire protocol validates claim names and provenance references with its own
-# fullmatch patterns, a separate contract from the header rows the parser reads.
-PROTOCOL_PATTERNS = {"models.py": frozenset({"_CLAIM_NAME", "_PROVENANCE"})}
 FORBIDDEN_CHARACTERS = " ~^:?*[\\`<>"
 
 
@@ -101,7 +94,7 @@ def test_header_definitions_have_one_owner() -> None:
         module: sorted(found)
         for module, tree in modules.items()
         if module != OWNER
-        and (found := OWNED_DEFINITIONS & _defined_names(tree) - PROTOCOL_PATTERNS.get(module, frozenset()))
+        and (found := OWNED_DEFINITIONS & _defined_names(tree))
     }
     assert stray == {}
 
@@ -292,113 +285,108 @@ _HEADER_ROWS = {
         "Completion Prerequisite: bad",
         "**Completion Prerequisite**: " + _ID_A,
     ],
+    "retired": [
+        "Prerequisite: " + _ID_A + " | release",
+        "Claim: release | satisfied | sha256:" + "a" * 64,
+        "Claim: release | unsatisfied",
+    ],
+    "malformed_completions": [
+        "Completion Prerequisite: not-a-uuid",
+        "Completion Prerequisite: " + _ID_B + " | claim",
+        "Completion Prerequisite: " + _ID_B + " | release",
+        "Completion Prerequisite:",
+        "Completion Prerequisite: " + _ID_B + " " + _ID_A,
+    ],
+    "duplicate_package_id": ["Package ID: " + _ID_A, "Package ID: " + _ID_A],
+    "two_package_ids": ["Package ID: " + _ID_A, "Package ID: " + _ID_B],
+    "trailing_text": ["Package ID: " + _ID_A + " extra"],
     "version": [
         "Package ID: 11111111-1111-1111-8111-111111111111",
         "Program Membership: 11111111-1111-4111-7111-111111111111",
     ],
     "self_succ": ["Package ID: " + _ID_A, "Superseded By: " + _ID_A],
 }
-# Values measured with the header parser before it moved out of the catalog.
-_PARSED_AT_BASELINE = {'claims': [{'claims': [{'evidence_ref': None,
-                         'invalid': False,
-                         'name': 'ab-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-c',
-                         'state': 'unknown'},
-                        {'evidence_ref': None, 'invalid': True, 'name': 'dup', 'state': 'unknown'},
-                        {'evidence_ref': None,
-                         'invalid': False,
-                         'name': 'has-hyphen',
-                         'state': 'unsatisfied'},
-                        {'evidence_ref': 'git-object-sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                         'invalid': False,
-                         'name': 's1',
-                         'state': 'satisfied'},
-                        {'evidence_ref': None, 'invalid': True, 'name': 's2', 'state': 'unknown'},
-                        {'evidence_ref': 'git-object-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                         'invalid': False,
-                         'name': 's3',
-                         'state': 'satisfied'},
-                        {'evidence_ref': 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-                         'invalid': False,
-                         'name': 's4',
-                         'state': 'satisfied'},
-                        {'evidence_ref': None, 'invalid': True, 'name': 's5', 'state': 'unknown'},
-                        {'evidence_ref': None, 'invalid': True, 'name': 's6', 'state': 'unknown'}],
-             'direct_prerequisite_state': None,
-             'participation': 'legacy',
-             'prerequisites': [],
-             'program': {'program_id': None, 'resolution': 'not_declared', 'title': None},
-             'superseded_by': {'package_id': None, 'resolution': 'not_declared'}},
-            []],
- 'ident': [{'claims': [],
-            'direct_prerequisite_state': 'no_declared_prerequisites',
-            'participation': 'available',
-            'prerequisites': [],
-            'program': {'program_id': '22222222-2222-4222-9222-222222222222',
-                        'resolution': 'unknown',
-                        'title': None},
-            'superseded_by': {'package_id': '22222222-2222-4222-9222-222222222222',
-                              'resolution': 'unknown'}},
-           ['11111111-1111-4111-8111-111111111111']],
- 'lookaround': [{'claims': [],
-                 'direct_prerequisite_state': None,
-                 'participation': 'invalid',
-                 'prerequisites': [],
-                 'program': {'program_id': None, 'resolution': 'not_declared', 'title': None},
-                 'superseded_by': {'package_id': None, 'resolution': 'not_declared'}},
-                []],
- 'lower_label': [{'claims': [],
-                  'direct_prerequisite_state': None,
-                  'participation': 'legacy',
-                  'prerequisites': [],
-                  'program': {'program_id': None, 'resolution': 'not_declared', 'title': None},
-                  'superseded_by': {'package_id': None, 'resolution': 'not_declared'}},
-                 []],
- 'prereq': [{'claims': [],
-             'direct_prerequisite_state': 'unknown',
-             'participation': 'legacy',
-             'prerequisites': [{'claim_name': 'claim-a',
-                                'kind': 'claim',
-                                'target_package_id': '11111111-1111-4111-8111-111111111111',
-                                'valid': True},
-                               {'claim_name': None,
-                                'kind': 'claim',
-                                'target_package_id': '11111111-1111-4111-8111-111111111111',
-                                'valid': False},
-                               {'claim_name': None,
-                                'kind': 'claim',
-                                'target_package_id': '11111111-1111-4111-8111-111111111111',
-                                'valid': False},
-                               {'kind': 'completion',
-                                'target_package_id': '22222222-2222-4222-9222-222222222222',
-                                'valid': True},
-                               {'kind': 'completion', 'target_package_id': None, 'valid': False},
-                               {'kind': 'completion', 'target_package_id': None, 'valid': False},
-                               {'kind': 'completion',
-                                'target_package_id': '11111111-1111-4111-8111-111111111111',
-                                'valid': True}],
-             'program': {'program_id': None, 'resolution': 'not_declared', 'title': None},
-             'superseded_by': {'package_id': None, 'resolution': 'not_declared'}},
-            []],
- 'self_succ': [{'claims': [],
-                'direct_prerequisite_state': 'no_declared_prerequisites',
-                'participation': 'available',
-                'prerequisites': [],
-                'program': {'program_id': None, 'resolution': 'not_declared', 'title': None},
-                'superseded_by': {'package_id': None, 'resolution': 'unknown'}},
-               ['11111111-1111-4111-8111-111111111111']],
- 'version': [{'claims': [],
-              'direct_prerequisite_state': None,
-              'participation': 'invalid',
-              'prerequisites': [],
-              'program': {'program_id': None, 'resolution': 'unknown', 'title': None},
-              'superseded_by': {'package_id': None, 'resolution': 'not_declared'}},
-             []]}
+_EMPTY_RELATIONSHIP = {
+    "prerequisites": [],
+    "program": {"program_id": None, "resolution": "not_declared", "title": None},
+    "superseded_by": {"package_id": None, "resolution": "not_declared"},
+}
+_PARSED_HEADERS = {
+    "ident": [
+        {
+            "prerequisites": [],
+            "program": {"program_id": _ID_B, "resolution": "unknown", "title": None},
+            "superseded_by": {"package_id": _ID_B, "resolution": "unknown"},
+        },
+        [_ID_A],
+        _ID_A,
+    ],
+    "lower_label": [dict(_EMPTY_RELATIONSHIP), [], None],
+    "lookaround": [dict(_EMPTY_RELATIONSHIP), [], None],
+    "claims": [dict(_EMPTY_RELATIONSHIP), [], None],
+    "prereq": [
+        {
+            "prerequisites": [
+                {"target_package_id": _ID_B},
+                {"target_package_id": None},
+                {"target_package_id": None},
+                {"target_package_id": _ID_A},
+            ],
+            "program": {"program_id": None, "resolution": "not_declared", "title": None},
+            "superseded_by": {"package_id": None, "resolution": "not_declared"},
+        },
+        [],
+        None,
+    ],
+    "retired": [dict(_EMPTY_RELATIONSHIP), [], None],
+    "malformed_completions": [
+        {
+            "prerequisites": [{"target_package_id": None}] * 5,
+            "program": {"program_id": None, "resolution": "not_declared", "title": None},
+            "superseded_by": {"package_id": None, "resolution": "not_declared"},
+        },
+        [],
+        None,
+    ],
+    "duplicate_package_id": [dict(_EMPTY_RELATIONSHIP), [_ID_A], None],
+    "two_package_ids": [dict(_EMPTY_RELATIONSHIP), [_ID_A, _ID_B], None],
+    "trailing_text": [dict(_EMPTY_RELATIONSHIP), [_ID_A], None],
+    "version": [
+        {
+            "prerequisites": [],
+            "program": {"program_id": None, "resolution": "unknown", "title": None},
+            "superseded_by": {"package_id": None, "resolution": "not_declared"},
+        },
+        [],
+        None,
+    ],
+    "self_succ": [
+        {
+            "prerequisites": [],
+            "program": {"program_id": None, "resolution": "not_declared", "title": None},
+            "superseded_by": {"package_id": None, "resolution": "unknown"},
+        },
+        [_ID_A],
+        _ID_A,
+    ],
+}
+
+
+def test_header_labels_are_the_four_live_rows() -> None:
+    assert spec_header._HEADER_LABELS == HEADER_LABELS
+    assert HEADER_LABELS == (
+        "Package ID", "Program Membership", "Superseded By", "Completion Prerequisite",
+    )
+    assert spec_header.RETIRED_HEADER_LABELS == RETIRED_HEADER_LABELS
+    assert not set(HEADER_LABELS) & set(RETIRED_HEADER_LABELS)
+    for label in RETIRED_HEADER_LABELS:
+        assert spec_header._HEADER_FIELD.match(f"{label}: {_ID_A} | release") is None
 
 
 @pytest.mark.parametrize("case", sorted(_HEADER_ROWS))
-def test_parse_header_matches_the_values_measured_before_the_move(case: str) -> None:
-    relationship, candidates = spec_header.parse_header(_HEADER_ROWS[case])
-    assert [relationship, sorted(candidates)] == _PARSED_AT_BASELINE[case]
+def test_parse_header_returns_the_relationship_candidates_and_package_id(case: str) -> None:
+    relationship, candidates, package_id = spec_header.parse_header(_HEADER_ROWS[case])
+    assert [relationship, sorted(candidates), package_id] == _PARSED_HEADERS[case]
 
 
 def test_metadata_values_match_the_original_line_pattern() -> None:

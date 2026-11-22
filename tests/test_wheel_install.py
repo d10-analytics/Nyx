@@ -445,17 +445,10 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                         "status": "ready",
                     },
                     "relationship": {
-                        "participation": "available",
-                        "claims": [],
                         "prerequisites": [],
-                        "direct_prerequisite_state": "no_declared_prerequisites",
                         "program": {
                             "program_id": None,
                             "title": None,
-                            "resolution": "not_declared",
-                        },
-                        "superseded_by": {
-                            "package_id": None,
                             "resolution": "not_declared",
                         },
                     },

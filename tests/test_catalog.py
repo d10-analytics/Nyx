@@ -17,6 +17,7 @@ from nyx import catalog
 from nyx.models import (
     MAX_TEXT_UNITS,
     SCHEMA_VERSION,
+    CatalogEntry,
     _text_units,
     canonical_digest,
     parse_catalog,
@@ -31,49 +32,8 @@ Target repo: /fictional/repo
 """
 
 PROGRAM_ID = "88888888-8888-4888-8888-888888888888"
-SMALL_ORACLE_BYTES = "{\"catalog_digest\":\"22ad4a68204302a96b44560271803e5eb428e16e95e36fed275e312249c09c26\",\"configuration_revision\":null,\"discovery_diagnostics\":[],\"entries\":[{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"One\"},\"diagnostics\":[],\"package_id\":null,\"package_path\":\"Fictional/Queue/one\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"relationship_unavailable\",\"participation\":\"legacy\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Queue\",\"state\":\"complete\",\"transitive_diagnostics\":[]}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"inventory\":{\"projects\":[{\"availability\":\"complete\",\"name\":\"Fictional\"}],\"stages\":[{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Queue\"}]},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[],\"schema_version\":7,\"terminal_stages\":[]}"
-COMPLETE_ORACLE_BYTES = "{\"catalog_digest\":\"29be6f910089807a68848044c136d2980a558a8a87ee2fe265c49b32df49e9fe\",\"configuration_revision\":null,\"discovery_diagnostics\":[],\"entries\":[{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Archive\"},\"diagnostics\":[],\"package_id\":\"77777777-7777-4777-8777-777777777777\",\"package_path\":\"Fictional/Archive/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Archive\",\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Retro\"},\"diagnostics\":[],\"package_id\":\"55555555-5555-4555-8555-555555555555\",\"package_path\":\"Fictional/Awaiting_Retrospective/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Awaiting_Retrospective\",\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Done\"},\"diagnostics\":[],\"package_id\":\"66666666-6666-4666-8666-666666666666\",\"package_path\":\"Fictional/Done/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Done\",\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Progress\"},\"diagnostics\":[],\"package_id\":\"33333333-3333-4333-8333-333333333333\",\"package_path\":\"Fictional/In_Progress/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[{\"diagnostics\":[],\"evidence_ref\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"name\":\"release\",\"state\":\"satisfied\"}],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[{\"code\":\"successor_cycle\",\"message\":\"successor cycle detected: Fictional/In_Progress/pkg\"}],\"package_id\":\"22222222-2222-4222-8222-222222222222\",\"resolution\":\"resolved\"}},\"stage\":\"In_Progress\",\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Fix\"},\"diagnostics\":[],\"package_id\":\"44444444-4444-4444-8444-444444444444\",\"package_path\":\"Fictional/Needs_Fixes/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Needs_Fixes\",\"state\":\"complete\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Queue\"},\"diagnostics\":[{\"code\":\"invalid_claim\",\"message\":\"invalid claim: Fictional/Queue/pkg\"},{\"code\":\"invalid_prerequisite\",\"message\":\"invalid prerequisite: Fictional/Queue/pkg\"}],\"package_id\":\"22222222-2222-4222-8222-222222222222\",\"package_path\":\"Fictional/Queue/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[{\"diagnostics\":[],\"evidence_ref\":null,\"name\":\"release\",\"state\":\"unsatisfied\"}],\"direct_prerequisite_state\":\"unknown\",\"participation\":\"available\",\"prerequisites\":[{\"claim_name\":null,\"kind\":\"claim\",\"observed_evidence_ref\":null,\"observed_state\":null,\"reason\":\"invalid_prerequisite\",\"resolved_state\":\"unknown\",\"target_package_id\":null},{\"claim_name\":\"release\",\"kind\":\"claim\",\"observed_evidence_ref\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"observed_state\":\"satisfied\",\"reason\":\"claim_satisfied\",\"resolved_state\":\"satisfied\",\"target_package_id\":\"33333333-3333-4333-8333-333333333333\"}],\"program\":{\"diagnostics\":[],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"resolution\":\"resolved\",\"title\":\"Core\"},\"superseded_by\":{\"diagnostics\":[{\"code\":\"successor_cycle\",\"message\":\"successor cycle detected: Fictional/Queue/pkg\"}],\"package_id\":\"33333333-3333-4333-8333-333333333333\",\"resolution\":\"resolved\"}},\"stage\":\"Queue\",\"state\":\"partial\",\"transitive_diagnostics\":[]},{\"declared\":{\"closure\":null,\"human_sanity_decision\":null,\"sanity_recommendation\":null,\"status\":null,\"target_project\":null,\"title\":\"Under\"},\"diagnostics\":[],\"package_id\":\"11111111-1111-4111-8111-111111111111\",\"package_path\":\"Fictional/Under_Development/pkg\",\"project\":\"Fictional\",\"relationship\":{\"claims\":[{\"diagnostics\":[],\"evidence_ref\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"design\",\"state\":\"satisfied\"}],\"direct_prerequisite_state\":\"no_declared_prerequisites\",\"participation\":\"available\",\"prerequisites\":[],\"program\":{\"diagnostics\":[],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"resolution\":\"resolved\",\"title\":\"Core\"},\"superseded_by\":{\"diagnostics\":[],\"package_id\":null,\"resolution\":\"not_declared\"}},\"stage\":\"Under_Development\",\"state\":\"complete\",\"transitive_diagnostics\":[]}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"inventory\":{\"projects\":[{\"availability\":\"complete\",\"name\":\"Fictional\"}],\"stages\":[{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Archive\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Awaiting_Retrospective\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Done\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"In_Progress\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Needs_Fixes\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Queue\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Under_Development\"}]},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[{\"diagnostics\":[],\"member_package_ids\":[\"11111111-1111-4111-8111-111111111111\",\"22222222-2222-4222-8222-222222222222\"],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"title\":\"Core\"}],\"schema_version\":7,\"terminal_stages\":[]}"
-
-
-def _migrate_oracle(legacy: str) -> str:
-    """Canonicalize the inspected schema-seven producer oracles."""
-    value = json.loads(legacy)
-    value["schema_version"] = SCHEMA_VERSION
-    value["configuration_revision"] = None
-    # The historical fixtures predate the completion policy, so they carry no
-    # terminal-stage grouping.  The digest is recomputed below.
-    value["terminal_stages"] = []
-    for program in value["programs"]:
-        del program["diagnostics"]
-    for entry in value["entries"]:
-        for key in ("state", "diagnostics", "transitive_diagnostics"):
-            del entry[key]
-        for key in ("closure", "sanity_recommendation", "human_sanity_decision"):
-            del entry["declared"][key]
-        entry["reported_fields"] = []
-        for claim in entry["relationship"]["claims"]:
-            del claim["diagnostics"]
-        for key in ("program", "superseded_by"):
-            del entry["relationship"][key]["diagnostics"]
-        for edge in entry["relationship"]["prerequisites"]:
-            edge["kind"] = "claim"
-    projects = sorted({entry["project"] for entry in value["entries"]})
-    stages = sorted({(entry["project"], entry["stage"]) for entry in value["entries"]})
-    if len(value["entries"]) >= 5 and projects == ["Fictional"]:
-        stages = sorted(("Fictional", stage) for stage in ("Archive", "Awaiting_Retrospective", "Done", "In_Progress", "Needs_Fixes", "Queue", "Under_Development"))
-    value["inventory"] = {
-        "projects": [{"name": project, "availability": "complete"} for project in projects],
-        "stages": [
-            {"project": project, "stage": stage, "availability": "complete"}
-            for project, stage in stages
-        ],
-    }
-    value["catalog_digest"] = canonical_digest(value)
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-
-
-SMALL_ORACLE_BYTES = _migrate_oracle(SMALL_ORACLE_BYTES)
-COMPLETE_ORACLE_BYTES = _migrate_oracle(COMPLETE_ORACLE_BYTES)
+SMALL_ORACLE_BYTES = "{\"catalog_digest\":\"4c97c34bdcbeb7278ca748282d013da4ccd79d8e61d164fb94805f79f553ab2b\",\"configuration_revision\":null,\"discovery_diagnostics\":[],\"entries\":[{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"One\"},\"package_id\":null,\"package_path\":\"Fictional/Queue/one\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null}},\"reported_fields\":[],\"stage\":\"Queue\"}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"inventory\":{\"projects\":[{\"availability\":\"complete\",\"name\":\"Fictional\"}],\"stages\":[{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Queue\"}]},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[],\"schema_version\":9,\"terminal_stages\":[]}"
+COMPLETE_ORACLE_BYTES = "{\"catalog_digest\":\"0e80871a38999787027f5390b0305aee0c5a31d83fcabf67c1c55168818f003a\",\"configuration_revision\":null,\"discovery_diagnostics\":[],\"entries\":[{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Archive\"},\"package_id\":\"77777777-7777-4777-8777-777777777777\",\"package_path\":\"Fictional/Archive/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null}},\"reported_fields\":[],\"stage\":\"Archive\"},{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Retro\"},\"package_id\":\"55555555-5555-4555-8555-555555555555\",\"package_path\":\"Fictional/Awaiting_Retrospective/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null}},\"reported_fields\":[],\"stage\":\"Awaiting_Retrospective\"},{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Done\"},\"package_id\":\"66666666-6666-4666-8666-666666666666\",\"package_path\":\"Fictional/Done/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null}},\"reported_fields\":[],\"stage\":\"Done\"},{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Progress\"},\"package_id\":\"33333333-3333-4333-8333-333333333333\",\"package_path\":\"Fictional/In_Progress/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null}},\"reported_fields\":[],\"stage\":\"In_Progress\"},{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Fix\"},\"package_id\":\"44444444-4444-4444-8444-444444444444\",\"package_path\":\"Fictional/Needs_Fixes/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":null,\"resolution\":\"not_declared\",\"title\":null}},\"reported_fields\":[],\"stage\":\"Needs_Fixes\"},{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Queue\"},\"package_id\":\"22222222-2222-4222-8222-222222222222\",\"package_path\":\"Fictional/Queue/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[{\"reason\":\"unresolved\",\"target_package_id\":null},{\"reason\":\"resolved\",\"target_package_id\":\"33333333-3333-4333-8333-333333333333\"}],\"program\":{\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"resolution\":\"resolved\",\"title\":\"Core\"}},\"reported_fields\":[],\"stage\":\"Queue\"},{\"declared\":{\"status\":null,\"target_project\":null,\"title\":\"Under\"},\"package_id\":\"11111111-1111-4111-8111-111111111111\",\"package_path\":\"Fictional/Under_Development/pkg\",\"project\":\"Fictional\",\"relationship\":{\"prerequisites\":[],\"program\":{\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"resolution\":\"resolved\",\"title\":\"Core\"}},\"reported_fields\":[],\"stage\":\"Under_Development\"}],\"identity_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"inventory\":{\"projects\":[{\"availability\":\"complete\",\"name\":\"Fictional\"}],\"stages\":[{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Archive\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Awaiting_Retrospective\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Done\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"In_Progress\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Needs_Fixes\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Queue\"},{\"availability\":\"complete\",\"project\":\"Fictional\",\"stage\":\"Under_Development\"}]},\"program_coverage\":{\"diagnostics\":[],\"state\":\"complete\"},\"programs\":[{\"member_package_ids\":[\"11111111-1111-4111-8111-111111111111\",\"22222222-2222-4222-8222-222222222222\"],\"program_id\":\"88888888-8888-4888-8888-888888888888\",\"title\":\"Core\"}],\"schema_version\":9,\"terminal_stages\":[]}"
 
 
 def package(root: Path, stage: str, name: str, content: str = V1) -> Path:
@@ -510,14 +470,13 @@ class CatalogTests(TestCase):
                 "Queue",
                 "source",
                 f"# Source\nPackage ID: {source_id}\n"
-                f"Prerequisite: {target_id} | handoff\n",
+                f"Completion Prerequisite: {target_id}\n",
             )
             package(
                 root,
                 "Done",
                 "target",
-                f"# Target\nPackage ID: {target_id}\n"
-                f"Claim: handoff | satisfied | sha256:{'a' * 64}\n",
+                f"# Target\nPackage ID: {target_id}\n",
             )
 
             group = root / "Fictional" / "Done" / "group"
@@ -563,20 +522,11 @@ class CatalogTests(TestCase):
             )
             self.assertEqual("Source", source["declared"]["title"])
             self.assertEqual("Target", target["declared"]["title"])
+            self.assertEqual(set(source["relationship"]), {"prerequisites", "program"})
+            self.assertEqual(set(target["relationship"]), {"prerequisites", "program"})
             self.assertEqual(
-                [{
-                    "evidence_ref": f"sha256:{'a' * 64}",
-                    "name": "handoff",
-                    "state": "satisfied",
-                }],
-                target["relationship"]["claims"],
+                {"target_package_id": target_id, "reason": "resolved"}, edge
             )
-            self.assertEqual(target_id, edge["target_package_id"])
-            self.assertEqual("handoff", edge["claim_name"])
-            self.assertEqual("satisfied", edge["observed_state"])
-            self.assertEqual(f"sha256:{'a' * 64}", edge["observed_evidence_ref"])
-            self.assertEqual("satisfied", edge["resolved_state"])
-            self.assertEqual("claim_satisfied", edge["reason"])
             self.assertNotIn("Escaped", json.dumps(value))
 
     def test_document_link_names_are_literal_at_every_discovery_level(self) -> None:
@@ -937,16 +887,15 @@ class CatalogTests(TestCase):
             source_id = "11111111-1111-4111-8111-111111111111"
             package(root, "Queue", "source",
                     f"# Source\nPackage ID: {source_id}\n"
-                    f"Prerequisite: {target_id} | handoff\n")
-            package(root, "Done", "target",
-                    f"# Target\nPackage ID: {target_id}\n"
-                    f"Claim: handoff | satisfied | sha256:{'a' * 64}\n")
+                    f"Completion Prerequisite: {target_id}\n")
+            package(root, "Done", "target", f"# Target\nPackage ID: {target_id}\n")
             first = json.loads(catalog.scan_catalog(root))
             source = next(entry for entry in first["entries"]
                           if entry["package_path"].endswith("/source"))
             edge = source["relationship"]["prerequisites"][0]
-            self.assertEqual("satisfied", edge["resolved_state"])
-            self.assertEqual("claim_satisfied", edge["reason"])
+            self.assertEqual(
+                {"target_package_id": target_id, "reason": "resolved"}, edge
+            )
             original_digest = first["catalog_digest"]
             anchor = root / "Fictional" / "Queue" / "source" / "spec.md"
             anchor.write_text(anchor.read_text(encoding="utf-8").replace("# Source", "# Changed"),
@@ -964,14 +913,15 @@ class CatalogTests(TestCase):
             source_id = "11111111-1111-4111-8111-111111111111"
             package(root, "Queue", "source",
                     f"# Source\nPackage ID: {source_id}\n"
-                    f"Prerequisite: {target_id} | handoff\n")
+                    f"Completion Prerequisite: {target_id}\n")
             package(root, "Done", "target-a", f"# A\nPackage ID: {target_id}\n")
             package(root, "Archive", "target-b", f"# B\nPackage ID: {target_id}\n")
             value = json.loads(catalog.scan_catalog(root))
             edge = next(entry for entry in value["entries"]
                         if entry["package_path"].endswith("/source"))["relationship"]["prerequisites"][0]
-            self.assertEqual("duplicate_target", edge["reason"])
-            self.assertEqual("unknown", edge["resolved_state"])
+            self.assertEqual(
+                {"target_package_id": target_id, "reason": "unresolved"}, edge
+            )
 
     def test_malformed_and_unreadable_anchors_are_partial_without_payload(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -1001,8 +951,13 @@ class CatalogTests(TestCase):
             if sys.platform != "win32":
                 unreadable_anchor.chmod(0o600)
             entries = {entry["package_path"]: entry for entry in value["entries"]}
-            self.assertEqual("invalid",
-                             entries["Fictional/Queue/malformed"]["relationship"]["participation"])
+            malformed_entry = entries["Fictional/Queue/malformed"]
+            self.assertIsNone(malformed_entry["package_id"])
+            self.assertEqual(
+                {"prerequisites": [], "program": {
+                    "program_id": None, "title": None, "resolution": "not_declared"}},
+                malformed_entry["relationship"],
+            )
             self.assertIn({"code": "unreadable_anchor", "message": "unreadable anchor: Fictional/Queue/unreadable"}, value["identity_coverage"]["diagnostics"])
             self.assertNotIn(str(malformed), json.dumps(value))
 
@@ -1033,7 +988,7 @@ class CatalogTests(TestCase):
                 value = json.loads(catalog.scan_catalog(root))
             self.assertEqual("product-checkout", value["entries"][0]["declared"]["target_project"])
 
-    def test_missing_prerequisite_is_unknown_without_target_payload(self) -> None:
+    def test_missing_prerequisite_is_unresolved_without_target_payload(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_id = "11111111-1111-4111-8111-111111111111"
@@ -1043,15 +998,14 @@ class CatalogTests(TestCase):
                 "Queue",
                 "source",
                 f"# Source\nPackage ID: {source_id}\n"
-                f"Prerequisite: {target_id} | handoff\n",
+                f"Completion Prerequisite: {target_id}\n",
             )
 
             value = json.loads(catalog.scan_catalog(root))
             edge = value["entries"][0]["relationship"]["prerequisites"][0]
-            self.assertEqual("missing_target", edge["reason"])
-            self.assertEqual("unknown", edge["resolved_state"])
-            self.assertIsNone(edge["observed_state"])
-            self.assertIsNone(edge["observed_evidence_ref"])
+            self.assertEqual(
+                {"target_package_id": target_id, "reason": "unresolved"}, edge
+            )
 
     def test_public_api_has_one_builder_and_one_scanner(self) -> None:
         from nyx import __all__
@@ -1097,12 +1051,12 @@ class CatalogTests(TestCase):
                 package(root, stage, stage.lower(), f"# {stage}\nPackage ID: {package_id}\n")
             queue_anchor = root / "Fictional" / "Queue" / "queue" / "spec.md"
             queue_anchor.write_text(
-                f"# Queue\nPackage ID: {ids[1]}\nPrerequisite: {ids[5]} | release\n",
+                f"# Queue\nPackage ID: {ids[1]}\nCompletion Prerequisite: {ids[5]}\n",
                 encoding="utf-8",
             )
             target_anchor = root / "Fictional" / "Done" / "done" / "spec.md"
             target_anchor.write_text(
-                f"# Done\nPackage ID: {ids[5]}\nClaim: release | satisfied | sha256:{'a' * 64}\n",
+                f"# Done\nPackage ID: {ids[5]}\n",
                 encoding="utf-8",
             )
             def inventory() -> list[tuple[object, ...]]:
@@ -1200,7 +1154,10 @@ class CatalogTests(TestCase):
                     self.assertTrue(all("board_visible" not in entry for entry in value["entries"]))
                     self.assertIn("Fictional/Done/done", {entry["package_path"] for entry in value["entries"]})
                     queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
-                    self.assertEqual("satisfied", queue["relationship"]["prerequisites"][0]["resolved_state"])
+                    self.assertEqual(
+                        {"target_package_id": ids[5], "reason": "resolved"},
+                        queue["relationship"]["prerequisites"][0],
+                    )
                     self.assertEqual(before, inventory())
 
             self.assertEqual(renders[0].encode("utf-8"), renders[1].encode("utf-8"))
@@ -1225,107 +1182,6 @@ class CatalogTests(TestCase):
             )
             self.assertEqual([ORACLE_PROGRAM_ID], [program["program_id"] for program in value["programs"]])
             self.assertEqual(value, parse_catalog(value).as_dict())
-
-    def test_completion_edges_follow_literal_policy_and_folder_moves(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source_id = "11111111-1111-4111-8111-111111111111"
-            target_id = "22222222-2222-4222-8222-222222222222"
-            package(
-                root,
-                "Queue",
-                "source",
-                f"# Source\nPackage ID: {source_id}\n"
-                f"Completion Prerequisite: {target_id}\n"
-                f"Claim: release | unsatisfied\n",
-            )
-            target = package(
-                root,
-                "Ready",
-                "target",
-                f"# Target\nPackage ID: {target_id}\n"
-                f"Claim: release | satisfied | sha256:{'a' * 64}\n",
-            )
-
-            def source_entry():
-                value = json.loads(
-                    catalog.scan_catalog(
-                        root,
-                        completed_stage_names=["Done"],
-                        configuration_revision="revision-1",
-                    )
-                )
-                return value, next(
-                    entry for entry in value["entries"] if entry["package_id"] == source_id
-                )
-
-            value, source_entry_value = source_entry()
-            edge = source_entry_value["relationship"]["prerequisites"][0]
-            self.assertEqual(SCHEMA_VERSION, value["schema_version"])
-            self.assertEqual("revision-1", value["configuration_revision"])
-            self.assertEqual(
-                {
-                    "kind": "completion",
-                    "target_package_id": target_id,
-                    "observed_stage": "Ready",
-                    "resolved_state": "unsatisfied",
-                    "reason": "completion_unsatisfied",
-                },
-                edge,
-            )
-            self.assertEqual("unsatisfied", source_entry_value["relationship"]["direct_prerequisite_state"])
-
-            (root / "Fictional" / "Done").mkdir()
-            target.rename(root / "Fictional" / "Done" / "target")
-            value, source_entry_value = source_entry()
-            edge = source_entry_value["relationship"]["prerequisites"][0]
-            self.assertEqual("Done", edge["observed_stage"])
-            self.assertEqual("satisfied", edge["resolved_state"])
-            self.assertEqual("completion_satisfied", edge["reason"])
-            self.assertEqual("satisfied", source_entry_value["relationship"]["direct_prerequisite_state"])
-            self.assertEqual("release", next(iter(source_entry_value["relationship"]["claims"]))["name"])
-
-            (root / "Fictional" / "Done" / "target").rename(target)
-            _, source_entry_value = source_entry()
-            edge = source_entry_value["relationship"]["prerequisites"][0]
-            self.assertEqual("Ready", edge["observed_stage"])
-            self.assertEqual("unsatisfied", edge["resolved_state"])
-
-    def test_completion_policy_and_typed_schema_are_strict_and_safe(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            target_id = "22222222-2222-4222-8222-222222222222"
-            source_id = "11111111-1111-4111-8111-111111111111"
-            package(
-                root,
-                "Queue",
-                "source",
-                f"# Source\nPackage ID: {source_id}\nCompletion Prerequisite: {target_id}\n",
-            )
-            package(root, "Done", "target", f"# Target\nPackage ID: {target_id}\n")
-            missing_policy = json.loads(catalog.scan_catalog(root))
-            missing_edge = missing_policy["entries"][-1]["relationship"]["prerequisites"][0]
-            self.assertEqual("completion_policy_needed", missing_edge["reason"])
-            self.assertEqual("unknown", missing_edge["resolved_state"])
-            invalid_policy = json.loads(
-                catalog.scan_catalog(root, completed_stage_names=["Done", "Done"])
-            )
-            invalid_edge = invalid_policy["entries"][-1]["relationship"]["prerequisites"][0]
-            self.assertEqual("completion_policy_invalid", invalid_edge["reason"])
-            self.assertEqual("unknown", invalid_edge["resolved_state"])
-
-            parsed = parse_catalog(missing_policy)
-            self.assertIsNone(parsed.configuration_revision)
-            schema_four = dict(missing_policy, schema_version=4)
-            schema_four["catalog_digest"] = canonical_digest(schema_four)
-            with self.assertRaises(ValueError):
-                parse_catalog(schema_four)
-            malformed = json.loads(catalog.scan_catalog(root, completed_stage_names=["Done"]))
-            typed_edge = malformed["entries"][-1]["relationship"]["prerequisites"][0]
-            typed_edge["kind"] = "claim"
-            malformed["catalog_digest"] = canonical_digest(malformed)
-            with self.assertRaises(ValueError):
-                parse_catalog(malformed)
 
 def test_terminal_stages_track_completion_without_removing_entries():
     with TemporaryDirectory() as temporary:
@@ -1360,14 +1216,12 @@ def make_baseline_graph(root: Path) -> Path:
         "Awaiting_Retrospective", "Done", "Archive",
     )
     contents = (
-        f"# Under\nPackage ID: {ORACLE_IDS[0]}\nProgram Membership: {ORACLE_PROGRAM_ID}\n"
-        f"Claim: design | satisfied | sha256:{'a' * 64}\n",
+        f"# Under\nPackage ID: {ORACLE_IDS[0]}\nProgram Membership: {ORACLE_PROGRAM_ID}\n",
         f"# Queue\nPackage ID: {ORACLE_IDS[1]}\nProgram Membership: {ORACLE_PROGRAM_ID}\n"
-        f"Prerequisite: {ORACLE_IDS[2]} | release\nPrerequisite: malformed\n"
-        f"Superseded By: {ORACLE_IDS[2]}\nClaim: release | unsatisfied\n"
-        "Claim: Bad Name | satisfied\n",
+        f"Completion Prerequisite: {ORACLE_IDS[2]}\n"
+        "Completion Prerequisite: malformed\n"
+        f"Superseded By: {ORACLE_IDS[2]}\n",
         f"# Progress\nPackage ID: {ORACLE_IDS[2]}\n"
-        f"Claim: release | satisfied | sha256:{'b' * 64}\n"
         f"Superseded By: {ORACLE_IDS[1]}\n",
         f"# Fix\nPackage ID: {ORACLE_IDS[3]}\n",
         f"# Retro\nPackage ID: {ORACLE_IDS[4]}\n",
@@ -1417,11 +1271,13 @@ def test_baseline_graph_retains_exact_serialized_bytes_and_relationship_proof():
         ]
         assert "Fictional/Archive/pkg" in {entry["package_path"] for entry in value["entries"]}
         queue = next(entry for entry in value["entries"] if entry["stage"] == "Queue")
-        assert queue["relationship"]["claims"] == [{"name": "release", "state": "unsatisfied", "evidence_ref": None}]
-        assert {item["reason"] for item in queue["relationship"]["prerequisites"]} == {"claim_satisfied", "invalid_prerequisite"}
+        assert set(queue["relationship"]) == {"prerequisites", "program"}
+        assert queue["relationship"]["prerequisites"] == [
+            {"target_package_id": None, "reason": "unresolved"},
+            {"target_package_id": ORACLE_IDS[2], "reason": "resolved"},
+        ]
         assert queue["relationship"]["program"]["resolution"] == "resolved"
-        assert queue["relationship"]["superseded_by"]["resolution"] == "resolved"
-        assert set(queue["relationship"]["superseded_by"]) == {"package_id", "resolution"}
+        assert queue["relationship"]["program"]["title"] == "Core"
         assert value["programs"][0]["member_package_ids"] == [ORACLE_IDS[0], ORACLE_IDS[1]]
 
 
@@ -1462,24 +1318,6 @@ def test_real_text_screening_truncates_on_code_point_boundary(tmp_path):
     assert parse_catalog(value).as_dict() == value
 
 
-def test_invalid_claim_forms_keep_resolution_marker_private(tmp_path):
-    target_id, source_id = ORACLE_IDS[:2]
-    for index, rows in enumerate([
-        "Claim: release | satisfied | sha256:bad\n",
-        "Claim: release | maybe\n",
-        "Claim: release | satisfied | sha256:" + "a" * 64 + "\nClaim: release | unknown\n",
-    ]):
-        root = tmp_path / str(index)
-        package(root, "Queue", "target", f"# Target\nPackage ID: {target_id}\n" + rows)
-        package(root, "Queue", "source", f"# Source\nPackage ID: {source_id}\nPrerequisite: {target_id} | release\n")
-        value = json.loads(catalog.scan_catalog(root))
-        source, target = value["entries"]
-        assert target["relationship"]["claims"] == [{"name": "release", "state": "unknown", "evidence_ref": None}]
-        edge = source["relationship"]["prerequisites"][0]
-        assert (edge["reason"], edge["resolved_state"]) == ("invalid_claim", "unknown")
-        assert parse_catalog(value).as_dict() == value
-
-
 def test_core_headers_and_exact_wire_shapes_include_default_relationships(tmp_path):
     from nyx.models import DIAGNOSTIC_CODES
 
@@ -1487,16 +1325,20 @@ def test_core_headers_and_exact_wire_shapes_include_default_relationships(tmp_pa
     descriptor = tmp_path / "Fictional" / "Reference" / "Programs" / program_id
     descriptor.mkdir(parents=True)
     (descriptor / "program.md").write_text(f"Program ID: {program_id}\nProgram Title: Core\n", encoding="utf-8")
-    package(tmp_path, "Done", "target", f"# Target\nPackage ID: {target_id}\nClaim: release | satisfied | sha256:" + "a" * 64 + "\n")
-    package(tmp_path, "Queue", "source", f"# Source\nPackage ID: {source_id}\nTarget repo: /work/core\nStatus: ready\nPrerequisite: {target_id} | release\nCompletion Prerequisite: {target_id}\nProgram Membership: {program_id}\nSuperseded By: {target_id}\n")
+    package(tmp_path, "Done", "target", f"# Target\nPackage ID: {target_id}\n")
+    package(tmp_path, "Queue", "source", f"# Source\nPackage ID: {source_id}\nTarget repo: /work/core\nStatus: ready\nCompletion Prerequisite: {target_id}\nProgram Membership: {program_id}\nSuperseded By: {target_id}\n")
     value = json.loads(catalog.scan_catalog(tmp_path, completed_stage_names=["Done"]))
     source = value["entries"][1]
     assert source["declared"] == {"title": "Source", "target_project": "core", "status": "ready"}
     assert source["package_id"] == source_id
-    assert {edge["reason"] for edge in source["relationship"]["prerequisites"]} == {"claim_satisfied", "completion_satisfied"}
+    assert source["relationship"]["prerequisites"] == [
+        {"target_package_id": target_id, "reason": "resolved"}
+    ]
     assert source["relationship"]["program"] == {"program_id": program_id, "title": "Core", "resolution": "resolved"}
-    assert source["relationship"]["superseded_by"] == {"package_id": target_id, "resolution": "resolved"}
-    assert value["entries"][0]["relationship"]["claims"] == [{"name": "release", "state": "satisfied", "evidence_ref": "sha256:" + "a" * 64}]
+    assert value["entries"][0]["relationship"] == {
+        "prerequisites": [],
+        "program": {"program_id": None, "title": None, "resolution": "not_declared"},
+    }
     package(tmp_path, "Queue", "empty", "")
     invalid = package(tmp_path, "Queue", "bytes", "") / "spec.md"
     invalid.write_bytes(b"\xff")
@@ -1510,11 +1352,10 @@ def test_core_headers_and_exact_wire_shapes_include_default_relationships(tmp_pa
         assert set(entry["declared"]) == {"title", "target_project", "status"}
         assert entry["reported_fields"] == []
         relationship = entry["relationship"]
-        assert set(relationship) == {"participation", "claims", "prerequisites", "direct_prerequisite_state", "program", "superseded_by"}
-        for claim in relationship["claims"]:
-            assert set(claim) == {"name", "state", "evidence_ref"}
+        assert set(relationship) == {"prerequisites", "program"}
+        for edge in relationship["prerequisites"]:
+            assert set(edge) == {"target_package_id", "reason"}
         assert set(relationship["program"]) == {"program_id", "title", "resolution"}
-        assert set(relationship["superseded_by"]) == {"package_id", "resolution"}
     assert all(set(program) == {"program_id", "title", "member_package_ids"} for program in value["programs"])
     assert DIAGNOSTIC_CODES == set(catalog.CATALOG_DIAGNOSTIC_MESSAGES) == {
         "discovery_unavailable", "invalid_package", "unreadable_anchor", "nonregular_anchor", "changed_during_read", "duplicate_program_id"
@@ -1740,7 +1581,7 @@ def test_pattern_scan_is_linear_over_long_header_fields(tmp_path):
     long_value = b"a" + b" " * spaces + b"b"
     root = tmp_path / "specs"
     rows = {
-        "claim": b"Claim: " + long_value + b"\n",
+        "completion": b"Completion Prerequisite: " + long_value + b"\n",
         "status": b"Status: " + long_value + b"\n",
         "target": b"Target repo: " + long_value + b"\n",
         "title": b"# " + long_value + b"\n",
@@ -2079,82 +1920,6 @@ def test_nested_admission_deep_unreadable_folders_keep_messages_bounded(tmp_path
     assert all(_text_units(message) <= MAX_TEXT_UNITS for message in messages(value))
 
 
-def prerequisite_edge(entry: dict, kind: str, claim_name: str | None = None) -> dict:
-    """Select the single rendered edge with this kind and claim name."""
-    matches = [
-        edge
-        for edge in entry["relationship"]["prerequisites"]
-        if edge["kind"] == kind and edge.get("claim_name") == claim_name
-    ]
-    assert len(matches) == 1, matches
-    return matches[0]
-
-
-def test_self_missing_and_unknown_claim_edges_keep_distinct_reasons(tmp_path):
-    source_id = "11111111-1111-4111-8111-111111111111"
-    target_id = "22222222-2222-4222-8222-222222222222"
-    source_ref = f"sha256:{'a' * 64}"
-    target_ref = f"sha256:{'b' * 64}"
-    root = tmp_path / "specs"
-    package(
-        root,
-        "Queue",
-        "source",
-        f"# Source\nPackage ID: {source_id}\n"
-        f"Claim: release | satisfied | {source_ref}\n"
-        f"Prerequisite: {source_id} | release\n"
-        f"Completion Prerequisite: {source_id}\n"
-        f"Prerequisite: {target_id} | absent\n"
-        f"Prerequisite: {target_id} | pending\n",
-    )
-    package(
-        root,
-        "Queue",
-        "target",
-        f"# Target\nPackage ID: {target_id}\n"
-        f"Claim: release | satisfied | {target_ref}\n"
-        f"Claim: pending | unknown\n",
-    )
-    # The policy names the source's own stage, so a self completion edge
-    # would resolve as satisfied if self edges were not singled out.
-    value = json.loads(catalog.scan_catalog(root, completed_stage_names=["Queue"]))
-    source = entry_by_path(value, "Fictional/Queue/source")
-    assert prerequisite_edge(source, "claim", "release") == {
-        "kind": "claim",
-        "target_package_id": source_id,
-        "claim_name": "release",
-        "observed_state": "satisfied",
-        "observed_evidence_ref": source_ref,
-        "resolved_state": "unknown",
-        "reason": "self_edge",
-    }
-    assert prerequisite_edge(source, "completion") == {
-        "kind": "completion",
-        "target_package_id": source_id,
-        "observed_stage": "Queue",
-        "resolved_state": "unknown",
-        "reason": "self_edge",
-    }
-    assert prerequisite_edge(source, "claim", "absent") == {
-        "kind": "claim",
-        "target_package_id": target_id,
-        "claim_name": "absent",
-        "observed_state": None,
-        "observed_evidence_ref": None,
-        "resolved_state": "unknown",
-        "reason": "missing_claim",
-    }
-    assert prerequisite_edge(source, "claim", "pending") == {
-        "kind": "claim",
-        "target_package_id": target_id,
-        "claim_name": "pending",
-        "observed_state": "unknown",
-        "observed_evidence_ref": None,
-        "resolved_state": "unknown",
-        "reason": "claim_unknown",
-    }
-
-
 def test_duplicate_package_id_rows_leave_target_identity_invalid(tmp_path):
     source_id = "11111111-1111-4111-8111-111111111111"
     target_id = "22222222-2222-4222-8222-222222222222"
@@ -2163,29 +1928,22 @@ def test_duplicate_package_id_rows_leave_target_identity_invalid(tmp_path):
         root,
         "Queue",
         "source",
-        f"# Source\nPackage ID: {source_id}\nPrerequisite: {target_id} | release\n",
+        f"# Source\nPackage ID: {source_id}\nCompletion Prerequisite: {target_id}\n",
     )
     package(
         root,
         "Queue",
         "target",
-        f"# Target\nPackage ID: {target_id}\nPackage ID: {target_id}\n"
-        f"Claim: release | satisfied | sha256:{'b' * 64}\n",
+        f"# Target\nPackage ID: {target_id}\nPackage ID: {target_id}\n",
     )
     value = json.loads(catalog.build_catalog(root))
     target = entry_by_path(value, "Fictional/Queue/target")
     assert target["package_id"] is None
-    assert target["relationship"]["participation"] == "invalid"
+    assert set(target["relationship"]) == {"prerequisites", "program"}
     source = entry_by_path(value, "Fictional/Queue/source")
-    assert prerequisite_edge(source, "claim", "release") == {
-        "kind": "claim",
-        "target_package_id": target_id,
-        "claim_name": "release",
-        "observed_state": None,
-        "observed_evidence_ref": None,
-        "resolved_state": "unknown",
-        "reason": "target_invalid_identity",
-    }
+    assert source["relationship"]["prerequisites"] == [
+        {"target_package_id": target_id, "reason": "unresolved"}
+    ]
 
 
 @pytest.mark.parametrize("reserved", ["Reference", ".pipeline"])
@@ -2269,49 +2027,6 @@ def test_anchor_changed_after_every_read_is_retried_exactly_once(tmp_path):
                 "message": "changed during read: Fictional/Queue/changing",
             }
         ],
-    }
-
-
-def test_completion_policy_and_stage_names_match_case_sensitively(tmp_path):
-    source_id = "11111111-1111-4111-8111-111111111111"
-    lower_id = "22222222-2222-4222-8222-222222222222"
-    title_id = "33333333-3333-4333-8333-333333333333"
-    root = tmp_path / "specs"
-    package(
-        root,
-        "Queue",
-        "source",
-        f"# Source\nPackage ID: {source_id}\n"
-        f"Completion Prerequisite: {lower_id}\n"
-        f"Completion Prerequisite: {title_id}\n",
-    )
-    package(root, "done", "lower", f"# Lower\nPackage ID: {lower_id}\n")
-    package(root, "Review", "title", f"# Title\nPackage ID: {title_id}\n")
-    value = json.loads(
-        catalog.scan_catalog(root, completed_stage_names=["Done", "review"])
-    )
-    edges = {
-        edge["target_package_id"]: edge
-        for edge in entry_by_path(value, "Fictional/Queue/source")["relationship"][
-            "prerequisites"
-        ]
-        if edge["kind"] == "completion"
-    }
-    assert edges == {
-        lower_id: {
-            "kind": "completion",
-            "target_package_id": lower_id,
-            "observed_stage": "done",
-            "resolved_state": "unsatisfied",
-            "reason": "completion_unsatisfied",
-        },
-        title_id: {
-            "kind": "completion",
-            "target_package_id": title_id,
-            "observed_stage": "Review",
-            "resolved_state": "unsatisfied",
-            "reason": "completion_unsatisfied",
-        },
     }
 
 
@@ -2606,9 +2321,8 @@ def test_scan_packages_records_match_the_catalog_listing(tmp_path) -> None:
     assert rows.candidate_ids == frozenset({SCAN_ID_B})
     assert rows.read_diagnostic is None
     prerequisites = rows.relationship["prerequisites"]
-    assert [row["kind"] for row in prerequisites] == ["completion", "completion"]
+    assert all(set(row) == {"target_package_id"} for row in prerequisites)
     assert [row["target_package_id"] for row in prerequisites] == [SCAN_ID_A, None]
-    assert [row["valid"] for row in prerequisites] == [True, False]
     linked = by_name["linked"]
     assert linked.read_diagnostic == "nonregular_anchor"
     assert linked.package_id is None
@@ -2676,3 +2390,189 @@ def test_scan_packages_does_not_change_the_catalog_bytes(tmp_path) -> None:
     before = catalog.build_catalog(root)
     catalog.scan_packages(root)
     assert catalog.build_catalog(root) == before
+
+
+def test_scan_and_catalog_serve_the_loki_prerequisite_interface(tmp_path):
+    """One root proves both interfaces an ordering consumer reads."""
+    source_id = "11111111-1111-4111-8111-111111111111"
+    target_id = "22222222-2222-4222-9222-222222222222"
+    missing_id = "33333333-3333-4333-8333-333333333333"
+    duplicate_id = "44444444-4444-4444-8444-444444444444"
+    blocked_id = "55555555-5555-4555-8555-555555555555"
+    root = tmp_path / "specs"
+    package(
+        root,
+        "Queue",
+        "source",
+        f"# Source\nPackage ID: {source_id}\n"
+        f"Completion Prerequisite: {target_id}\n"
+        "Completion Prerequisite: not-a-uuid\n"
+        f"Completion Prerequisite: {missing_id}\n"
+        f"Completion Prerequisite: {source_id}\n"
+        f"Completion Prerequisite: {duplicate_id}\n"
+        f"Completion Prerequisite: {target_id} | claim\n",
+    )
+    package(root, "Queue", "target", f"# Target\nPackage ID: {target_id}\n")
+    package(root, "Queue", "duplicate-a", f"# A\nPackage ID: {duplicate_id}\n")
+    package(root, "Queue", "duplicate-b", f"# B\nPackage ID: {duplicate_id}\n")
+
+    scan = catalog.scan_packages(root)
+    assert scan.status == "complete"
+    source = next(
+        record for record in scan.records
+        if record.package_path == "Fictional/Queue/source"
+    )
+    assert source.stage == "Queue"
+    assert source.package_id == source_id
+    assert source.candidate_ids == frozenset({source_id})
+    rows = source.relationship["prerequisites"]
+    assert all(set(row) == {"target_package_id"} for row in rows)
+    assert [row["target_package_id"] for row in rows] == [
+        target_id, None, missing_id, source_id, duplicate_id, None,
+    ]
+
+    entry = entry_by_path(json.loads(catalog.build_catalog(root)), "Fictional/Queue/source")
+    edges = entry["relationship"]["prerequisites"]
+    assert all(set(edge) == {"target_package_id", "reason"} for edge in edges)
+    assert [edge["target_package_id"] for edge in edges] == sorted(
+        [target_id, None, missing_id, source_id, duplicate_id, None],
+        key=lambda value: value or "",
+    )
+    # Only the readable, singly identified target resolves; the self row does
+    # not, and neither does a malformed, absent, duplicated or pipe-qualified one.
+    assert [edge["reason"] for edge in edges] == [
+        "unresolved", "unresolved", "unresolved", "resolved", "unresolved",
+        "unresolved",
+    ]
+
+    blocked = package(root, "Queue", "blocked", f"# Blocked\nPackage ID: {blocked_id}\n")
+    blocked_anchor = blocked / "spec.md"
+    permission_bits_deny = sys.platform != "win32" and not (
+        hasattr(os, "geteuid") and os.geteuid() == 0
+    )
+    blocked_anchor.chmod(0)
+    if permission_bits_deny:
+        denial = nullcontext()
+    else:
+        original_open = catalog.Path.open
+
+        def deny(target, *args, **kwargs):
+            if Path(target) == blocked_anchor:
+                raise PermissionError("injected unreadable anchor")
+            return original_open(target, *args, **kwargs)
+
+        denial = patch.object(catalog.Path, "open", autospec=True, side_effect=deny)
+    try:
+        with denial:
+            incomplete = catalog.scan_packages(root)
+            incomplete_value = json.loads(catalog.build_catalog(root))
+    finally:
+        blocked_anchor.chmod(0o600)
+    assert incomplete.status == "incomplete"
+    incomplete_edges = entry_by_path(
+        incomplete_value, "Fictional/Queue/source"
+    )["relationship"]["prerequisites"]
+    assert [edge["reason"] for edge in incomplete_edges] == ["unresolved"] * 6
+
+
+def test_served_edges_ignore_the_completion_policy(tmp_path):
+    """The policy still groups terminal stages but never evaluates an edge."""
+    source_id = "11111111-1111-4111-8111-111111111111"
+    target_id = "22222222-2222-4222-8222-222222222222"
+    root = tmp_path / "specs"
+    package(
+        root, "Queue", "source",
+        f"# Source\nPackage ID: {source_id}\nCompletion Prerequisite: {target_id}\n",
+    )
+    target = package(root, "Done", "target", f"# Target\nPackage ID: {target_id}\n")
+    expected_edge = [{"target_package_id": target_id, "reason": "resolved"}]
+
+    def served_under_every_policy():
+        values = [
+            json.loads(catalog.build_catalog(root, completed_stage_names=policy))
+            for policy in (None, ["Done"], ["Done", "Done"])
+        ]
+        assert values[0]["entries"] == values[1]["entries"] == values[2]["entries"]
+        assert [value["terminal_stages"] for value in values] == [[], ["Done"], []]
+        for value in values:
+            assert entry_by_path(
+                value, "Fictional/Queue/source"
+            )["relationship"]["prerequisites"] == expected_edge
+        return values
+
+    served_under_every_policy()
+    (root / "Fictional" / "Queue").mkdir(exist_ok=True)
+    target.rename(root / "Fictional" / "Queue" / "target")
+    served_under_every_policy()
+    assert list(inspect.signature(catalog._edge).parameters) == [
+        "source", "row", "index", "identity_complete",
+    ]
+    assert list(inspect.signature(catalog._render_entry).parameters) == [
+        "record", "index", "identity_complete", "program_index",
+        "program_coverage_complete",
+    ]
+
+
+def test_relationship_shape_identity_and_legacy_edges(tmp_path):
+    """Every served relationship is the two-key shape, edges included."""
+    target_id = "22222222-2222-4222-8222-222222222222"
+    duplicate_id = "11111111-1111-4111-8111-111111111111"
+    root = tmp_path / "specs"
+    package(root, "Archive", "legacy", f"# Legacy\nCompletion Prerequisite: {target_id}\n")
+    package(root, "Queue", "target", f"# Target\nPackage ID: {target_id}\n")
+    package(
+        root, "Queue", "twice",
+        f"# Twice\nPackage ID: {duplicate_id}\nPackage ID: {duplicate_id}\n",
+    )
+    value = json.loads(catalog.build_catalog(root))
+    for entry in value["entries"]:
+        assert set(entry["relationship"]) == {"prerequisites", "program"}
+        assert set(entry["relationship"]["program"]) == {
+            "program_id", "title", "resolution",
+        }
+    legacy = entry_by_path(value, "Fictional/Archive/legacy")
+    assert legacy["package_id"] is None
+    assert legacy["relationship"]["prerequisites"] == [
+        {"target_package_id": target_id, "reason": "resolved"},
+    ]
+    assert entry_by_path(value, "Fictional/Queue/twice")["package_id"] is None
+    assert {field.name for field in dataclasses.fields(CatalogEntry)} == {
+        "package_path", "project", "stage", "declared", "reported_fields",
+        "relationship_data", "package_id", "program_id", "program_title",
+    }
+    # The legacy package's edge survives the protocol, so its parsed entry keeps it.
+    assert parse_catalog(value).as_dict() == value
+
+
+def test_retired_labels_stay_out_of_reported_fields(tmp_path):
+    """A finished and a live card show only their live header fields."""
+    target_id = "22222222-2222-4222-8222-222222222222"
+    rows = (
+        f"Prerequisite: {target_id} | release\n"
+        "Claim: release | satisfied | sha256:" + "a" * 64 + "\n"
+        "Owner: Alice\n"
+    )
+    for index, (stage, package_id) in enumerate((
+        ("Done", "11111111-1111-4111-8111-111111111111"),
+        ("Under_Development", "22222222-2222-4222-9222-222222222222"),
+    )):
+        root = tmp_path / str(index) / "specs"
+        package(root, stage, "item", f"# Item\nPackage ID: {package_id}\n" + rows)
+        value = json.loads(catalog.build_catalog(root))
+        entry = entry_by_path(value, f"Fictional/{stage}/item")
+        assert entry["reported_fields"] == [{"name": "Owner", "value": "Alice"}]
+        assert entry["relationship"]["prerequisites"] == []
+        assert value["discovery_diagnostics"] == []
+        assert value["identity_coverage"] == {"state": "complete", "diagnostics": []}
+        assert parse_catalog(value).as_dict() == value
+    # Dropping the retired labels from the exclusion shows what it hides.
+    retired = {label.lower() for label in catalog.RETIRED_HEADER_LABELS}
+    root = tmp_path / "0" / "specs"
+    with patch.object(
+        catalog, "_REPORTED_EXCLUSIONS", catalog._REPORTED_EXCLUSIONS - retired
+    ):
+        exposed = json.loads(catalog.build_catalog(root))
+    assert [
+        field["name"]
+        for field in entry_by_path(exposed, "Fictional/Done/item")["reported_fields"]
+    ] == ["Claim", "Owner", "Prerequisite"]

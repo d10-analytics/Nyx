@@ -68,45 +68,23 @@ def raw_catalog():
             "stage": path.split("/")[1],
             "declared": {"title": title, "target_project": "Fictional",
                          "status": "ready"},
-            "relationship": {"participation": "available", "claims": [],
-                              "prerequisites": [],
-                              "direct_prerequisite_state": "no_declared_prerequisites",
+            "relationship": {"prerequisites": [],
                               "program": {"program_id": None, "title": None,
-                                          "resolution": "not_declared"},
-                              "superseded_by": {"package_id": None,
-                                                "resolution": "not_declared"}},
+                                          "resolution": "not_declared"}},
             "reported_fields": [],
         })
     first, second = value["entries"]
     program_id = str(UUID(int=3, version=4))
     first["relationship"] = {
-        "participation": "available",
-        "claims": [
-            {
-                "name": "release",
-                "state": "satisfied",
-                "evidence_ref": "sha256:" + "a" * 64,
-            }
-        ],
         "prerequisites": [
             {
-                "kind": "claim",
                 "target_package_id": second["package_id"],
-                "claim_name": "release",
-                "observed_state": "satisfied",
-                "observed_evidence_ref": "sha256:" + "a" * 64,
-                "resolved_state": "satisfied",
-                "reason": "claim_satisfied",
+                "reason": "resolved",
             }
         ],
-        "direct_prerequisite_state": "satisfied",
         "program": {
             "program_id": program_id,
             "title": "Test program",
-            "resolution": "resolved",
-        },
-        "superseded_by": {
-            "package_id": second["package_id"],
             "resolution": "resolved",
         },
     }
@@ -149,6 +127,7 @@ def test_default_provider_uses_real_scanner_and_emits_every_stage(tmp_path, monk
         lambda value: value.update(schema_version=5),
         lambda value: value.update(schema_version=6),
         lambda value: value.update(schema_version=7),
+        lambda value: value.update(schema_version=8),
         lambda value: value.pop("configuration_revision"),
         lambda value: value.update(configuration_revision=[]),
         lambda value: value.update(unknown=True),
@@ -158,12 +137,13 @@ def test_default_provider_uses_real_scanner_and_emits_every_stage(tmp_path, monk
         lambda value: value.update(terminal_stages=["Done", "Archive"]),
         lambda value: value.update(terminal_stages=["Done", "Done"]),
         lambda value: value["entries"][0].update(stage="Done"),
-        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(kind="completion"),
+        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(kind="claim"),
+        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(reason="completion_satisfied"),
         lambda value: value["entries"][0].update(
             transitive_diagnostics=[{"code": "transitive_diagnostics_truncated"}]
         ),
     ],
-    ids=["schema-3", "schema-4", "schema-5", "schema-6", "schema-7", "missing-revision", "malformed-revision", "unknown-key", "old-entry-field", "old-object", "missing-terminal", "unsorted-terminal", "duplicate-terminal", "inventory-mismatch", "cross-kind-edge", "transitive-reference"],
+    ids=["schema-3", "schema-4", "schema-5", "schema-6", "schema-7", "schema-8", "missing-revision", "malformed-revision", "unknown-key", "old-entry-field", "old-object", "missing-terminal", "unsorted-terminal", "duplicate-terminal", "inventory-mismatch", "retired-edge-key", "retired-edge-reason", "transitive-reference"],
 )
 def test_schema_four_parser_rejects_legacy_unknown_and_mutated_payloads(mutate):
     value = raw_catalog()
@@ -673,44 +653,15 @@ def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
     "mutate",
     [
         lambda value: value["identity_coverage"].update({"diagnostics": {}}),
-        lambda value: value["entries"][0]["relationship"].update(
-            {
-                "claims": [
-                    {
-                        "name": "release",
-                        "state": "satisfied",
-                        "evidence_ref": None,
-                        "diagnostics": "not-a-list",
-                    }
-                ]
-            }
-        ),
-        lambda value: value["entries"][0]["relationship"].update(
-            {
-                "prerequisites": [
-                    {
-                        "kind": "claim",
-                        "target_package_id": None,
-                        "claim_name": None,
-                        "observed_state": "invalid",
-                        "observed_evidence_ref": None,
-                        "resolved_state": "unknown",
-                        "reason": "invalid_prerequisite",
-                    }
-                ]
-            }
+        lambda value: value["entries"][0]["relationship"].update({"extra": []}),
+        lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(
+            {"reason": "missing_target"}
         ),
         lambda value: value["entries"][0]["relationship"]["prerequisites"][0].update(
-            {"observed_evidence_ref": "unsafe"}
+            {"target_package_id": "unsafe"}
         ),
         lambda value: value["entries"][0]["relationship"].update(
-            {
-                "superseded_by": {
-                    "package_id": None,
-                    "resolution": "not_declared",
-                    "diagnostics": [{"code": "invalid_package", "message": 1}],
-                }
-            }
+            {"prerequisites": "not-a-list"}
         ),
         lambda value: value["entries"][0]["relationship"]["program"].update(
             {"diagnostics": [{"code": "invalid_package", "message": 1}]}
@@ -729,10 +680,10 @@ def test_catalog_route_rejects_malformed_inventory_before_serving(case, mutate):
     ],
     ids=[
         "coverage",
-        "claims",
-        "observed_state",
-        "observed_evidence",
-        "successor_diagnostics",
+        "relation_extra_key",
+        "edge_reason",
+        "edge_target",
+        "prerequisites_type",
         "program_diagnostics",
         "program_members",
     ],
@@ -2066,9 +2017,7 @@ def reported_contract_cases():
     add("entry-state", lambda v, e: e.update(state="complete"))
     add("entry-diagnostics", lambda v, e: e.update(diagnostics=[]))
     add("transitive", lambda v, e: e.update(transitive_diagnostics=[]))
-    add("claim-diagnostics", lambda v, e: e["relationship"]["claims"][0].update(diagnostics=[]))
     add("program-diagnostics", lambda v, e: e["relationship"]["program"].update(diagnostics=[]))
-    add("successor-diagnostics", lambda v, e: e["relationship"]["superseded_by"].update(diagnostics=[]))
     add("catalog-program-diagnostics", lambda v, e: v["programs"][0].update(diagnostics=[]))
     for name, fields in [
         ("sixty-four", [{"name": f"N{i:02}", "value": "ok"} for i in range(64)]),
@@ -2078,18 +2027,9 @@ def reported_contract_cases():
     ]:
         add(name, lambda v, e, fields=fields: e.update(reported_fields=fields), True)
 
-    # Text bound agreement for paths, diagnostics, terminal stages and
-    # completion stages: 1024 UTF-16 units accepted, one unit over, or a lone
-    # surrogate anywhere in the text, rejected.
-    def completion_edge(value, stage):
-        return {
-            "kind": "completion",
-            "target_package_id": value["entries"][1]["package_id"],
-            "observed_stage": stage,
-            "resolved_state": "satisfied",
-            "reason": "completion_satisfied",
-        }
-
+    # Text bound agreement for paths, diagnostics and terminal stages: 1024
+    # UTF-16 units accepted, one unit over, or a lone surrogate anywhere in the
+    # text, rejected.
     add(
         "text_limit_path_1024",
         lambda v, e: e.update(package_path="Fictional/Queue/first/" + "😀" * 501),
@@ -2109,11 +2049,6 @@ def reported_contract_cases():
     )
     add("text_limit_terminal_512", lambda v, e: v.update(terminal_stages=["😀" * 512]), True)
     add(
-        "text_limit_observed_512",
-        lambda v, e: e["relationship"].update(prerequisites=[completion_edge(v, "😀" * 512)]),
-        True,
-    )
-    add(
         "text_limit_path_over",
         lambda v, e: e.update(package_path="Fictional/Queue/first/" + "😀" * 502),
     )
@@ -2132,10 +2067,6 @@ def reported_contract_cases():
         ),
     )
     add("text_limit_terminal_513", lambda v, e: v.update(terminal_stages=["😀" * 513]))
-    add(
-        "text_limit_observed_513",
-        lambda v, e: e["relationship"].update(prerequisites=[completion_edge(v, "😀" * 513)]),
-    )
     return cases
 
 

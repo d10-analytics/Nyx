@@ -62,27 +62,8 @@ def _declared(title, project):
     }
 
 
-def _edge(target_id, name):
-    return {
-        "kind": "claim",
-        "target_package_id": target_id,
-        "claim_name": name,
-        "observed_state": "unsatisfied",
-        "observed_evidence_ref": None,
-        "resolved_state": "unsatisfied",
-        "reason": "claim_unsatisfied",
-    }
-
-
-def _completion_edge(target_id, *, observed_stage=None, resolved_state="unknown",
-                     reason="completion_policy_needed"):
-    return {
-        "kind": "completion",
-        "target_package_id": target_id,
-        "observed_stage": observed_stage,
-        "resolved_state": resolved_state,
-        "reason": reason,
-    }
+def _edge(target_id, reason="resolved"):
+    return {"target_package_id": target_id, "reason": reason}
 
 
 def _entry(package_id, path, lifecycle, title, project, prerequisites=None):
@@ -94,18 +75,12 @@ def _entry(package_id, path, lifecycle, title, project, prerequisites=None):
         "stage": stage,
         "declared": _declared(title, project),
         "relationship": {
-            "participation": "available",
-            "claims": [],
             "prerequisites": [] if prerequisites is None else prerequisites,
-            "direct_prerequisite_state": (
-                "unsatisfied" if prerequisites else "no_declared_prerequisites"
-            ),
             "program": {
                 "program_id": None,
                 "title": None,
                 "resolution": "not_declared",
             },
-            "superseded_by": {"package_id": None, "resolution": "not_declared"},
         },
         "reported_fields": [],
     }
@@ -160,7 +135,7 @@ def board_payload(*, titles=None):
                 "queue",
                 titles.get("gate", "Gate step"),
                 "Alpha",
-                prerequisites=[_edge(STEP_TWO, "gate")],
+                prerequisites=[_edge(STEP_TWO)],
             ),
             _entry(
                 STEP_ONE,
@@ -175,7 +150,7 @@ def board_payload(*, titles=None):
                 "under_development",
                 titles.get("step_two", "Dependent step"),
                 "Alpha",
-                prerequisites=[_edge(STEP_ONE, "build")],
+                prerequisites=[_edge(STEP_ONE)],
             ),
             _entry(
                 LOOSE,
@@ -183,7 +158,7 @@ def board_payload(*, titles=None):
                 "under_development",
                 titles.get("loose", XSS_TITLE),
                 "Beta",
-                prerequisites=[_edge(STEP_ONE, "shared")],
+                prerequisites=[_edge(STEP_ONE)],
             ),
         ],
         "programs": [],
@@ -204,13 +179,11 @@ def mixed_producer_root(tmp_path, *, target_stage="Queue"):
     source_id = "123e4567-e89b-42d3-a456-426614174011"
     _write_package(
         root, "Alpha", target_stage, "target", target_id,
-        f"# Target\nPackage ID: {target_id}\n"
-        "Claim: release | satisfied | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        f"# Target\nPackage ID: {target_id}\n",
     )
     _write_package(
         root, "Beta", "Under_Development", "dependent", source_id,
         f"# Dependent\nPackage ID: {source_id}\n"
-        f"Prerequisite: {target_id} | release\n"
         f"Completion Prerequisite: {target_id}\n",
     )
     return root, target_id, source_id
@@ -257,15 +230,7 @@ def lifecycle_payload(*, completed_stages=()):
     for stage, lifecycle, _label, title in STAGE_ROWS:
         prerequisites = None
         if stage == "Queue":
-            edge = _edge(STAGE_IDS["Done"], "release")
-            evidence = "sha256:" + "b" * 64
-            edge.update(
-                observed_state="satisfied",
-                observed_evidence_ref=evidence,
-                resolved_state="satisfied",
-                reason="claim_satisfied",
-            )
-            prerequisites = [edge]
+            prerequisites = [_edge(STAGE_IDS["Done"])]
         entry = _entry(
             STAGE_IDS[stage],
             f"Fictional/{stage}/package",
@@ -274,12 +239,6 @@ def lifecycle_payload(*, completed_stages=()):
             "Fictional",
             prerequisites=prerequisites,
         )
-        if stage == "Done":
-            entry["relationship"]["claims"] = [{
-                "name": "release",
-                "state": "satisfied",
-                "evidence_ref": "sha256:" + "b" * 64,
-            }]
         entries.append(entry)
     value = {
         "schema_version": SCHEMA_VERSION,
@@ -307,20 +266,8 @@ COMPACT_COMPLETED = "123e4567-e89b-42d3-a456-426614174022"
 
 
 def compact_payload(*, extra_stage=False):
-    completed_edge = _edge(COMPACT_COMPLETED, "release")
-    completed_edge.update(
-        observed_state="satisfied",
-        observed_evidence_ref="sha256:" + "c" * 64,
-        resolved_state="satisfied",
-        reason="claim_satisfied",
-    )
-    visible_edge = _edge(COMPACT_CARD, "build")
-    visible_edge.update(
-        observed_state="satisfied",
-        observed_evidence_ref="sha256:" + "d" * 64,
-        resolved_state="satisfied",
-        reason="claim_satisfied",
-    )
+    completed_edge = _edge(COMPACT_COMPLETED)
+    visible_edge = _edge(COMPACT_CARD)
     entries = [
         _entry(
             COMPACT_CARD, "Alpha/Testing/custom", "under_development", "Custom stage card", "Alpha"
@@ -1106,14 +1053,8 @@ def open_stage_editor(page):
         editor.locator("summary").click()
 
 
-def dependency_state_payload(state, *, titles=None):
-    value = json.loads(board_payload(titles=titles))
-    gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
-    edge = gate["relationship"]["prerequisites"][0]
-    edge.update(observed_state=state, resolved_state=state, reason=f"claim_{state}")
-    gate["relationship"]["direct_prerequisite_state"] = state
-    _reseal(value)
-    return value
+def dependency_state_payload(*, titles=None):
+    return json.loads(board_payload(titles=titles))
 
 
 # Literal expectations for Windows-style roots: the root is preserved and every
@@ -1350,9 +1291,9 @@ def test_empty_click_preference_is_available_without_saved_settings_and_persists
 
 
 def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board(open_page):
-    first = dependency_state_payload("unsatisfied")
-    stale = dependency_state_payload("unsatisfied", titles={"gate": "Stale gate"})
-    fresh = dependency_state_payload("satisfied", titles={"gate": "Fresh gate"})
+    first = dependency_state_payload()
+    stale = dependency_state_payload(titles={"gate": "Stale gate"})
+    fresh = dependency_state_payload(titles={"gate": "Fresh gate"})
     client = BlockingSequenceClient([first, first, stale, stale, fresh], blocked_call=3)
     settings = BrowserSettings()
     page_a = open_page(client, settings=settings)
@@ -1400,8 +1341,8 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
 
 @pytest.mark.parametrize("case", ["stale", "null", "malformed"])
 def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_page, case):
-    valid = dependency_state_payload("unsatisfied")
-    bad = dependency_state_payload("satisfied", titles={"gate": "Rejected gate"})
+    valid = dependency_state_payload()
+    bad = dependency_state_payload(titles={"gate": "Rejected gate"})
     if case == "stale":
         bad["configuration_revision"] = "revision-before-save"
     elif case == "null":
@@ -1409,7 +1350,7 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
     elif case == "malformed":
         bad["configuration_revision"] = {"revision": "bad"}
     bad["catalog_digest"] = canonical_digest(bad)
-    fresh = dependency_state_payload("unknown", titles={"gate": "Fresh gate"})
+    fresh = dependency_state_payload(titles={"gate": "Fresh gate"})
     fresh["configuration_revision"] = "revision-2"
     fresh["catalog_digest"] = canonical_digest(fresh)
     client = BlockingRawSequenceClient([valid, bad, fresh])
@@ -1448,17 +1389,15 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
 
 
 def coherent_refresh_payload():
-    value = dependency_state_payload("satisfied")
+    value = dependency_state_payload()
     loose = next(entry for entry in value["entries"] if entry["package_id"] == LOOSE)
-    edge = loose["relationship"]["prerequisites"][0]
-    edge.update(target_package_id=STEP_TWO, observed_state="satisfied",
-                resolved_state="satisfied", reason="claim_satisfied")
+    loose["relationship"]["prerequisites"][0]["target_package_id"] = STEP_TWO
     _reseal(value)
     return value
 
 
 def test_successful_save_updates_needs_selection_and_arrows_together(open_page):
-    client = SequenceClient([dependency_state_payload("unsatisfied"), coherent_refresh_payload()])
+    client = SequenceClient([dependency_state_payload(), coherent_refresh_payload()])
     settings = BrowserSettings()
     page = open_page(client, settings=settings)
     page.locator("#stage-order-editor").wait_for()
@@ -1494,8 +1433,9 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
     assert connection_pairs(page) == {(target_id, source_id)}
     before = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
                   if entry["package_id"] == source_id)
-    edge = next(edge for edge in before["relationship"]["prerequisites"] if edge["kind"] == "completion")
-    assert (edge["resolved_state"], edge["reason"]) == ("unsatisfied", "completion_unsatisfied")
+    assert before["relationship"]["prerequisites"] == [
+        {"target_package_id": target_id, "reason": "resolved"}
+    ]
 
     source.click()
     assert panel_needs(page) == [{
@@ -1518,8 +1458,9 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
         "reason": "merge state unknown, in a finished row, hidden"}]
     after = next(entry for entry in client.fetch_catalog().as_dict()["entries"]
                  if entry["package_id"] == source_id)
-    edge = next(edge for edge in after["relationship"]["prerequisites"] if edge["kind"] == "completion")
-    assert (edge["resolved_state"], edge["reason"]) == ("satisfied", "completion_satisfied")
+    assert after["relationship"]["prerequisites"] == [
+        {"target_package_id": target_id, "reason": "resolved"}
+    ]
     assert source.get_attribute("aria-pressed") == "true"
 
     page.get_by_label("Hide terminal rows", exact=True).uncheck()
@@ -1544,9 +1485,9 @@ def test_real_producer_terminal_gated_completion_target_reveals_card_and_rail(op
         "reason": "merge state unknown, in a finished row, hidden"}]
     value = client.fetch_catalog().as_dict()
     dependent = next(entry for entry in value["entries"] if entry["package_id"] == source_id)
-    completion = next(edge for edge in dependent["relationship"]["prerequisites"] if edge["kind"] == "completion")
-    assert completion["resolved_state"] == "satisfied"
-    assert completion["reason"] == "completion_satisfied"
+    assert dependent["relationship"]["prerequisites"] == [
+        {"target_package_id": target_id, "reason": "resolved"}
+    ]
     page.get_by_label("Hide terminal rows", exact=True).uncheck()
     assert page.locator(f'.card[data-package-id="{target_id}"]').count() == 1
     assert connection_pairs(page) == {(target_id, source_id)}
@@ -1556,139 +1497,97 @@ def test_real_producer_invalid_and_missing_completion_edges_are_admitted(open_pa
     root = tmp_path / "workspace"
     source_id = "123e4567-e89b-42d3-a456-426614174012"
     missing_id = "123e4567-e89b-42d3-a456-426614174013"
+    provider_id = "123e4567-e89b-42d3-a456-426614174014"
+    self_id = "123e4567-e89b-42d3-a456-426614174015"
     _write_package(
         root, "Alpha", "Queue", "invalid", source_id,
         f"# Invalid\nPackage ID: {source_id}\nCompletion Prerequisite: malformed | value\n",
     )
     _write_package(
-        root, "Alpha", "Under_Development", "dependent", "123e4567-e89b-42d3-a456-426614174014",
-        f"# Dependent\nPackage ID: 123e4567-e89b-42d3-a456-426614174014\n"
-        f"Completion Prerequisite: {missing_id}\n",
+        root, "Alpha", "Under_Development", "missing", missing_id,
+        f"# Missing\nPackage ID: {missing_id}\n"
+        "Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174099\n",
+    )
+    _write_package(
+        root, "Alpha", "Queue", "provider", provider_id,
+        f"# Provider\nPackage ID: {provider_id}\n",
+    )
+    _write_package(
+        root, "Alpha", "Queue", "self", self_id,
+        f"# Self\nPackage ID: {self_id}\n"
+        f"Completion Prerequisite: {self_id}\n"
+        f"Completion Prerequisite: {provider_id}\n",
     )
     value = json.loads(scan_catalog(root, configuration_revision="revision-1"))
-    invalid_entry = next(item for item in value["entries"] if item["package_id"] == source_id)
-    missing_entry = next(
-        item for item in value["entries"] if item["package_id"] == "123e4567-e89b-42d3-a456-426614174014"
-    )
-    invalid_edge = invalid_entry["relationship"]["prerequisites"][0]
-    missing_edge = missing_entry["relationship"]["prerequisites"][0]
-    assert (invalid_edge["kind"], invalid_edge["reason"]) == ("completion", "invalid_prerequisite")
-    assert (missing_edge["kind"], missing_edge["reason"]) == ("completion", "missing_target")
+    by_path = {entry["package_path"]: entry for entry in value["entries"]}
+    assert by_path["Alpha/Queue/invalid"]["relationship"]["prerequisites"] == [
+        {"target_package_id": None, "reason": "unresolved"}
+    ]
+    assert by_path["Alpha/Under_Development/missing"]["relationship"]["prerequisites"] == [
+        {"target_package_id": "123e4567-e89b-42d3-a456-426614174099",
+         "reason": "unresolved"}
+    ]
+    # A row naming its own displayed card is served unresolved with that ID.
+    assert by_path["Alpha/Queue/self"]["relationship"]["prerequisites"] == [
+        {"target_package_id": provider_id, "reason": "resolved"},
+        {"target_package_id": self_id, "reason": "unresolved"},
+    ]
     assert parse_catalog(value).schema_version == SCHEMA_VERSION
 
     page = open_page(StaticClient(value))
-    for package_id in (source_id, "123e4567-e89b-42d3-a456-426614174014"):
-        card = page.locator(f'.card[data-package-id="{package_id}"]')
+    for package_path in ("Alpha/Queue/invalid", "Alpha/Under_Development/missing"):
+        card = page.locator(f'.card[data-package-path="{package_path}"]')
         playwright.expect(card).to_have_count(1)
         card.click()
         assert panel_needs(page) == [{
             "title": "unresolved target", "linked": False, "project": "",
             "reason": ""}]
-
-
-CLAIM_EDGE_REASONS = [
-    "claim_satisfied", "claim_unsatisfied", "claim_unknown", "missing_claim",
-    "invalid_claim", "missing_target", "duplicate_target", "identity_coverage_incomplete",
-    "target_unreadable", "target_changed_during_read", "target_invalid_identity",
-    "self_edge", "invalid_prerequisite",
-]
-COMPLETION_EDGE_REASONS = [
-    "completion_satisfied", "completion_unsatisfied", "completion_policy_needed",
-    "completion_policy_invalid", "missing_target", "duplicate_target",
-    "identity_coverage_incomplete", "target_unreadable", "target_changed_during_read",
-    "target_invalid_identity", "self_edge", "invalid_prerequisite",
-]
-
-
-def admitted_reason_payload(kind, reason):
-    value = json.loads(board_payload())
-    gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
-    if kind == "claim":
-        edge = _edge(None if reason in {
-            "missing_target", "duplicate_target", "identity_coverage_incomplete",
-            "target_unreadable", "target_changed_during_read", "target_invalid_identity",
-            "self_edge", "invalid_prerequisite",
-        } else STEP_ONE, None if reason == "invalid_prerequisite" else "release")
-        edge.update(observed_state=None, observed_evidence_ref=None,
-                    resolved_state="unknown", reason=reason)
-    else:
-        edge = _completion_edge(
-            None if reason in {
-                "missing_target", "duplicate_target", "identity_coverage_incomplete",
-                "target_unreadable", "target_changed_during_read", "target_invalid_identity",
-                "self_edge", "invalid_prerequisite",
-            } else STEP_ONE,
-            observed_stage=None if reason not in {"completion_satisfied", "completion_unsatisfied"} else "Queue",
-            resolved_state="unknown" if reason not in {"completion_satisfied", "completion_unsatisfied"} else (
-                "satisfied" if reason == "completion_satisfied" else "unsatisfied"
-            ),
-            reason=reason,
-        )
-    gate["relationship"]["prerequisites"] = [edge]
-    gate["relationship"]["direct_prerequisite_state"] = edge["resolved_state"]
-    _reseal(value)
-    return value
-
-
-def test_browser_admits_every_python_valid_typed_edge_reason(open_page):
-    reasons = [("claim", reason) for reason in CLAIM_EDGE_REASONS] + [
-        ("completion", reason) for reason in COMPLETION_EDGE_REASONS
+    # The self row's target is the card itself: reading the served reason keeps
+    # it plain text, while the resolved row beside it is a link.
+    page.locator('.card[data-package-path="Alpha/Queue/self"]').click()
+    assert panel_needs(page) == [
+        {"title": "Provider", "linked": True, "project": "", "reason": "merge state unknown"},
+        {"title": "unresolved target", "linked": False, "project": "", "reason": ""},
     ]
-    values = []
-    for kind, reason in reasons:
-        value = admitted_reason_payload(kind, reason)
-        gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
-        gate["declared"]["title"] = f"Gate {kind} {reason}"
-        _reseal(value)
-        assert parse_catalog(value).entries, f"{kind} {reason}"
-        values.append(value)
-    client = SequenceClient([board_payload()] + values)
-    page = open_page(client, fake_clock=True)
-    # Freeze the page timers so only the explicit polls fire.
-    # pause_at takes seconds, so one second ahead of the page's current time.
-    page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
-    assert client.calls == 1, "pausing the clock must not fire a poll"
-    gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
-    for kind, reason in reasons:
-        fire_poll(page)
-        playwright.expect(gate_title).to_have_text(f"Gate {kind} {reason}", timeout=5000)
-        assert page.locator("#board-issues").count() == 0, f"{kind} {reason}"
-    assert client.calls == len(reasons) + 1
+    assert page.locator(
+        '.panel-links .panel-needs-title a[href="#"]'
+    ).count() == 0
 
 
-def malformed_typed_edge_payload(case):
+def malformed_edge_payload(case):
+    """The valid board with one edge changed so only the browser can reject it."""
     value = json.loads(board_payload())
     edge = next(entry for entry in value["entries"] if entry["package_id"] == GATE)[
         "relationship"
     ]["prerequisites"][0]
-    if case == "missing-kind":
-        del edge["kind"]
-    elif case == "invalid-kind":
-        edge["kind"] = "unknown"
+    if case == "kind-key":
+        edge["kind"] = "completion"
+    elif case == "retired-reason":
+        edge["reason"] = "completion_satisfied"
     elif case == "extra-key":
         edge["extra"] = "unexpected"
-    elif case == "cross-kind":
-        edge.clear()
-        edge.update(_completion_edge(STEP_ONE, observed_stage=None,
-                                     resolved_state="unknown", reason="claim_unknown"))
-    elif case == "unsafe-stage":
-        edge.clear()
-        edge.update(_completion_edge(STEP_ONE, observed_stage="../unsafe",
-                                     resolved_state="unknown", reason="completion_policy_needed"))
-    elif case == "mismatched-reason":
-        edge["reason"] = "completion_satisfied"
     else:  # pragma: no cover - the parameter list owns the cases
         raise AssertionError(case)
     _reseal(value)
     return value
 
 
-@pytest.mark.parametrize("case", [
-    "missing-kind", "invalid-kind", "extra-key", "cross-kind", "unsafe-stage", "mismatched-reason",
-])
-def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page, case):
-    valid = json.loads(board_payload())
-    invalid = malformed_typed_edge_payload(case)
+def _titled_gate(value, title):
+    gate = next(entry for entry in value["entries"] if entry["package_id"] == GATE)
+    gate["declared"]["title"] = title
+    return _reseal(value)
+
+
+def test_browser_rejects_malformed_edges_and_retains_last_board(open_page):
+    cases = ("kind-key", "retired-reason", "extra-key")
+    payloads = [json.loads(board_payload())]
+    # A failed refresh, then one valid payload before each bad one: the valid
+    # poll is what clears the issue and shows which payload the board holds.
+    payloads.append(_titled_gate(malformed_edge_payload(cases[0]), "Seed gate"))
+    for index, case in enumerate(cases):
+        payloads.append(_titled_gate(json.loads(board_payload()), f"Valid gate {index}"))
+        payloads.append(_titled_gate(malformed_edge_payload(case), f"Bad gate {index}"))
+
     from nyx import server as server_module
 
     def passthrough_catalog(candidate):
@@ -1696,25 +1595,40 @@ def test_browser_rejects_malformed_typed_edges_and_retains_last_board(open_page,
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(server_module, "parse_catalog", passthrough_catalog)
-        client = BlockingRawSequenceClient([valid, invalid], blocked_call=2)
-        page = open_page(client)
-        page.evaluate("() => window.dispatchEvent(new Event('focus'))")
-        assert client.started.wait(timeout=5)
-        assert page.locator("#board .card").count() == 4
-        assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
-        client.release.set()
-        page.locator("#board").get_by_text("Latest refresh issue: producer_protocol_error", exact=True).wait_for(
-            timeout=15000
-        )
+        client = RawSequenceClient(payloads)
+        page = open_page(client, fake_clock=True)
+        page.clock.pause_at(page.evaluate("Date.now()") / 1000 + 1)
+        gate_title = page.locator(f'.card[data-package-id="{GATE}"] .card-title')
+        cards = page.locator("#board .card")
+        playwright.expect(gate_title).to_have_text("Gate step")
+        assert cards.count() == 4
 
-    assert page.locator("#board .card").count() == 4
-    assert page.locator('.card[data-package-id="%s"]' % GATE).count() == 1
+        return_check(page)
+        page.locator("#board").get_by_text(
+            "Latest refresh issue: producer_protocol_error", exact=True
+        ).wait_for(timeout=15000)
+        playwright.expect(gate_title).to_have_text("Gate step")
+        assert cards.count() == 4
+
+        for index, _case in enumerate(cases):
+            fire_poll(page)
+            playwright.expect(gate_title).to_have_text(f"Valid gate {index}")
+            playwright.expect(page.locator("#refresh-status")).to_have_text(
+                "Refresh issue resolved."
+            )
+            assert cards.count() == 4
+            fire_poll(page)
+            page.locator("#board").get_by_text(
+                "Latest refresh issue: producer_protocol_error", exact=True
+            ).wait_for(timeout=15000)
+            playwright.expect(gate_title).to_have_text(f"Valid gate {index}")
+            assert cards.count() == 4
 
 
 def test_root_switch_during_post_save_refresh_reloads_the_new_root_policy(open_page):
     client = BlockingSequenceClient(
-        [dependency_state_payload("unsatisfied"), dependency_state_payload("satisfied"),
-         dependency_state_payload("unknown")],
+        [dependency_state_payload(), dependency_state_payload(),
+         dependency_state_payload()],
         blocked_call=2,
     )
     settings = RootSwitchSettings()
@@ -1968,7 +1882,7 @@ def test_long_unbroken_names_wrap_within_their_column(open_page):
         ],
     }
     value["entries"] = [
-        _entry(STEP_ONE, f"Alpha/Queue/{token}", "queue", token, "Alpha", [_edge(STEP_TWO, "input")]),
+        _entry(STEP_ONE, f"Alpha/Queue/{token}", "queue", token, "Alpha", [_edge(STEP_TWO)]),
         _entry(STEP_TWO, "Beta/Queue/source", "queue", token, "Beta"),
         _entry(GATE, f"{token}/Queue/item", "queue", "Third project item", token),
     ]
@@ -2789,7 +2703,7 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
         "under_development",
         "Reverse dependent",
         "Beta",
-        prerequisites=[_edge(GATE, "reverse")],
+        prerequisites=[_edge(GATE)],
     ))
     first["entries"].sort(key=lambda entry: entry["package_path"])
     _reseal(first)
@@ -3351,58 +3265,35 @@ def test_catalog_diagnostics_are_visible_when_discovery_returns_no_packages(open
     assert page.locator("#board-issues img").count() == 0
 
 
-@pytest.mark.parametrize("participation,state,edge_states", [
-    ("available", "no_declared_prerequisites", []),
-    ("available", "satisfied", ["satisfied", "satisfied"]),
-    ("available", "unsatisfied", ["satisfied", "unsatisfied"]),
-    ("available", "unknown", ["satisfied", "unknown"]),
-    ("available", "unknown", []),
-    ("legacy", "relationship_unavailable", []),
-    ("invalid", "relationship_unavailable", []),
-    ("available", "satisfied", ["unknown"]),
-    ("available", "no_declared_prerequisites", ["unknown"]),
+@pytest.mark.parametrize("reasons", [
+    [],
+    ["resolved"],
+    ["resolved", "resolved"],
+    ["resolved", "unresolved"],
+    ["unresolved", "unresolved"],
 ])
-def test_card_color_follows_incoming_arrows_regardless_of_prerequisite_state(
-    open_page, participation, state, edge_states
-):
+def test_card_color_follows_incoming_arrows_regardless_of_edge_reasons(open_page, reasons):
     value = json.loads(board_payload())
     relationship = value["entries"][0]["relationship"]
-    edges = []
-    for index, edge_state in enumerate(edge_states):
-        edge = _edge(STEP_TWO, f"claim-{index}")
-        edge.update(
-            observed_state=edge_state, resolved_state=edge_state,
-            reason=f"claim_{edge_state}",
-        )
-        edges.append(edge)
-    relationship.update(
-        participation=participation, direct_prerequisite_state=state, prerequisites=edges
-    )
+    relationship.update(prerequisites=[_edge(STEP_TWO, reason) for reason in reasons])
     _reseal(value)
     page = open_page(StaticClient(value))
     card = page.locator(f'[data-package-id="{GATE}"]')
-    expected_color = DARK_CARD if edge_states else NO_INCOMING_CARD
+    # No scan is served, so any declared row is outstanding whatever its reason.
+    expected_color = DARK_CARD if reasons else NO_INCOMING_CARD
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == expected_color
     card.click()
     assert "selected" in card.get_attribute("class").split()
     assert card.evaluate("el => getComputedStyle(el).backgroundColor") == expected_color
 
 
-def test_refresh_changing_only_incoming_edge_state_keeps_card_color(open_page):
+def test_refresh_changing_only_an_incoming_edge_reason_keeps_card_color(open_page):
     first = json.loads(board_payload())
     relationship = first["entries"][1]["relationship"]
-    satisfied = _edge(STEP_TWO, "build")
-    satisfied.update(
-        observed_state="satisfied", resolved_state="satisfied", reason="claim_satisfied"
-    )
-    relationship.update(direct_prerequisite_state="satisfied", prerequisites=[satisfied])
+    relationship.update(prerequisites=[_edge(STEP_TWO)])
     _reseal(first)
     second = json.loads(json.dumps(first))
-    second_relationship = second["entries"][1]["relationship"]
-    second_relationship["direct_prerequisite_state"] = "unknown"
-    second_relationship["prerequisites"][0].update(
-        observed_state="unknown", resolved_state="unknown", reason="claim_unknown"
-    )
+    second["entries"][1]["relationship"]["prerequisites"][0]["reason"] = "unresolved"
     _reseal(second)
     page = open_page(SequenceClient([first, second]), fake_clock=True)
     card = page.locator(f'[data-package-id="{STEP_ONE}"]')
@@ -3444,8 +3335,8 @@ def test_incoming_arrow_colors_individual_cards_and_updates_with_filter(open_pag
 
 def test_same_project_needs_entries_name_their_card_and_escape_their_title(open_page):
     page = open_page(SequenceClient([
-        dependency_state_payload("unsatisfied"),
-        dependency_state_payload("unsatisfied", titles={"loose": "Retitled loose"}),
+        dependency_state_payload(),
+        dependency_state_payload(titles={"loose": "Retitled loose"}),
     ]))
     body = page.locator("#work-item-panel-body")
     dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
@@ -3489,7 +3380,7 @@ def test_same_project_needs_entries_name_their_card_and_escape_their_title(open_
         "aria-pressed") == "true"
 
     # A title is shown as text, never as markup.
-    escaped = open_page(StaticClient(dependency_state_payload("unsatisfied", titles={"step_one": XSS_TITLE})))
+    escaped = open_page(StaticClient(dependency_state_payload(titles={"step_one": XSS_TITLE})))
     escaped.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
     assert panel_needs(escaped) == [{
         "title": XSS_TITLE, "linked": True, "project": "",
@@ -3498,28 +3389,28 @@ def test_same_project_needs_entries_name_their_card_and_escape_their_title(open_
 
 
 @pytest.mark.parametrize("source_project", ["Alpha", "Beta"])
-def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_page, tmp_path, source_project):
+def test_relationship_text_keeps_one_entry_for_a_repeated_completion_row(open_page, tmp_path, source_project):
     _write_package(
         tmp_path, source_project, "Queue", "source", STEP_ONE,
-        f"# Foundation step\nPackage ID: {STEP_ONE}\n"
-        "Claim: release | unsatisfied\nClaim: second | unsatisfied\n",
+        f"# Foundation step\nPackage ID: {STEP_ONE}\n",
     )
     _write_package(
         tmp_path, "Alpha", "Queue", "dependent", STEP_TWO,
         f"# Dependent step\nPackage ID: {STEP_TWO}\n"
-        f"Prerequisite: {STEP_ONE} | INVALID\nPrerequisite: {STEP_ONE} | release\n"
-        f"Prerequisite: {STEP_ONE} | second\n",
+        f"Completion Prerequisite: {STEP_ONE}\n"
+        f"Completion Prerequisite: {STEP_ONE}\n",
     )
     value = json.loads(scan_catalog(tmp_path))
     dependent_entry = next(entry for entry in value["entries"] if entry["package_id"] == STEP_TWO)
-    assert [edge["reason"] for edge in dependent_entry["relationship"]["prerequisites"]] == [
-        "invalid_prerequisite", "claim_unsatisfied", "claim_unsatisfied",
+    assert dependent_entry["relationship"]["prerequisites"] == [
+        {"target_package_id": STEP_ONE, "reason": "resolved"},
+        {"target_package_id": STEP_ONE, "reason": "resolved"},
     ]
     page = open_page(ScanningClient(tmp_path))
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO)}
     dependent = page.locator(f'.card[data-package-id="{STEP_TWO}"]')
-    # The malformed declaration must not hide the valid relationship to the same
-    # item: the panel names it once, with the project only when they differ.
+    # Two rows naming the same target draw one arrow and one panel entry, with
+    # the project only when they differ.
     dependent.click()
     assert panel_needs(page) == [{
         "title": "Foundation step", "linked": True,
@@ -3531,19 +3422,19 @@ def test_relationship_text_keeps_valid_target_after_malformed_prerequisite(open_
 def test_shared_identity_cards_keep_valid_relationship_text(open_page, tmp_path, provider_project):
     _write_package(
         tmp_path, provider_project, "Queue", "provider", STEP_ONE,
-        f"# Provider\nPackage ID: {STEP_ONE}\nClaim: release | unsatisfied\n",
+        f"# Provider\nPackage ID: {STEP_ONE}\n",
     )
     for name, title in (("first", "First twin"), ("second", "Second twin")):
         _write_package(
             tmp_path, "Alpha", "Queue", name, STEP_TWO,
-            f"# {title}\nPackage ID: {STEP_TWO}\nPrerequisite: {STEP_ONE} | release\n",
+            f"# {title}\nPackage ID: {STEP_TWO}\nCompletion Prerequisite: {STEP_ONE}\n",
         )
     value = json.loads(scan_catalog(tmp_path))
     twins = [entry for entry in value["entries"] if entry["package_id"] == STEP_TWO]
     assert len(twins) == 2
     for entry in twins:
-        assert [(edge["target_package_id"], edge["reason"]) for edge in entry["relationship"]["prerequisites"]] == [
-            (STEP_ONE, "claim_unsatisfied"),
+        assert entry["relationship"]["prerequisites"] == [
+            {"target_package_id": STEP_ONE, "reason": "resolved"},
         ]
     page = open_page(ScanningClient(tmp_path))
     assert connection_pairs(page) == set()
@@ -3585,7 +3476,7 @@ def test_shared_identity_cards_keep_valid_relationship_text(open_page, tmp_path,
 
 
 def test_no_incoming_text_matches_the_color_and_ignores_search(open_page):
-    page = open_page(StaticClient(dependency_state_payload("unsatisfied")))
+    page = open_page(StaticClient(dependency_state_payload()))
 
     def assert_text_matches_color():
         for card in page.locator(".card").all():
@@ -3903,15 +3794,14 @@ def routing_payload():
     unknown = "123e4567-e89b-42d3-a456-426614174005"
     value["entries"].extend([
         _entry(far, "Gamma/Done/far", "done", "Far prerequisite", "Gamma",
-               prerequisites=[_edge(STEP_ONE, "forward")]),
+               prerequisites=[_edge(STEP_ONE)]),
         _entry(unknown, "Other/Queue/unknown", "queue", "Unknown project", "Other",
-               prerequisites=[_edge(far, "input")]),
+               prerequisites=[_edge(far)]),
     ])
     _admit_inventory_stage(value, "Gamma", "Done")
     _admit_inventory_stage(value, "Other", "Queue")
     # Reverse cross-project edge and a cycle; neither implies a topological order.
-    value["entries"][1]["relationship"]["prerequisites"] = [_edge(far, "reverse")]
-    value["entries"][1]["relationship"]["direct_prerequisite_state"] = "unsatisfied"
+    value["entries"][1]["relationship"]["prerequisites"] = [_edge(far)]
     value["entries"].sort(key=lambda entry: entry["package_path"])
     _reseal(value)
     return value, far, unknown
@@ -3952,7 +3842,7 @@ def test_chained_rails_reuse_two_lanes(open_page):
     value["entries"] = [
         _entry(package_id, f"Alpha/Queue/item-{index:02d}", "queue",
                f"{'Keep' if index < 13 else 'Other'} item {index:02d}", "Alpha",
-               [_edge(ids[index - 1], "input")] if index else [])
+               [_edge(ids[index - 1])] if index else [])
         for index, package_id in enumerate(ids)
     ]
     _reseal(value)
@@ -3974,7 +3864,7 @@ def test_rail_lanes_are_capped_and_overflow_is_drawn_for_the_selected_card(open_
     ids = [f"123e4567-e89b-42d3-a456-{index:012d}" for index in range(100, 113)]
     value = json.loads(board_payload())
     value["entries"] = [_entry(ids[0], "Alpha/Queue/00-hub", "queue", "Hub", "Alpha")] + [
-        _entry(ids[index], f"Alpha/Queue/{index:02d}-dependent", "queue", f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
+        _entry(ids[index], f"Alpha/Queue/{index:02d}-dependent", "queue", f"Dependent {index:02d}", "Alpha", [_edge(ids[0])])
         for index in range(1, 13)
     ]
     # A served scan can only match a catalog whose configuration it was taken under.
@@ -4068,8 +3958,8 @@ def test_rail_lanes_are_capped_and_overflow_is_drawn_for_the_selected_card(open_
 def test_upward_edge_rails_use_separate_lanes(open_page):
     value = json.loads(board_payload())
     value["entries"] = [
-        _entry(STEP_ONE, "Alpha/Queue/q1", "queue", "Q1", "Alpha", [_edge(GATE, "input")]),
-        _entry(STEP_TWO, "Alpha/Queue/q2", "queue", "Q2", "Alpha", [_edge(STEP_ONE, "input")]),
+        _entry(STEP_ONE, "Alpha/Queue/q1", "queue", "Q1", "Alpha", [_edge(GATE)]),
+        _entry(STEP_TWO, "Alpha/Queue/q2", "queue", "Q2", "Alpha", [_edge(STEP_ONE)]),
         _entry(GATE, "Alpha/Under_Development/u", "under_development", "U", "Alpha"),
     ]
     _reseal(value)
@@ -4085,8 +3975,8 @@ def test_cross_row_rail_uses_the_source_row_band_slot(open_page):
     value = json.loads(board_payload())
     value["entries"] = [
         _entry(STEP_ONE, "Alpha/Queue/a1", "queue", "A1", "Alpha"),
-        _entry(STEP_TWO, "Alpha/Queue/a2", "queue", "A2", "Alpha", [_edge(STEP_ONE, "input")]),
-        _entry(GATE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(LOOSE, "input")]),
+        _entry(STEP_TWO, "Alpha/Queue/a2", "queue", "A2", "Alpha", [_edge(STEP_ONE)]),
+        _entry(GATE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(LOOSE)]),
         _entry(LOOSE, "Beta/Queue/s", "queue", "S", "Beta"),
     ]
     _admit_inventory_stage(value, "Beta", "Queue")
@@ -4107,10 +3997,10 @@ def test_cross_project_rail_needs_a_lane_in_both_columns(open_page):
     value = json.loads(board_payload())
     value["entries"] = [_entry(ids[0], "Alpha/Queue/hub", "queue", "Hub", "Alpha")] + [
         _entry(ids[index], f"Alpha/Under_Development/{index:02d}-dependent", "under_development",
-               f"Dependent {index:02d}", "Alpha", [_edge(ids[0], "input")])
+               f"Dependent {index:02d}", "Alpha", [_edge(ids[0])])
         for index in range(1, 9)
     ] + [
-        _entry(STEP_ONE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(STEP_TWO, "input")]),
+        _entry(STEP_ONE, "Alpha/Under_Development/x", "under_development", "X", "Alpha", [_edge(STEP_TWO)]),
         _entry(STEP_TWO, "Beta/Under_Development/s", "under_development", "S", "Beta"),
     ]
     _reseal(value)
@@ -4168,21 +4058,21 @@ def test_cross_project_routes_avoid_cards_in_both_directions_after_resize_and_fi
     assert_rail_lanes_do_not_overlap(page)
 
 
-@pytest.mark.parametrize("reason,duplicate_record", [
-    ("missing_target", False), ("duplicate_target", True), ("duplicate_target", False),
+@pytest.mark.parametrize("target,duplicate_record", [
+    ("absent", False), ("present", False), ("present", True),
 ])
 def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
-    open_page, reason, duplicate_record
+    open_page, target, duplicate_record
 ):
     value = json.loads(board_payload())
     edge = value["entries"][3]["relationship"]["prerequisites"][0]
-    edge.update(resolved_state="unknown", reason=reason)
+    edge["reason"] = "unresolved"
     if duplicate_record:
         value["entries"].append(_entry(
             STEP_ONE, "Gamma/Queue/duplicate", "queue", "Duplicate source", "Gamma"
         ))
         _admit_inventory_stage(value, "Gamma", "Queue")
-    elif reason == "missing_target":
+    elif target == "absent":
         edge["target_package_id"] = "123e4567-e89b-42d3-a456-426614174009"
     value["entries"].sort(key=lambda entry: entry["package_path"])
     _reseal(value)
@@ -4198,14 +4088,14 @@ def test_unresolved_targets_are_not_connected_to_arbitrary_cards(
         "title": "unresolved target", "linked": False, "project": "", "reason": ""}]
 
 
-def test_multiple_claims_share_one_arrow_and_one_cross_project_name(open_page):
+def test_repeated_rows_share_one_arrow_and_one_cross_project_name(open_page):
     value = json.loads(board_payload())
-    value["entries"][3]["relationship"]["prerequisites"].append(_edge(STEP_ONE, "testing"))
+    value["entries"][3]["relationship"]["prerequisites"].append(_edge(STEP_ONE))
     _reseal(value)
     page = open_page(StaticClient(value))
     assert connection_pairs(page) == {(STEP_ONE, STEP_TWO), (STEP_TWO, GATE), (STEP_ONE, LOOSE)}
     assert page.locator(".rail").count() == 3
-    # Two claims on one prerequisite name it once, with one cross-project name.
+    # Two rows on one prerequisite name it once, with one cross-project name.
     page.locator(f'.card[data-package-id="{LOOSE}"]').click()
     assert panel_needs(page) == [{
         "title": "Foundation step", "linked": True, "project": "Alpha",
@@ -4216,7 +4106,7 @@ def test_multiple_claims_share_one_arrow_and_one_cross_project_name(open_page):
 def test_refresh_rebuilds_connections_and_keeps_selection_emphasis(open_page):
     first = json.loads(board_payload())
     second = json.loads(board_payload())
-    second["entries"][3]["relationship"]["prerequisites"] = [_edge(STEP_TWO, "shared")]
+    second["entries"][3]["relationship"]["prerequisites"] = [_edge(STEP_TWO)]
     _reseal(second)
     page = open_page(SequenceClient([first, second]))
     page.locator(f'.card[data-package-id="{STEP_TWO}"]').click()
@@ -4532,13 +4422,13 @@ def test_cycle_preserves_order_of_upstream_and_downstream_packages(open_page):
     value["entries"] = [
         _entry(upstream, "Alpha/Queue/root", "queue", "Z upstream", "Alpha"),
         _entry(STEP_ONE, "Alpha/Queue/a", "queue", "Y cycle A", "Alpha",
-               [_edge(STEP_TWO, "cycle"), _edge(upstream, "input")]),
+               [_edge(STEP_TWO), _edge(upstream)]),
         _entry(STEP_TWO, "Alpha/Queue/b", "queue", "X cycle B", "Alpha",
-               [_edge(STEP_ONE, "cycle")]),
+               [_edge(STEP_ONE)]),
         _entry(GATE, "Alpha/Queue/c", "queue", "B prerequisite C", "Alpha",
-               [_edge(STEP_TWO, "input")]),
+               [_edge(STEP_TWO)]),
         _entry(LOOSE, "Alpha/Queue/d", "queue", "A dependent D", "Alpha",
-               [_edge(GATE, "input")]),
+               [_edge(GATE)]),
     ]
     value["entries"].sort(key=lambda entry: entry["package_path"])
     _reseal(value)
@@ -4554,15 +4444,9 @@ def test_cycle_preserves_order_of_upstream_and_downstream_packages(open_page):
     assert_rail_lanes_do_not_overlap(page)
 
 
-@pytest.mark.parametrize("reason", [
-    "missing_target", "duplicate_target", "identity_coverage_incomplete",
-    "target_unreadable", "target_changed_during_read", "target_invalid_identity",
-    "invalid_prerequisite", "self_edge",
-])
-def test_unresolved_relationship_does_not_change_card_order(open_page, reason):
+def test_unresolved_relationship_does_not_change_card_order(open_page):
     value = json.loads(board_payload())
-    edge = _edge(STEP_ONE, "input")
-    edge.update(reason=reason, resolved_state="unknown")
+    edge = _edge(STEP_ONE, "unresolved")
     value["entries"] = [
         _entry(STEP_ONE, "Alpha/Queue/a", "queue", "Z candidate", "Alpha"),
         _entry(STEP_TWO, "Alpha/Queue/b", "queue", "A unresolved", "Alpha", [edge]),
@@ -4581,7 +4465,7 @@ def test_identity_collision_in_another_project_does_not_change_card_order(
     value["entries"] = [
         _entry(STEP_ONE, "Alpha/Queue/a", "queue", "Z candidate", "Alpha"),
         _entry(STEP_TWO, "Alpha/Queue/b", "queue", "A dependent", "Alpha",
-               [_edge(STEP_ONE, "input")]),
+               [_edge(STEP_ONE)]),
         _entry(duplicate_id, "Beta/Queue/c", "queue", "Duplicate", "Beta"),
     ]
     _admit_inventory_stage(value, "Beta", "Queue")
@@ -5084,12 +4968,14 @@ def test_digest_consistent_reversed_unicode_sequences_keep_last_valid_board(open
         lambda value: value.update(terminal_stages=["Done", "Done"]),
         lambda value: value.pop("terminal_stages"),
         lambda value: value.update(schema_version=7),
+        lambda value: value.update(schema_version=8),
         lambda value: value.update(visibility={}),
     ],
     ids=[
         "equal-terminal-stages",
         "missing-terminal-stages",
         "older-schema",
+        "schema-8",
         "top-level-extra-key",
     ],
 )
@@ -5249,14 +5135,15 @@ def test_real_screened_reported_and_declared_text_is_browser_safe(open_page, tmp
 @pytest.mark.parametrize("duplicate", [False, True], ids=["missing", "duplicate"])
 def test_real_unresolved_targets_do_not_draw_connections(open_page, tmp_path, duplicate):
     _write_package(tmp_path, "Alpha", "Queue", "source", STEP_ONE,
-                   f"# Source\nPackage ID: {STEP_ONE}\nPrerequisite: {STEP_TWO} | release\nClaim: local | maybe\n")
+                   f"# Source\nPackage ID: {STEP_ONE}\n"
+                   f"Completion Prerequisite: {STEP_TWO}\n")
     if duplicate:
         for name in ("target-a", "target-b"):
             _write_package(tmp_path, "Alpha", "Queue", name, STEP_TWO,
-                           f"# Target\nPackage ID: {STEP_TWO}\nClaim: release | satisfied | sha256:{'a' * 64}\n")
+                           f"# Target\nPackage ID: {STEP_TWO}\n")
     value = json.loads(scan_catalog(tmp_path))
     edge = value["entries"][0]["relationship"]["prerequisites"][0]
-    assert edge["reason"] == ("duplicate_target" if duplicate else "missing_target")
+    assert edge["reason"] == "unresolved"
     page = open_page(ScanningClient(tmp_path))
     card = page.locator(f'.card[data-package-id="{STEP_ONE}"]')
     card.click()
@@ -6733,74 +6620,59 @@ READINESS_SETTLED_PAIRS = {
 }
 
 
-def _readiness_edge(target_id, reason, *, resolved_state="unsatisfied", claim_name="input"):
-    """One claim edge with the reason the catalog reports for that outcome."""
-    edge = _edge(target_id, claim_name)
-    edge.update(
-        reason=reason,
-        resolved_state=resolved_state,
-        observed_state="satisfied" if resolved_state == "satisfied" else resolved_state,
-    )
-    return edge
-
-
 def readiness_payload():
     """One column whose every declared prerequisite states its own merge outcome.
 
-    The prerequisites cover a merged target reached by a plain and by a
-    satisfied claim and by a completion edge, a ``not_merged`` and an ``unknown``
-    target, one edge whose reason is no claim outcome, a target in a hidden
-    finished row, a target the scan does not list, an absent UUID and two cards
-    sharing a Package ID.
+    The prerequisites cover a merged target, a ``not_merged`` and an ``unknown``
+    target, a target the scan does not list, a target in a hidden finished row,
+    an unresolved target, an entry with no scan facts and two cards sharing a
+    Package ID.
     """
     entries = [
         _entry(READINESS_MERGED_ID, "Alpha/Queue/merged-provider", "queue",
                "Merged provider", "Alpha"),
         _entry(READINESS_MERGED_DEPENDENT_ID, "Alpha/Queue/merged-dependent", "queue",
                "Merged dependent", "Alpha",
-               [_readiness_edge(READINESS_MERGED_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_MERGED_ID)]),
         _entry(READINESS_SATISFIED_DEPENDENT_ID, "Alpha/Queue/satisfied-dependent", "queue",
                "Satisfied dependent", "Alpha",
-               [_readiness_edge(READINESS_MERGED_ID, "claim_satisfied",
-                                resolved_state="satisfied")]),
+               [_edge(READINESS_MERGED_ID)]),
         _entry(READINESS_UNMERGED_ID, "Alpha/Queue/zebra-provider", "queue",
                "Zebra provider", "Alpha"),
         _entry(READINESS_UNMERGED_DEPENDENT_ID, "Alpha/Queue/zebra-dependent", "queue",
                "Aardvark zebra dependent", "Alpha",
-               [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_UNMERGED_ID)]),
         _entry(READINESS_OPEN_DEPENDENT_ID, "Alpha/Queue/open-dependent", "queue",
                "Badger open dependent", "Alpha",
-               [_readiness_edge(READINESS_UNMERGED_ID, "missing_claim")]),
+               [_edge(READINESS_UNMERGED_ID)]),
         _entry(READINESS_UNKNOWN_ID, "Alpha/Queue/unknown-provider", "queue",
                "Unknown provider", "Alpha"),
         _entry(READINESS_UNKNOWN_DEPENDENT_ID, "Alpha/Queue/unknown-dependent", "queue",
                "Unknown dependent", "Alpha",
-               [_readiness_edge(READINESS_UNKNOWN_ID, "claim_unknown",
-                                resolved_state="unknown")]),
+               [_edge(READINESS_UNKNOWN_ID)]),
         _entry(READINESS_UNLISTED_ID, "Alpha/Queue/unlisted-provider", "queue",
                "Unlisted provider", "Alpha"),
         _entry(READINESS_UNLISTED_DEPENDENT_ID, "Alpha/Queue/unlisted-dependent", "queue",
                "Unlisted dependent", "Alpha",
-               [_readiness_edge(READINESS_UNLISTED_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_UNLISTED_ID)]),
         _entry(READINESS_MISSING_DEPENDENT_ID, "Alpha/Queue/missing-dependent", "queue",
                "Missing dependent", "Alpha",
-               [_readiness_edge(READINESS_ABSENT_ID, "missing_target",
-                                resolved_state="unknown")]),
+               [_edge(READINESS_ABSENT_ID, "unresolved")]),
         _entry(READINESS_ENTRYLESS_DEPENDENT_ID, "Alpha/Queue/entryless-dependent", "queue",
                "Entryless dependent", "Alpha",
-               [_readiness_edge(READINESS_MERGED_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_MERGED_ID)]),
         _entry(READINESS_COMPLETION_DEPENDENT_ID, "Alpha/Queue/completion-dependent",
                "queue", "Completion dependent", "Alpha",
-               [_completion_edge(READINESS_MERGED_ID)]),
+               [_edge(READINESS_MERGED_ID)]),
         _entry(READINESS_TWIN_ID, "Alpha/Queue/twin-one", "queue", "Twin one", "Alpha",
-               [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_UNMERGED_ID)]),
         _entry(READINESS_TWIN_ID, "Alpha/Queue/twin-two", "queue", "Twin two", "Alpha",
-               [_readiness_edge(READINESS_UNMERGED_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_UNMERGED_ID)]),
         _entry(READINESS_HIDDEN_ID, "Alpha/Done/hidden-provider", "done",
                "Hidden provider", "Alpha"),
         _entry(READINESS_HIDDEN_DEPENDENT_ID, "Alpha/Queue/hidden-dependent", "queue",
                "Hidden dependent", "Alpha",
-               [_readiness_edge(READINESS_HIDDEN_ID, "claim_unsatisfied")]),
+               [_edge(READINESS_HIDDEN_ID)]),
     ]
     entries.sort(key=lambda entry: entry["package_path"])
     value = json.loads(board_payload())
@@ -7302,7 +7174,7 @@ def test_change_marks_follow_poll_installs_only(open_page):
         _entry(status_id, "Alpha/Under_Development/status-card", "under_development",
                "Status card", "Alpha"),
         _entry(relation_id, "Alpha/Under_Development/relation-card", "under_development",
-               "Relation card", "Alpha", prerequisites=[_edge(STEP_ONE, "build")]),
+               "Relation card", "Alpha", prerequisites=[_edge(STEP_ONE)]),
         _entry(quiet_id, "Alpha/Under_Development/quiet-card", "under_development",
                "Quiet card", "Alpha"),
     ])
@@ -7328,8 +7200,8 @@ def test_change_marks_follow_poll_installs_only(open_page):
         entry["package_path"] = "Alpha/Under_Development/loose"
         entry["project"] = "Alpha"
 
-    def rename_claim(entry):
-        entry["relationship"]["prerequisites"][0]["claim_name"] = "build-again"
+    def change_relation(entry):
+        entry["relationship"]["prerequisites"][0]["reason"] = "unresolved"
 
     changed = base
     changed = edit(changed, STEP_TWO, move_stage)
@@ -7337,7 +7209,7 @@ def test_change_marks_follow_poll_installs_only(open_page):
     changed = edit(changed, GATE, retitle("Gate renamed"))
     changed = edit(changed, status_id, lambda entry: entry["declared"].__setitem__(
         "status", "blocked"))
-    changed = edit(changed, relation_id, rename_claim)
+    changed = edit(changed, relation_id, change_relation)
     changed["entries"].append(_entry(
         added_id, "Alpha/Queue/added", "queue", "Added card", "Alpha"))
     changed["entries"].sort(key=lambda entry: entry["package_path"])

@@ -432,7 +432,10 @@ def test_worker_scan_uses_one_saved_policy_and_exact_configuration_revision() ->
             item for item in payload["entries"] if item["package_id"] == "11111111-1111-4111-8111-111111111111"
         )
         assert source_entry["reported_fields"] == [{"name": "Owner Note", "value": "worker text"}]
-        assert source_entry["relationship"]["prerequisites"][0]["reason"] == "completion_satisfied"
+        assert source_entry["relationship"]["prerequisites"] == [{
+            "target_package_id": "22222222-2222-4222-8222-222222222222",
+            "reason": "resolved",
+        }]
 
 
 def test_worker_reports_oversized_catalog_with_size_status() -> None:

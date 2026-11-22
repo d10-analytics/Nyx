@@ -94,7 +94,8 @@ def test_setup_accepts_empty_root_and_defers_malformed_children_to_catalog():
             result = state.setup(spec_root)
             assert result.specification_root == spec_root.resolve()
             catalog = json.loads(scan_catalog(result.specification_root))
-            assert catalog["entries"][0]["relationship"]["participation"] == "legacy"
+            assert catalog["entries"][0]["package_id"] is None
+            assert set(catalog["entries"][0]["relationship"]) == {"prerequisites", "program"}
             assert catalog["identity_coverage"] == {"state": "complete", "diagnostics": []}
 
 
