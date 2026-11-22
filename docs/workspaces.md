@@ -54,19 +54,19 @@ The event plan can use the same metadata fields as a software specification:
 Package ID: 123e4567-e89b-42d3-a456-426614174100
 Status: planning
 Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102
-Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
-Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
 
 ## Purpose
 
 Coordinate volunteers, food, music, and a safe public event.
 ```
 
-The completion row is the event plan's whole-item requirement: it becomes
-satisfied only when this workspace explicitly marks the literal `Done` stage as
-finished. The two `Prerequisite` rows remain separate named outcomes with their
-own recorded claim and evidence state, so the event can show both a completed
-permit item and the individual outcomes it provides.
+The completion row is the event plan's whole-item requirement. It names the whole
+permit work item rather than a part of it, and that item sits in the `Done` stage
+folder. A prerequisite is outstanding until the board reads its target as served
+merged on `main`. This fictional workspace names no repository, so the event
+plan's prerequisite stays outstanding. Marking `Done` as finished makes the
+permit a finished row that **Hide terminal rows** hides, and it changes no
+prerequisite.
 
 The complete disposable fixture used by the checked-in captures adds these
 fictional files:
@@ -75,8 +75,6 @@ fictional files:
 # Confirm the community festival permit
 Package ID: 123e4567-e89b-42d3-a456-426614174102
 Status: ready
-Claim: venue-confirmed | satisfied | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-Claim: permit-approved | satisfied | sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 ```
 
 ```markdown
@@ -104,9 +102,9 @@ Before each capture, verify the live catalog is complete and has no workspace di
 and the browser has no workspace or refresh issues panel. The expanded view
 reveals the empty `Planning` row and `Community_Resources` column.
 The interface calls each
-specification a **work item** and displays its directory stage as a board row;
-the original `Package ID`, `Claim`, and `Prerequisite` spellings remain the
-file contract. Use fresh UUIDs in a real workspace.
+specification a **work item** and displays its directory stage as a board row.
+The `Package ID` and `Completion Prerequisite` spellings remain the file
+contract. Use fresh UUIDs in a real workspace.
 
 ## Create your first specification
 
@@ -126,12 +124,12 @@ Nyx reads only that `spec.md`; other files and folders inside the work item
 directory are ignored.
 
 Every UUID field (`Package ID`, `Program ID`, `Program Membership`,
-`Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a
+`Completion Prerequisite`, and `Superseded By`) takes a
 lowercase version 4 UUID only; an uppercase or otherwise invalid value is not
 accepted. An invalid `Package ID` makes the item lose its identity, so
 dependents that name it show **unresolved target** and **Workspace issues**
-lists nothing. An invalid `Prerequisite` or `Completion Prerequisite` shows
-**unresolved target**. An invalid `Program Membership` or `Superseded By` leaves
+lists nothing. An invalid `Completion Prerequisite` shows **unresolved target**.
+An invalid `Program Membership` or `Superseded By` leaves
 the item's identity intact and leaves only that relationship unresolved. An
 invalid `Program ID` invalidates its program descriptor without affecting any
 item's identity.
@@ -213,30 +211,29 @@ You do not need to create every stage in advance. Direct files such as a tracked
 After moving files, the board shows the change at its next check, within ten
 seconds.
 
-### Define whole-item completion
+### Mark finished work items
 
-Completion is an explicit, literal policy for this workspace. Open the collapsed
-**Board settings** panel, select **Counts as finished** beside each stage whose
-literal name should count, and choose **Save**. There is no implicit `Done` or
-`Archive` rule: row order, visual position, cancellation, and
-the spelling of a stage never infer completion. A cancelled or archived item
-therefore remains outside the completion policy unless you deliberately select
-that exact literal stage name.
+Finished work is an explicit, literal setting for this workspace. Open the
+collapsed **Board settings** panel, select **Counts as finished** beside each
+stage whose literal name should count, and choose **Save**. There is no implicit
+`Done` or `Archive` rule: row order, visual position, and cancellation never infer
+a finished row. A cancelled or archived item therefore counts as finished only
+when you deliberately select that exact literal stage name.
 
-Declare the requirement in the dependent `spec.md` with exactly one whole-item
-header:
+The setting decides finished rows, **Hide terminal rows** and the Code Status that
+`nyx checkouts` reports, and it decides no prerequisite. A prerequisite names one
+whole work item, and `Completion Prerequisite: UUID` is the one prerequisite row
+that declares it.
+
+Declare a prerequisite in the dependent `spec.md` with exactly one header:
 
 ```text
 Completion Prerequisite: 55555555-5555-4555-8555-555555555555
 ```
 
-When the target moves into a selected stage, this whole-item requirement becomes
-satisfied; moving it out reopens the requirement. The policy is set in **Board
-settings**; a missing policy leaves the requirement **unknown**, with no prompt
-or explanation. Hiding a
-finished row does not change its dependency results. This assertion records
-workflow completion; it does not verify evidence, approve work, or satisfy a
-named outcome.
+A prerequisite is outstanding until the board reads its target as served merged
+on `main`. Hiding that target's finished row changes no prerequisite. The row
+records a workflow dependency, and it does not verify evidence or approve work.
 
 The same selection also decides which packages `nyx checkouts` treats as
 finished when it reads a package's Code Status (see
@@ -252,8 +249,8 @@ rows** to reveal finished rows; this is the only control that hides populated
 stage rows.
 
 The selected stage names are saved per canonical workspace root and shared by
-all projects in that root. Switching roots keeps each root's own policy, and a
-root with no saved names reports unknown for its simple completion dependencies.
+all projects in that root. Switching roots keeps each root's own setting, and a
+root with no saved names makes no row finished.
 Names that are temporarily absent remain retained in the Board
 settings panel so they can be used again when available. **Cancel** leaves the
 saved policy unchanged; **Reset** removes the current root's completion policy.
@@ -367,25 +364,24 @@ requires that reload, which replaces the stale unsaved draft with the current
 saved order. For other Save failures: If Save fails, the board keeps displaying
 the prior saved order and retains the unsaved editor draft so you can retry.
 Changing row order never renames or moves a project, stage, or work item
-directory, and never changes completion, approval, claims, prerequisites,
+directory, and never changes completion, approval, prerequisites,
 dependencies, or execution behavior.
 
-Completion and named outcomes are separate relationships. Use the exact
-`Completion Prerequisite: UUID` header for a whole-item requirement. Keep
-`Prerequisite: UUID | claim-name` for an individual claim; it still depends on
-that claim's recorded state and evidence even when the provider is in a selected
-completed stage. A mixed dependent item may declare both forms.
+A prerequisite names one whole work item. Use the exact header
+`Completion Prerequisite: UUID` to declare it, and repeat the row for each
+further work item the dependent needs. Selecting a stage as finished never
+changes it.
 
 ## Add another project or a dependency
 
 Create another project directory alongside `Trail_Web` for work in a separate
 repository or product area. Nyx shows each project as a column.
 
-When one specification needs an outcome from another, record that outcome as a
-**claim** on the providing specification and a **prerequisite** on the dependent
-specification. The [sample walkthrough](../examples/sample-specifications/README.md)
-shows a web feature waiting for an API implementation while design work can
-already proceed from the API contract.
+When one specification needs another whole work item, declare it on the dependent
+specification with a `Completion Prerequisite` row. The
+[sample walkthrough](../examples/sample-specifications/README.md) shows a web
+feature waiting for the API implementation while separate design work waits for
+the API contract.
 
 Dependencies and program membership are optional. Start with titles, stable IDs,
 and stages, then use the [specification reference](specification-reference.md)
