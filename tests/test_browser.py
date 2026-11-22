@@ -11937,12 +11937,14 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     assert page.evaluate("document.activeElement.id") == "checkout-folders-path"
     # The checkbox takes Space, and Cancel takes Enter, then focus stays in the panel.
     tab_until(page, "document.activeElement.id === 'checkout-folders-github'")
+    # With no saved settings the box starts at the default, on, so Space clears it
+    # and Cancel returns it to the default.
     page.keyboard.press("Space")
-    assert page.locator("#checkout-folders-github").is_checked()
+    assert not page.locator("#checkout-folders-github").is_checked()
     tab_until(page, "document.activeElement.id === 'checkout-folders-save'")
     tab_until(page, "document.activeElement.id === 'checkout-folders-cancel'")
     page.keyboard.press("Enter")
-    assert not page.locator("#checkout-folders-github").is_checked()
+    assert page.locator("#checkout-folders-github").is_checked()
     assert page.evaluate(
         "document.activeElement.closest('#checkout-folders-editor') !== null")
     tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
