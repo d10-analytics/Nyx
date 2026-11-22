@@ -114,6 +114,7 @@ from .models import (
     worktree_sort_key,
 )
 from .state import (
+    DEFAULT_CHECKOUT_GITHUB_LOOKUP,
     ConfigurationObservation,
     StateError,
     _is_reparse_or_link,
@@ -4504,7 +4505,11 @@ def collection_inputs(observation: ConfigurationObservation) -> CollectionInputs
         return None
     configuration = observation.configuration
     if configuration is None:
-        return CollectionInputs(folders=(), github_lookup=False, package_scan=None)
+        return CollectionInputs(
+            folders=(),
+            github_lookup=DEFAULT_CHECKOUT_GITHUB_LOOKUP,
+            package_scan=None,
+        )
     return CollectionInputs(
         folders=configuration.checkout_folders,
         github_lookup=configuration.checkout_github_lookup,

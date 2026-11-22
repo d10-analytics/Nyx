@@ -36,6 +36,9 @@ CACHE_DIRECTORY = "cache"
 CHECKOUT_CACHE_FILENAME = "checkouts.json"
 CHECKOUT_CACHE_MAX_BYTES = 4 * 1024 * 1024
 CHECKOUT_CACHE_TEMPORARY_MAX_AGE = 600.0
+# The pull-request lookup setting of a workspace with no saved checkout
+# settings. A saved entry always carries its own explicit value.
+DEFAULT_CHECKOUT_GITHUB_LOOKUP = True
 _OMITTED = object()
 
 CONFIGURATION_UNAVAILABLE = "configuration_unavailable"
@@ -187,11 +190,13 @@ class Configuration:
 
     @property
     def checkout_github_lookup(self) -> bool:
-        """Return whether the active workspace turned pull-request lookup on."""
+        """Return whether the active workspace has pull-request lookup on.
+
+        A workspace with no saved checkout settings has the default."""
 
         assert self.checkout_settings is not None
         entry = self.checkout_settings.get(str(self.specification_root))
-        return False if entry is None else entry.github_lookup
+        return DEFAULT_CHECKOUT_GITHUB_LOOKUP if entry is None else entry.github_lookup
 
     @property
     def revision(self) -> str:
@@ -1331,6 +1336,7 @@ __all__ = [
     "CheckoutSettings",
     "CONFIGURATION_STATES",
     "CONFIGURATION_UNAVAILABLE",
+    "DEFAULT_CHECKOUT_GITHUB_LOOKUP",
     "AccountHomeError",
     "Configuration",
     "ConfigurationCommitVerificationError",
