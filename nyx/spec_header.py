@@ -4,8 +4,9 @@ Reads the header of a specification anchor: the bounded UTF-8 text before the
 first ``## `` item heading, the single-value metadata lines, and the
 package-owned relationship rows (``Package ID``, ``Program Membership``,
 ``Superseded By``, ``Prerequisite``, ``Completion Prerequisite`` and
-``Claim``).  Also holds the lexical rules of a git branch name.  Depends only
-on the standard library; every function is pure.
+``Claim``).  Also holds the lexical rules of a git branch name and the retired
+relationship labels the package validator rejects in a live package.  Depends
+only on the standard library; every function is pure.
 """
 from __future__ import annotations
 
@@ -32,6 +33,10 @@ _HEADER_LABELS = (
     "Package ID", "Program Membership", "Superseded By", "Prerequisite",
     "Completion Prerequisite", "Claim",
 )
+# Retired relationship labels: the first has a replacement row, the second is
+# deleted.  This tuple is their only definition, for the validator rule that
+# rejects them in a live package.
+RETIRED_HEADER_LABELS = ("Prerequisite", "Claim")
 _HEADER_FIELD = re.compile(
     r"^\s*\*{0,2}(" + "|".join(_HEADER_LABELS) + r")\*{0,2}\s*:\s?(.*)"
 )
