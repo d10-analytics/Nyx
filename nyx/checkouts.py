@@ -7,7 +7,7 @@ fetches, writes or locks anything. Local commands run with every transport
 denied. The one exception is the optional remote check: a single
 ``git ls-remote`` per distinct remote, the only call that lifts the transport
 denial (so git applies the user's own transport policy and credentials), and it
-transfers no objects. When the active workspace turns GitHub lookup on, the same
+transfers no objects. When the active workspace has GitHub lookup on, the same
 phase also makes one ``gh api graphql`` request per GitHub repository, asking for
 the pull requests of its local branch names and of the branch names packages
 declare for it; it runs the user's own ``gh`` with the user's credentials, is
