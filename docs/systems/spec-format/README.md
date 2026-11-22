@@ -8,7 +8,9 @@ README is narrative only.
 - Owns the reading of a specification anchor's header: the bounded header cut,
   the BOM-aware UTF-8 header text, the single-value metadata lines, and the
   package-owned relationship rows (`Package ID`, `Program Membership`,
-  `Superseded By`, `Prerequisite`, `Completion Prerequisite`, `Claim`).
+  `Superseded By`, `Completion Prerequisite`). The retired `Prerequisite` and
+  `Claim` labels are not header labels: a header line carrying one is read as
+  ordinary text and adds no relationship row.
 - Owns the lexical rules of a git branch name. Callers add their own bounds and
   normalisation before calling it.
 - Owns the parsing of specification text in `nyx/spec_body.py`: section bodies,
@@ -53,7 +55,7 @@ README is narrative only.
 - `spec_header.py` and `spec_body.py` import nothing from Nyx;
   `spec_validation.py` imports the other two and reads the metadata lines only
   through `metadata_value` and `metadata_values`.
-- The header byte limit, the header cut, the six header labels, the retired
+- The header byte limit, the header cut, the four header labels, the retired
   relationship labels and the metadata readers are defined only in
   `nyx/spec_header.py`; consumers import them and never define a second copy.
   `tests/test_spec_header.py` enforces this.

@@ -1,11 +1,12 @@
 """Typed validation for the producer's catalog and checkout protocols.
 
 The tracker consumes only the catalog fields it renders: package identity,
-lifecycle, declared values, diagnostics, program membership, and direct
-prerequisites. Every other producer field is accepted as part of the fixed shape
-and then discarded, so the wire contract stays strict without carrying unused
-concepts. The checkout document is validated in full, because every field it
-carries is either shown to a reader or re-derived from the others.
+lifecycle, declared values, diagnostics, program membership, and each
+prerequisite's target with the one reason that says whether it resolved. Every
+other producer field is accepted as part of the fixed shape and then discarded,
+so the wire contract stays strict without carrying unused concepts. The checkout
+document is validated in full, because every field it carries is either shown to
+a reader or re-derived from the others.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 LIFECYCLES = frozenset(
     {
@@ -70,108 +71,17 @@ _TOP_LEVEL_KEYS = frozenset(
 _ENTRY_KEYS = frozenset(
     {"package_id", "package_path", "project", "stage", "declared", "reported_fields", "relationship"}
 )
-_RELATIONSHIP_KEYS = frozenset(
-    {
-        "participation",
-        "claims",
-        "prerequisites",
-        "direct_prerequisite_state",
-        "program",
-        "superseded_by",
-    }
-)
-_EDGE_KEYS = frozenset(
-    {
-        "kind",
-        "target_package_id",
-        "claim_name",
-        "observed_state",
-        "observed_evidence_ref",
-        "resolved_state",
-        "reason",
-    }
-)
-_CLAIM_EDGE_KEYS = frozenset(
-    {
-        "kind",
-        "target_package_id",
-        "claim_name",
-        "observed_state",
-        "observed_evidence_ref",
-        "resolved_state",
-        "reason",
-    }
-)
-_COMPLETION_EDGE_KEYS = frozenset(
-    {
-        "kind",
-        "target_package_id",
-        "observed_stage",
-        "resolved_state",
-        "reason",
-    }
-)
+_RELATIONSHIP_KEYS = frozenset({"prerequisites", "program"})
+_EDGE_KEYS = frozenset({"target_package_id", "reason"})
 _PROGRAM_KEYS = frozenset({"program_id", "title", "resolution"})
 _COVERAGE_KEYS = frozenset({"state", "diagnostics"})
 _INVENTORY_KEYS = frozenset({"projects", "stages"})
 _INVENTORY_PROJECT_KEYS = frozenset({"name", "availability"})
 _INVENTORY_STAGE_KEYS = frozenset({"project", "stage", "availability"})
-_CLAIM_KEYS = frozenset({"name", "state", "evidence_ref"})
-_SUCCESSOR_KEYS = frozenset({"package_id", "resolution"})
 _CATALOG_PROGRAM_KEYS = frozenset({"program_id", "title", "member_package_ids"})
 _DIAGNOSTIC_KEYS = frozenset({"code", "message"})
 _COVERAGE_STATES = frozenset({"complete", "incomplete"})
-_OBSERVED_STATES = frozenset({"satisfied", "unsatisfied", "unknown"})
-_DIRECT_PREREQUISITE_STATES = _OBSERVED_STATES | {
-    "no_declared_prerequisites", "relationship_unavailable"
-}
-_EDGE_REASONS = frozenset(
-    {
-        "claim_satisfied",
-        "claim_unsatisfied",
-        "claim_unknown",
-        "missing_claim",
-        "invalid_claim",
-        "missing_target",
-        "duplicate_target",
-        "identity_coverage_incomplete",
-        "target_unreadable",
-        "target_changed_during_read",
-        "target_invalid_identity",
-        "self_edge",
-        "invalid_prerequisite",
-        "completion_satisfied",
-        "completion_unsatisfied",
-        "completion_policy_needed",
-        "completion_policy_invalid",
-    }
-)
-_CLAIM_EDGE_REASONS = _EDGE_REASONS - {
-    "completion_satisfied",
-    "completion_unsatisfied",
-    "completion_policy_needed",
-    "completion_policy_invalid",
-}
-_COMPLETION_EDGE_REASONS = frozenset(
-    {
-        "completion_satisfied",
-        "completion_unsatisfied",
-        "completion_policy_needed",
-        "completion_policy_invalid",
-        "missing_target",
-        "duplicate_target",
-        "identity_coverage_incomplete",
-        "target_unreadable",
-        "target_changed_during_read",
-        "target_invalid_identity",
-        "self_edge",
-        "invalid_prerequisite",
-    }
-)
-_CLAIM_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
-_PROVENANCE = re.compile(
-    r"(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})"
-)
+_EDGE_REASONS = frozenset({"resolved", "unresolved"})
 
 
 class ProtocolError(ValueError):
@@ -200,8 +110,6 @@ class CatalogEntry:
     package_id: str | None = None
     program_id: str | None = None
     program_title: str | None = None
-    prerequisites: tuple[dict[str, Any], ...] = ()
-    direct_prerequisite_state: str = "relationship_unavailable"
 
     @property
     def lifecycle(self) -> str:
@@ -381,22 +289,6 @@ def _uuid4(value: Any, name: str, *, nullable: bool = False) -> str | None:
     return value
 
 
-def _claim_name(value: Any, name: str, *, nullable: bool = False) -> str | None:
-    if value is None and nullable:
-        return None
-    if type(value) is not str or _CLAIM_NAME.fullmatch(value) is None:
-        raise ProtocolError(f"{name} must be a normalized claim name")
-    return value
-
-
-def _provenance(value: Any, name: str, *, nullable: bool = False) -> str | None:
-    if value is None and nullable:
-        return None
-    if type(value) is not str or _PROVENANCE.fullmatch(value) is None:
-        raise ProtocolError(f"{name} must be a valid provenance reference")
-    return value
-
-
 def _coverage(value: Any, name: str) -> None:
     item = _object(value, name)
     _keys(item, _COVERAGE_KEYS, name)
@@ -474,33 +366,6 @@ def _terminal_stages(value: Any) -> tuple[str, ...]:
     return terminal_stages
 
 
-def _claims(value: Any, name: str) -> None:
-    if type(value) is not list:
-        raise ProtocolError(f"{name} must be a list")
-    names: list[str] = []
-    for index, raw in enumerate(value):
-        item_name = f"{name}[{index}]"
-        item = _object(raw, item_name)
-        _keys(item, _CLAIM_KEYS, item_name)
-        claim_name = _claim_name(item["name"], f"{item_name}.name")
-        state = _string(item["state"], f"{item_name}.state")
-        if state not in _OBSERVED_STATES:
-            raise ProtocolError(f"{item_name}.state is invalid")
-        _provenance(item["evidence_ref"], f"{item_name}.evidence_ref", nullable=True)
-        names.append(claim_name)
-    if names != sorted(names) or len(names) != len(set(names)):
-        raise ProtocolError(f"{name} must be unique and name-sorted")
-
-
-def _successor(value: Any, name: str) -> None:
-    item = _object(value, name)
-    _keys(item, _SUCCESSOR_KEYS, name)
-    _uuid4(item["package_id"], f"{name}.package_id", nullable=True)
-    resolution = _string(item["resolution"], f"{name}.resolution")
-    if resolution not in {"not_declared", "resolved", "unknown"}:
-        raise ProtocolError(f"{name}.resolution is invalid")
-
-
 def _catalog_program(value: Any, name: str) -> str:
     item = _object(value, name)
     _keys(item, _CATALOG_PROGRAM_KEYS, name)
@@ -524,53 +389,14 @@ def _catalog_program(value: Any, name: str) -> str:
 
 def _edge(value: Any, name: str) -> dict[str, Any]:
     item = _object(value, name)
-    kind = _string(item.get("kind"), f"{name}.kind")
-    if kind == "claim":
-        _keys(item, _CLAIM_EDGE_KEYS, name)
-    elif kind == "completion":
-        _keys(item, _COMPLETION_EDGE_KEYS, name)
-    else:
-        raise ProtocolError(f"{name}.kind is invalid")
-    target = _uuid4(item["target_package_id"], f"{name}.target_package_id", nullable=True)
-    resolved_state = _string(item["resolved_state"], f"{name}.resolved_state")
-    if resolved_state not in _OBSERVED_STATES:
-        raise ProtocolError(f"{name}.resolved_state is invalid")
+    _keys(item, _EDGE_KEYS, name)
+    target = _uuid4(
+        item["target_package_id"], f"{name}.target_package_id", nullable=True
+    )
     reason = _string(item["reason"], f"{name}.reason")
     if reason not in _EDGE_REASONS:
         raise ProtocolError(f"{name}.reason is invalid")
-    if kind == "claim":
-        claim_name = _claim_name(item["claim_name"], f"{name}.claim_name", nullable=True)
-        observed_state = _string(item["observed_state"], f"{name}.observed_state", nullable=True)
-        if observed_state is not None and observed_state not in _OBSERVED_STATES:
-            raise ProtocolError(f"{name}.observed_state is invalid")
-        evidence_ref = _provenance(
-            item["observed_evidence_ref"],
-            f"{name}.observed_evidence_ref",
-            nullable=True,
-        )
-        if reason not in _CLAIM_EDGE_REASONS:
-            raise ProtocolError(f"{name}.reason does not match kind")
-        return {
-            "kind": "claim",
-            "target_package_id": target,
-            "claim_name": claim_name,
-            "observed_state": observed_state,
-            "observed_evidence_ref": evidence_ref,
-            "resolved_state": resolved_state,
-            "reason": reason,
-        }
-    observed_stage = _string(item["observed_stage"], f"{name}.observed_stage", nullable=True)
-    if observed_stage is not None and not _safe_component(observed_stage):
-        raise ProtocolError(f"{name}.observed_stage is invalid")
-    if reason not in _COMPLETION_EDGE_REASONS:
-        raise ProtocolError(f"{name}.reason does not match kind")
-    return {
-        "kind": "completion",
-        "target_package_id": target,
-        "observed_stage": observed_stage,
-        "resolved_state": resolved_state,
-        "reason": reason,
-    }
+    return {"target_package_id": target, "reason": reason}
 
 
 def _program(value: Any, name: str) -> tuple[str | None, str | None]:
@@ -593,19 +419,11 @@ def _program(value: Any, name: str) -> tuple[str | None, str | None]:
 
 def _relationship(
     value: Any, index: int
-) -> tuple[str | None, str | None, tuple[dict[str, Any], ...], str]:
+) -> tuple[str | None, str | None, tuple[dict[str, Any], ...]]:
     name = f"entries[{index}].relationship"
     item = _object(value, name)
     _keys(item, _RELATIONSHIP_KEYS, name)
-    participation = _string(item["participation"], f"{name}.participation")
-    if participation not in {"available", "legacy", "invalid"}:
-        raise ProtocolError(f"{name}.participation is invalid")
-    direct_state = _string(item["direct_prerequisite_state"], f"{name}.direct_prerequisite_state")
-    if direct_state not in _DIRECT_PREREQUISITE_STATES:
-        raise ProtocolError(f"{name}.direct_prerequisite_state is invalid")
-    _claims(item["claims"], f"{name}.claims")
     program_id, program_title = _program(item["program"], f"{name}.program")
-    _successor(item["superseded_by"], f"{name}.superseded_by")
     prerequisites_value = item["prerequisites"]
     if type(prerequisites_value) is not list:
         raise ProtocolError(f"{name}.prerequisites must be a list")
@@ -613,20 +431,10 @@ def _relationship(
         _edge(raw, f"{name}.prerequisites[{edge_index}]")
         for edge_index, raw in enumerate(prerequisites_value)
     )
-    edge_sort = [
-        (
-            edge["target_package_id"] or "",
-            edge["kind"],
-            edge.get("claim_name") or "",
-            edge.get("observed_stage") or "",
-        )
-        for edge in prerequisites
-    ]
-    if edge_sort != sorted(edge_sort):
+    targets = [edge["target_package_id"] or "" for edge in prerequisites]
+    if targets != sorted(targets):
         raise ProtocolError(f"{name}.prerequisites must be sorted")
-    if participation != "available":
-        return None, None, (), "relationship_unavailable"
-    return program_id, program_title, prerequisites, direct_state
+    return program_id, program_title, prerequisites
 
 
 def _text_units(value: str) -> int:
@@ -689,7 +497,7 @@ def _entry(value: Any, index: int) -> CatalogEntry:
         )
         for field in DECLARED_FIELDS
     }
-    program_id, program_title, prerequisites, direct_state = _relationship(
+    program_id, program_title, prerequisites = _relationship(
         item["relationship"], index
     )
     for field, value in declared_values.items():
@@ -709,15 +517,9 @@ def _entry(value: Any, index: int) -> CatalogEntry:
         package_id=package_id,
         program_id=program_id,
         program_title=program_title,
-        prerequisites=prerequisites,
-        direct_prerequisite_state=direct_state,
         relationship_data={
-            "participation": item["relationship"]["participation"],
-            "claims": item["relationship"]["claims"],
-            "prerequisites": [dict(edge) for edge in item["relationship"]["prerequisites"]],
-            "direct_prerequisite_state": item["relationship"]["direct_prerequisite_state"],
+            "prerequisites": [dict(edge) for edge in prerequisites],
             "program": item["relationship"]["program"],
-            "superseded_by": item["relationship"]["superseded_by"],
         },
     )
 

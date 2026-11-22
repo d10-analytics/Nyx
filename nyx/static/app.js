@@ -17,31 +17,12 @@
     ["Awaiting_Retrospective", "awaiting_retrospective"], ["Done", "done"],
     ["Archive", "archive"],
   ]);
-  const UNRESOLVED_EDGE_REASONS = new Set([
-    "missing_target", "duplicate_target", "identity_coverage_incomplete",
-    "target_unreadable", "target_changed_during_read", "target_invalid_identity",
-    "invalid_prerequisite", "self_edge",
-  ]);
-  const CLAIM_EDGE_REASONS = new Set([
-    "claim_satisfied", "claim_unsatisfied", "claim_unknown", "missing_claim",
-    "invalid_claim", "missing_target", "duplicate_target",
-    "identity_coverage_incomplete", "target_unreadable",
-    "target_changed_during_read", "target_invalid_identity", "self_edge",
-    "invalid_prerequisite",
-  ]);
-  const COMPLETION_EDGE_REASONS = new Set([
-    "completion_satisfied", "completion_unsatisfied", "completion_policy_needed",
-    "completion_policy_invalid", "missing_target", "duplicate_target",
-    "identity_coverage_incomplete", "target_unreadable",
-    "target_changed_during_read", "target_invalid_identity", "self_edge",
-    "invalid_prerequisite",
-  ]);
   // These fields are indexed for search. Only the title and target project
   // are displayed.
   const DECLARED_FIELDS = ["title", "target_project", "status"];
   const REPORTED_FIELD_KEYS = ["name", "value"];
   const MAX_REPORTED_FIELDS = 64;
-  const SCHEMA_VERSION = 8;
+  const SCHEMA_VERSION = 9;
   const SAFE_CATEGORIES = [
     "producer_unavailable", "producer_timeout", "producer_failed",
     "producer_output_too_large", "producer_protocol_error",
@@ -677,11 +658,10 @@
   }
 
   // Every declared prerequisite of one card, as the edge and its target entry,
-  // or an unresolved target.  Resolution reads the reason alone: an edge is
-  // unresolved exactly when its reason is one of the unresolved ones, whatever
-  // its row kind, claim or completion state says.  The target is looked up in
-  // the full catalog index, which holds the finished rows Hide terminal rows
-  // removes, so a prerequisite in a hidden row still resolves to its entry.
+  // or an unresolved target.  Resolution reads the served reason alone: only a
+  // resolved edge names a card to look up.  The target is looked up in the full
+  // catalog index, which holds the finished rows Hide terminal rows removes, so
+  // a prerequisite in a hidden row still resolves to its entry.
   function prerequisiteTargets(entry, byId) {
     const targets = new Map();
     (entry.relationship.prerequisites || []).forEach((edge) => {
@@ -779,7 +759,7 @@
   }
 
   function prerequisiteTarget(edge, byId) {
-    if (UNRESOLVED_EDGE_REASONS.has(edge.reason)) return null;
+    if (edge.reason !== "resolved") return null;
     return byId.get(edge.target_package_id) || null;
   }
 
@@ -908,7 +888,7 @@
     restoreFocus();
   }
 
-  // One arrow per unambiguous prerequisite/dependent pair, regardless of claim count.
+  // One arrow per unambiguous prerequisite/dependent pair, however many rows name it.
   function planEdges(entries, byId) {
     const seen = new Set();
     const edges = [];
@@ -2318,54 +2298,18 @@
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)));
   }
 
-  function provenance(value, nullable = false) {
-    protocol((nullable && value === null) ||
-      (typeof value === "string" &&
-        /^(?:git-object-sha1:[0-9a-f]{40}|git-object-sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$/.test(value)));
-  }
-
   function relationship(value) {
-    protocol(exactKeys(value, ["claims", "direct_prerequisite_state", "participation",
-      "prerequisites", "program", "superseded_by"]));
-    protocol(["available", "legacy", "invalid"].includes(value.participation));
-    protocol(["satisfied", "unsatisfied", "unknown", "no_declared_prerequisites",
-      "relationship_unavailable"].includes(value.direct_prerequisite_state));
-    protocol(Array.isArray(value.claims));
-    value.claims.forEach((claim) => {
-      protocol(exactKeys(claim, ["evidence_ref", "name", "state"]));
-      protocol(/^[a-z][a-z0-9-]{0,63}$/.test(claim.name));
-      protocol(["satisfied", "unsatisfied", "unknown"].includes(claim.state));
-      provenance(claim.evidence_ref, true);
-    });
-    protocol(value.claims.every((claim, index) => index === 0 || claim.name >= value.claims[index - 1].name));
+    protocol(exactKeys(value, ["prerequisites", "program"]));
     protocol(Array.isArray(value.prerequisites));
     value.prerequisites.forEach((edge) => {
-      protocol(typeof edge.kind === "string");
-      if (edge.kind === "claim") {
-        protocol(exactKeys(edge, ["kind", "claim_name", "observed_evidence_ref", "observed_state",
-          "reason", "resolved_state", "target_package_id"]));
-        uuid(edge.target_package_id, true);
-        protocol(edge.claim_name === null || /^[a-z][a-z0-9-]{0,63}$/.test(edge.claim_name));
-        protocol(edge.observed_state === null || ["satisfied", "unsatisfied", "unknown"].includes(edge.observed_state));
-        provenance(edge.observed_evidence_ref, true);
-        protocol(CLAIM_EDGE_REASONS.has(edge.reason));
-      } else if (edge.kind === "completion") {
-        protocol(exactKeys(edge, ["kind", "observed_stage", "reason", "resolved_state", "target_package_id"]));
-        uuid(edge.target_package_id, true);
-        protocol(edge.observed_stage === null || component(edge.observed_stage));
-        protocol(COMPLETION_EDGE_REASONS.has(edge.reason));
-      } else {
-        protocol(false);
-      }
-      protocol(["satisfied", "unsatisfied", "unknown"].includes(edge.resolved_state));
+      protocol(exactKeys(edge, ["reason", "target_package_id"]));
+      uuid(edge.target_package_id, true);
+      protocol(["resolved", "unresolved"].includes(edge.reason));
     });
     protocol(exactKeys(value.program, ["program_id", "resolution", "title"]));
     uuid(value.program.program_id, true);
     protocol(["not_declared", "resolved", "unknown"].includes(value.program.resolution));
     protocol(value.program.title === null || safeText(value.program.title));
-    protocol(exactKeys(value.superseded_by, ["package_id", "resolution"]));
-    uuid(value.superseded_by.package_id, true);
-    protocol(["not_declared", "resolved", "unknown"].includes(value.superseded_by.resolution));
   }
 
   function asciiString(value) {

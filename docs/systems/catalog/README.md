@@ -14,11 +14,12 @@ README is narrative only.
   document.
 - Exposes `scan_packages`, the one scan the catalog renders from, as frozen
   records: each listed package's path, raw stage folder name, read diagnostic,
-  relationship (including `completion` rows), candidate IDs and package ID,
-  plus whether identity coverage is complete. A record holds no file contents:
-  the catalog reads only a bounded prefix of each specification, so a consumer
-  that needs the text reads the file at the record's path. It adds no directory
-  walk and changes neither the catalog document nor the package heads.
+  relationship (whose prerequisite rows carry the target package ID each
+  completion row names, or none), candidate IDs and package ID, plus whether
+  identity coverage is complete. A record holds no file contents: the catalog
+  reads only a bounded prefix of each specification, so a consumer that needs
+  the text reads the file at the record's path. It adds no directory walk and
+  changes neither the catalog document nor the package heads.
 
 ## Outside this boundary
 
