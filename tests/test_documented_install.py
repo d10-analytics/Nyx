@@ -496,8 +496,10 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "answers from the checks that earlier networked runs saved, shown as "
         "`remote recorded remote_checks_off <time>`",
         "A remote with no saved check shows `remote off`",
-        "GitHub lookup is optional and off until the workspace's `github_lookup` setting "
-        "turns it on",
+        "GitHub lookup is on by default: a workspace with no saved checkout settings has it "
+        "on",
+        "A workspace with no folders reads no repository, so the default asks GitHub "
+        "nothing until folders are saved",
         "found in an absolute `PATH` directory (`gh.exe` on Windows) and logged in",
         "one `gh` request per GitHub repository, however many clones share it",
         "and `--no-network` makes none",
@@ -507,7 +509,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the host must be `github.com` or a `*.ghe.com` host, and the path exactly `owner/repo`",
         "Any other host, a GitHub Enterprise Server host included, is `not_github` and is "
         "never asked",
-        "`setting_off`: `github_lookup` is off for the workspace",
+        "`setting_off`: the workspace saved `github_lookup` as off, so no request is made",
         "`remote_checks_off`: `--no-network` was given",
         "`not_github`: the `origin` URL is not a GitHub repository",
         "`gh_missing`: no `gh` was found",
@@ -615,11 +617,11 @@ CHECKOUT_GUIDANCE_MARKERS = {
     "docs/workspaces.md": (
         '"schema_version": 4',
         '"checkout_settings"',
-        '"github_lookup": false',
-        "`github_lookup` is the workspace's switch for the optional GitHub pull-request "
+        '"github_lookup": true',
+        "`github_lookup` is the workspace's switch for the GitHub pull-request "
         "lookup of `nyx checkouts`",
-        "The **Checkout folders** editor changes it with the folders; with no folders "
-        "it is off",
+        "A workspace with no entry has the lookup on",
+        "saving no folders removes the entry, so the lookup returns to on",
         "### Without the board",
         "The key under `checkout_settings` is the record's own `specification_root` value",
         "Each entry in `folders` must be an absolute path, and the list must be sorted",
@@ -1220,9 +1222,11 @@ def test_board_relationship_text_matches_the_outstanding_filter():
     # A prerequisite whose branch is gone reads an unknown merge fact, and GitHub
     # lookup is the documented remedy that can clear the word.
     assert ("A prerequisite whose branch was deleted reads \"merge state unknown\" "
-            "while GitHub lookup is off.") in guide
-    assert ("Turning on [GitHub lookup](#inspect-checkouts) lets Nyx read the merged "
-            "pull request, and the word can then clear.") in guide
+            "while [GitHub lookup](#inspect-checkouts) cannot read its merged pull "
+            "request: the workspace saved the lookup as off, `gh` is missing or not "
+            "logged in, or the repository is not on GitHub.") in guide
+    assert ("With the lookup on and answering, Nyx reads the merged pull request, and "
+            "the word can then clear.") in guide
     board = _normalized("docs/systems/board-web/README.md")
     for marker in (
         "It draws an arrow only for an outstanding prerequisite.",
@@ -1410,9 +1414,13 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "until you choose **Save checkout folders**",
         "(`Add /home/me/code (3 work items)`)",
         "A folder it refuses stays in the draft with its reason beside it",
-        "Saving an empty list stores no folders and turns the lookup off; when the "
-        "lookup was on before the save, the editor adds `With no folders the "
-        "pull-request lookup is off.` to its saved message",
+        "Saving an empty list stores no folders and removes the workspace's saved "
+        "settings, so the lookup returns to its default, on; when the box was cleared "
+        "before the save, the editor adds `With no folders the pull-request lookup "
+        "setting is not kept.` to its saved message",
+        "It is checked for a workspace with no saved settings; clear it to turn the "
+        "lookup off for this workspace",
+        "clear the GitHub lookup checkbox, and choose **Save checkout folders**",
         "until the checkouts read that a checkout folder save on the same page requests "
         "answers with a scan of the new folders (or, when a checkouts read was already in "
         "flight at the save, until the next ten-second check), and, after a configuration "
