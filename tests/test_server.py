@@ -1453,8 +1453,44 @@ def test_checkout_settings_route_reports_an_empty_entry_without_one():
         assert status == 200
         assert json.loads(body) == {
             "folders": [],
-            "github_lookup": False,
+            "github_lookup": True,
             "revision": revision,
+        }
+
+
+def test_a_workspace_with_no_entry_reads_lookup_on_and_its_first_save_writes_it_explicitly():
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        folder = root / "folder"
+        folder.mkdir()
+        application, paths, _ = _checkout_settings_world(root)
+        key = str(application.configuration.specification_root)
+        with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
+            status, _, body = request(port, "GET", "/api/checkout-settings")
+            read = json.loads(body)
+            assert status == 200
+            assert read["github_lookup"] is True
+            status, _, body = _checkout_put(
+                port, read["revision"], [str(folder)], read["github_lookup"]
+            )
+            saved = json.loads(body)
+            assert status == 200
+            assert saved["outcome"] == "success"
+            assert saved["github_lookup"] is True
+            assert json.loads(paths.config_file.read_bytes())["checkout_settings"][key] == {
+                "folders": [str(folder)],
+                "github_lookup": True,
+            }
+            status, _, body = _checkout_put(
+                port, saved["revision"], [str(folder)], False
+            )
+            assert status == 200
+            assert json.loads(body)["github_lookup"] is False
+            status, _, body = request(port, "GET", "/api/checkout-settings")
+            assert json.loads(body)["github_lookup"] is False
+        assert json.loads(paths.config_file.read_bytes())["checkout_settings"][key] == {
+            "folders": [str(folder)],
+            "github_lookup": False,
         }
 
 
@@ -1728,12 +1764,12 @@ def test_checkout_settings_put_with_an_empty_folder_list_removes_the_active_entr
             assert status == 200
             assert saved["outcome"] == "success"
             assert saved["folders"] == []
-            assert saved["github_lookup"] is False
+            assert saved["github_lookup"] is True
             status, _, body = request(port, "GET", "/api/checkout-settings")
             assert status == 200
             assert json.loads(body) == {
                 "folders": [],
-                "github_lookup": False,
+                "github_lookup": True,
                 "revision": saved["revision"],
             }
         stored = json.loads(paths.config_file.read_bytes())
@@ -1841,7 +1877,7 @@ def test_real_checkout_settings_http_reports_conflict_for_a_competing_record_aft
         assert status == 409
         assert body == {
             "folders": [],
-            "github_lookup": False,
+            "github_lookup": True,
             "revision": state.configuration_revision(paths),
             "outcome": "conflict",
         }
@@ -1857,7 +1893,7 @@ def test_real_checkout_settings_http_reports_reload_needed_for_unreadable_record
         assert status == 409
         assert body == {
             "folders": [],
-            "github_lookup": False,
+            "github_lookup": True,
             "revision": None,
             "outcome": "reload-needed",
         }

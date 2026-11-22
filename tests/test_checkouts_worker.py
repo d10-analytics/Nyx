@@ -201,6 +201,45 @@ def test_a_closed_manager_reports_the_checkouts_cancellation():
         assert manager.close(time.monotonic() + 5)
 
 
+def test_a_workspace_with_no_saved_checkout_settings_collects_with_lookup_on(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    isolate_git(monkeypatch, home)
+    specification = tmp_path / "specification"
+    specification.mkdir()
+    paths = state.state_paths(create=True)
+    assert paths.config_file.is_relative_to(home)
+    record = {"schema_version": 4, "specification_root": str(specification.resolve())}
+    paths.config_file.write_bytes(
+        (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    )
+    manager = worker.CatalogWorkerManager(working_directory=paths.state_directory)
+    with _managed(manager):
+        document = models.parse_checkouts(manager.fetch_checkouts(network=False))
+
+    assert document["folders"] == []
+    assert document["github_lookup"] == "on"
+
+
+def test_a_saved_lookup_off_collects_with_the_lookup_off(workspace):
+    _write_record(
+        workspace.home, workspace.specification, [workspace.folder], github_lookup=False
+    )
+    manager = _worker_manager(workspace)
+    with _managed(manager):
+        document = models.parse_checkouts(manager.fetch_checkouts(network=True))
+
+    assert document["github_lookup"] == "off"
+    [repository] = document["repositories"]
+    assert repository["pr_lookup"] == {
+        "status": "off",
+        "reason": "setting_off",
+        "checked_at": None,
+    }
+
+
 def test_a_not_configured_home_still_yields_an_empty_document(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()

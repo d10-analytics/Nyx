@@ -7593,9 +7593,32 @@ def test_collection_inputs_carry_the_loaded_configuration_revision(tmp_path):
         nyx_state.ConfigurationObservation("not_configured")
     )
     assert absent == checkouts.CollectionInputs(
-        folders=(), github_lookup=False, package_scan=None
+        folders=(), github_lookup=True, package_scan=None
     )
     assert absent.configuration_revision is None
+
+
+def test_collection_inputs_take_the_lookup_from_the_saved_entry_or_the_default(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    root = tmp_path / "spec"
+    root.mkdir()
+
+    def inputs(settings: dict) -> checkouts.CollectionInputs:
+        found = checkouts.collection_inputs(
+            nyx_state.ConfigurationObservation(
+                "configured", specification_root=root, checkout_settings=settings
+            )
+        )
+        assert found is not None
+        return found
+
+    unsaved = inputs({})
+    assert unsaved.folders == ()
+    assert unsaved.github_lookup is True
+    for lookup in (False, True):
+        saved = inputs({str(root): nyx_state.CheckoutSettings((str(folder),), lookup)})
+        assert saved.github_lookup is lookup
 
 
 # ---------------------------------------------------------------------------
