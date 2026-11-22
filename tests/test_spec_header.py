@@ -26,6 +26,7 @@ OWNED_DEFINITIONS = frozenset(
         "metadata_value",
         "metadata_values",
         "_HEADER_LABELS",
+        "RETIRED_HEADER_LABELS",
         "_HEADER_FIELD",
         "_CLAIM_NAME",
         "_PROVENANCE",
@@ -44,6 +45,7 @@ HEADER_LABELS = (
     "Completion Prerequisite",
     "Claim",
 )
+RETIRED_HEADER_LABELS = ("Prerequisite", "Claim")
 # The wire protocol validates claim names and provenance references with its own
 # fullmatch patterns, a separate contract from the header rows the parser reads.
 PROTOCOL_PATTERNS = {"models.py": frozenset({"_CLAIM_NAME", "_PROVENANCE"})}
@@ -122,11 +124,12 @@ def test_owner_defines_the_public_names() -> None:
 
 def test_header_label_literals_have_one_owner() -> None:
     modules = _modules()
-    assert set(HEADER_LABELS) <= _code_string_literals(modules[OWNER])
+    labels = set(HEADER_LABELS) | set(RETIRED_HEADER_LABELS)
+    assert labels <= _code_string_literals(modules[OWNER])
     stray = {
-        module: sorted(set(HEADER_LABELS) & _code_string_literals(tree))
+        module: sorted(labels & _code_string_literals(tree))
         for module, tree in modules.items()
-        if module != OWNER and set(HEADER_LABELS) & _code_string_literals(tree)
+        if module != OWNER and labels & _code_string_literals(tree)
     }
     assert stray == {}
 
