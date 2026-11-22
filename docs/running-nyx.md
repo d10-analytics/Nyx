@@ -450,10 +450,15 @@ remote with no saved check shows `remote off`, and its values come from the
 remote-tracking branches the clone already has, so they can be older than the
 remote until you fetch.
 
-GitHub lookup is optional and off until the workspace's `github_lookup` setting
-turns it on (see [Your specification workspace](workspaces.md#checkout-folders)).
-It needs the GitHub CLI, `gh`, found in an absolute `PATH` directory (`gh.exe` on
-Windows) and logged in; Nyx uses the login and token variables you already have
+GitHub lookup is on by default: a workspace with no saved checkout settings has it
+on, and the **Checkout folders** editor saves the choice with the folders, so a
+first save keeps it on unless you clear its checkbox (see [Your specification
+workspace](workspaces.md#checkout-folders), which also gives the `github_lookup`
+setting for a hand edit). A workspace with no folders reads no repository, so the
+default asks GitHub nothing until folders are saved. It needs the GitHub CLI, `gh`,
+found in an absolute `PATH` directory (`gh.exe` on Windows) and logged in; without
+one the lookup reports `gh_missing` or `not_authenticated` below and the scan
+still completes. Nyx uses the login and token variables you already have
 and ignores `GH_HOST` and `GH_REPO`. A networked run makes one `gh` request per
 GitHub repository, however many clones share it, in the same 60 seconds as the git
 remote checks, and `--no-network` makes none. The request only reads: it asks for
@@ -470,7 +475,8 @@ used and the last successful lookup is shown, with its time. `off` means no
 request was made, and `unavailable` means it was tried and failed with no saved
 lookup. The reason says why, and what clears it:
 
-- `setting_off`: `github_lookup` is off for the workspace; turn it on.
+- `setting_off`: the workspace saved `github_lookup` as off, so no request is made;
+  check the box in the **Checkout folders** editor to turn it on.
 - `remote_checks_off`: `--no-network` was given; run without it.
 - `not_github`: the `origin` URL is not a GitHub repository by the rule above; it
   clears only when the URL is.
@@ -1378,8 +1384,10 @@ the list nor whether an entry is a link. A card with nothing outstanding has no
 **Needs** list.
 
 A prerequisite whose branch was deleted reads "merge state unknown" while
-GitHub lookup is off. Turning on [GitHub lookup](#inspect-checkouts) lets Nyx
-read the merged pull request, and the word can then clear.
+[GitHub lookup](#inspect-checkouts) cannot read its merged pull request: the
+workspace saved the lookup as off, `gh` is missing or not logged in, or the
+repository is not on GitHub. With the lookup on and answering, Nyx reads the
+merged pull request, and the word can then clear.
 
 Keyboard focus inside the panel is kept whenever the panel is rewritten: a
 relationship link stays focused and so does the **All fields** summary, and
@@ -1508,7 +1516,8 @@ the number of work items it would reveal (`Add /home/me/code (3 work items)`);
 these are the `folder_suggestions` of the document, and a folder already in the
 list is not offered. The checkbox **Look up pull requests with the GitHub CLI
 (gh)** is the workspace's lookup switch described under [Inspect
-checkouts](#inspect-checkouts).
+checkouts](#inspect-checkouts). It is checked for a workspace with no saved
+settings; clear it to turn the lookup off for this workspace.
 
 A save is checked by the server. A folder it refuses stays in the draft with its
 reason beside it (`This folder does not exist.`, `This path is not absolute.`,
@@ -1518,9 +1527,10 @@ the marked folders and save again.`; nothing was saved. A folder that is already
 saved is not refused for being missing, so a list keeps saving while one of its
 drives is away. The saved list is sorted and keeps each folder once, so the list
 shown after a save can differ in order from the draft. Saving an empty list
-stores no folders and turns the lookup off; when the lookup was on before the
-save, the editor adds `With no folders the pull-request lookup is off.` to its
-saved message.
+stores no folders and removes the workspace's saved settings, so the lookup
+returns to its default, on; when the box was cleared before the save, the editor
+adds `With no folders the pull-request lookup setting is not kept.` to its saved
+message.
 
 When the record changed after the editor loaded it, such as a save from another
 page, the save is not applied. (A running board does not notice a hand edit of
@@ -1740,8 +1750,8 @@ never fetched. Use a short, neutral fixture path such as `/tmp/nyx-capture-fixtu
 (a path under your home directory would show your username).
 Start the isolated instance, choose **Repositories**, and configure the clones'
 parent folder through the **Checkout folders** editor (see [Use the Repositories
-view](#use-the-repositories-view)): add the parent folder, leave the GitHub lookup
-unchecked, and choose **Save checkout folders**; a Board settings save keeps
+view](#use-the-repositories-view)): add the parent folder, clear the GitHub lookup
+checkbox, and choose **Save checkout folders**; a Board settings save keeps
 that entry. Close the editor again before the capture so only its summary shows.
 Then save the Board
 settings described above, which also clears the

@@ -31,8 +31,9 @@ README is narrative only.
   not already hold, answers 400 `invalid_checkout_folders` with every problem's
   index and reason, and otherwise answers exactly `{folders, github_lookup,
   revision, outcome}` with the board settings save's outcomes and status
-  mapping. An empty folder list removes the entry and answers `folders: []` and
-  `github_lookup: false`. Both routes share the board settings admission counter
+  mapping. A workspace with no saved entry reads `folders: []` and the default lookup
+  (`state.DEFAULT_CHECKOUT_GITHUB_LOOKUP`, on); an empty folder list removes the
+  entry and answers the same. Both routes share the board settings admission counter
   and operation lock, they answer 503 `settings_unavailable` while admission is
   closed, and the standalone catalog server answers 404.
 - A served document is refreshed in the background once
