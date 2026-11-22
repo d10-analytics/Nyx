@@ -259,6 +259,16 @@ _ID_A = "11111111-1111-4111-8111-111111111111"
 _ID_B = "22222222-2222-4222-9222-222222222222"
 _NAME_64 = "a" + "b-" * 31 + "c"
 _HEADER_ROWS = {
+    # One header holding both a retired row and every completion-row form: only
+    # the four completion rows become prerequisites, in header order.
+    "ac04": [
+        "Prerequisite: " + _ID_B + " | release",
+        "Claim: release | satisfied | sha256:" + "a" * 64,
+        "Completion Prerequisite: " + _ID_B,
+        "Completion Prerequisite: " + _ID_B + " | release",
+        "Completion Prerequisite: not-a-uuid",
+        "Completion Prerequisite:",
+    ],
     "ident": ["  **Package ID**:" + _ID_A, "Program Membership:" + _ID_B, "**Superseded By**: " + _ID_B + "  "],
     "lower_label": ["package id: " + _ID_A, "claim: x | unknown", "prerequisite: " + _ID_A + " | x"],
     "lookaround": ["Package ID: 0" + _ID_A + " " + _ID_B + "f", "Package ID: x"],
@@ -312,6 +322,20 @@ _EMPTY_RELATIONSHIP = {
     "superseded_by": {"package_id": None, "resolution": "not_declared"},
 }
 _PARSED_HEADERS = {
+    "ac04": [
+        {
+            "prerequisites": [
+                {"target_package_id": _ID_B},
+                {"target_package_id": None},
+                {"target_package_id": None},
+                {"target_package_id": None},
+            ],
+            "program": {"program_id": None, "resolution": "not_declared", "title": None},
+            "superseded_by": {"package_id": None, "resolution": "not_declared"},
+        },
+        [],
+        None,
+    ],
     "ident": [
         {
             "prerequisites": [],
