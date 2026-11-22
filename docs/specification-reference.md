@@ -82,11 +82,9 @@ For example, a community-event item can wait on one whole permit item:
 Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102
 ```
 
-The row names the permit work item rather than a part of it. A prerequisite is
-outstanding until the board reads its target as served merged on `main`. The board
-draws an arrow only for an outstanding prerequisite, and the work item panel's
-**Needs** list names every outstanding prerequisite of the card. A provider in a
-finished row appears when **Hide terminal rows** is unchecked.
+The row names the permit work item rather than a part of it. The
+[Prerequisites](#prerequisites) section says when the row is outstanding. A
+provider in a finished row appears when **Hide terminal rows** is unchecked.
 
 Other header lines of the form `Name: value`, such as `Owner Note: waiting for
 venue confirmation`, are retained as reported text. The name may be bold, as in
@@ -173,9 +171,9 @@ and never repeat a scalar field such as `Package ID`. The
 in use.
 
 A prerequisite is outstanding until the board reads its target as served merged
-on `main`. The board draws an arrow only for an outstanding prerequisite, and the
+on `main`. Board cards draw an arrow only for an outstanding prerequisite. The
 work item panel's **Needs** list names every outstanding prerequisite of the
-card, with its reason. A provider in a finished row appears when **Hide terminal
+card. A provider in a finished row appears when **Hide terminal
 rows** is unchecked.
 
 Progress and dependency information comes from your specification files.
