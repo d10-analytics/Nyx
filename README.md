@@ -77,10 +77,11 @@ python3.12 -m venv .venv
 .venv/bin/nyx --stop
 ```
 
-Open **http://127.0.0.1:8765/**. Uncheck **Hide terminal rows**. Select **Plan
-the route preview** to highlight its connection to the API contract work item.
-Select **Build the route preview** to highlight its connection to the separate
-API implementation work item. The [sample walkthrough](examples/sample-specifications/README.md)
+Open **http://127.0.0.1:8765/**. Uncheck **Hide terminal rows**. The API
+contract and its implementation are separate whole work items. Select **Plan the
+route preview** to highlight its connection to the API contract. Select **Build
+the route preview** to highlight its connection to the API implementation. The
+[sample walkthrough](examples/sample-specifications/README.md)
 explains the fictional software project, its custom stage, and the compact-view
 workflow. For a non-programming example, the [workspace guide](docs/workspaces.md)
 also shows a fictional community event with a finished permit work item.
