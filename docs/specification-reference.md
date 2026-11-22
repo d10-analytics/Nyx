@@ -165,7 +165,7 @@ repeat scalar fields such as `Package ID` or `Program Membership`.
 
 `Completion Prerequisite: UUID` is the one prerequisite row. It names the whole
 work item that the dependent needs, and its value is exactly one lowercase
-version 4 UUID. Repeat the row for each distinct work item the dependent needs,
+version 4 UUID. Repeat the row for each further work item the dependent needs,
 and never repeat a scalar field such as `Package ID`. The
 [sample walkthrough](../examples/sample-specifications/README.md) shows the row
 in use.
@@ -173,8 +173,8 @@ in use.
 A prerequisite is outstanding until the board reads its target as served merged
 on `main`. Board cards draw an arrow only for an outstanding prerequisite. The
 work item panel's **Needs** list names every outstanding prerequisite of the
-card. A provider in a finished row appears when **Hide terminal
-rows** is unchecked.
+card. A provider in a finished row appears when **Hide terminal rows** is
+unchecked.
 
 Progress and dependency information comes from your specification files.
 Missing, ambiguous, or malformed information can leave a relationship unknown or

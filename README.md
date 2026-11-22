@@ -108,9 +108,9 @@ already running with a different setup, stop it before changing the account-loca
 settings. See [running Nyx](docs/running-nyx.md) for status and configuration
 options.
 
-`Completion Prerequisite: UUID` is the one prerequisite row, and it names the
-whole work item that this work item needs. A prerequisite is outstanding until the
-board reads its target as served merged on `main`. **Board settings** holds a
+`Completion Prerequisite: UUID` is the one prerequisite row. It names one whole
+work item as a prerequisite. A prerequisite is outstanding until the board reads
+its target as served merged on `main`. **Board settings** holds a
 literal set of stage names that you pick beside **Counts as finished**. That
 setting decides only which cards are finished rows, which rows **Hide terminal
 rows** hides, and the Code Status that `nyx checkouts` reports. Nyx does not
