@@ -77,13 +77,14 @@ python3.12 -m venv .venv
 .venv/bin/nyx --stop
 ```
 
-Open **http://127.0.0.1:8765/**. Uncheck **Hide terminal rows** and select
-**Build the route preview** or **Plan the route preview** to highlight their
-connections to the API contract. The [sample walkthrough](examples/sample-specifications/README.md)
+Open **http://127.0.0.1:8765/**. Uncheck **Hide terminal rows**. The API
+contract and its implementation are separate whole work items. Select **Plan the
+route preview** to highlight its connection to the API contract. Select **Build
+the route preview** to highlight its connection to the API implementation. The
+[sample walkthrough](examples/sample-specifications/README.md)
 explains the fictional software project, its custom stage, and the compact-view
 workflow. For a non-programming example, the [workspace guide](docs/workspaces.md)
-also shows a fictional community event with a finished permit work item and two
-recorded outcomes.
+also shows a fictional community event with a finished permit work item.
 
 Throughout the linked guides, bare `nyx` is shorthand for the console installed
 above: `.venv/bin/nyx`. That relative path works from the repository root. When
@@ -103,28 +104,28 @@ configuration, shared by that account's browser and desktop views. The saved ord
 survives browser reload and a supported Nyx restart, and is keyed by workspace root:
 switching from workspace A to workspace B does not apply A's order, while returning
 to A restores it. Reordering changes presentation only; it does not rename or move
-folders, change completion, approval, claims, dependencies, or execution. If Nyx is
+folders, change completion, approval, dependencies, or execution. If Nyx is
 already running with a different setup, stop it before changing the account-local
 settings. See [running Nyx](docs/running-nyx.md) for status and configuration
 options.
 
-Simple completion dependencies use an explicit `Completion Prerequisite: UUID`
-header and a literal set of stage names that you choose in **Board settings**.
-For example, selecting `Done` makes a work item in the literal `Done` stage
-count as finished for this workspace. Nyx does not infer completion from a row
-name, row order, cancellation, or Archive, and it never treats a
-completed stage as evidence verification. The setting is saved in the
-account-local configuration for the current workspace root, so another root can
-use a different policy and returning to this root restores its own choice.
-Named outcomes still use `Prerequisite: UUID | claim-name` and keep their own
-claim and evidence semantics.
+`Completion Prerequisite: UUID` is the one prerequisite row. It names one whole
+work item as a prerequisite. A prerequisite is outstanding until the board reads
+its target as served merged on `main`. **Board settings** holds a
+literal set of stage names that you pick beside **Counts as finished**. That
+setting decides only which cards are finished rows, which rows **Hide terminal
+rows** hides, and the Code Status that `nyx checkouts` reports. Nyx does not
+infer a finished row from a row name, row order, cancellation, or Archive. It
+never treats a finished stage as evidence verification. The setting is saved in
+the account-local configuration for the current workspace root. Another root can
+use a different set, and returning to this root restores its own choice.
 
 The same finished-stage selection drives the board's **Hide terminal rows**
 control in the top bar. It starts checked, so rows for finished stages are hidden
 until you reveal them, and the preference lives in the browser like **Hide empty
 rows and columns**. This is presentation only: it never changes setup, the
-catalog, or which dependencies are satisfied. Every discovered stage has rows in
-the catalog; **Hide terminal rows** is the only control that hides populated
+catalog, or which prerequisites are outstanding. Every discovered stage has rows
+in the catalog; **Hide terminal rows** is the only control that hides populated
 stage rows. Unchecking it reveals finished rows and their cards.
 
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.

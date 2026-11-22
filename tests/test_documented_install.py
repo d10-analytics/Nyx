@@ -139,11 +139,11 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
 COMPLETION_GUIDANCE_MARKERS = {
     "README.md": (
         "Completion Prerequisite: UUID",
+        "is the one prerequisite row",
         "literal set of stage names",
         "Board settings",
         "workspace root",
         "evidence verification",
-        "Prerequisite: UUID | claim-name",
     ),
     "docs/running-nyx.md": (
         "collapsed **Board settings**",
@@ -154,7 +154,7 @@ COMPLETION_GUIDANCE_MARKERS = {
         "Hide terminal rows",
         "Reload board settings",
         "configuration revision",
-        "moving it out reopens it",
+        "It decides no prerequisite",
         "recorded workflow assertion",
         "A theme change follows other open tabs",
         "The compact view (**Hide empty rows and columns**), **Hide terminal rows**, and "
@@ -165,25 +165,48 @@ COMPLETION_GUIDANCE_MARKERS = {
     "docs/workspaces.md": (
         "no implicit `Done` or `Archive` rule",
         "Completion Prerequisite: UUID",
-        "missing policy leaves the requirement **unknown**",
+        "is the one prerequisite row",
+        "outstanding until the board reads its target as served merged",
         "saved per canonical workspace root",
         "stay keyed to the workspace's original path",
         "does not carry them to the new path and does not delete them",
         "Moving the folder back to its original path restores its order and completion policy",
-        "root with no saved names reports unknown",
         "A cancelled or archived item",
         "finished row",
-        "mixed dependent item",
     ),
     "docs/specification-reference.md": (
-        "one exact completion grammar",
-        "one-part `Prerequisite: UUID` is not",
-        "never uses a magic claim name",
+        "is the one prerequisite row",
+        "outstanding until the board reads its target as served merged",
         "collapsed **Board settings**",
         "temporarily absent names",
         "recorded workflow assertion",
     ),
 }
+# The retired two-row grammar and its claim wording, by the document that pinned
+# it. Each document drops every marker it pinned.
+RETIRED_COMPLETION_MARKERS = {
+    "README.md": (
+        "Prerequisite: UUID | claim-name",
+    ),
+    "docs/running-nyx.md": (
+        "moving it out reopens it",
+    ),
+    "docs/workspaces.md": (
+        "missing policy leaves the requirement **unknown**",
+        "root with no saved names reports unknown",
+        "mixed dependent item",
+    ),
+    "docs/specification-reference.md": (
+        "one-part `Prerequisite: UUID` is not",
+        "never uses a magic claim name",
+    ),
+}
+# The same retired wording as one list, for the policy test's absence check.
+RETIRED_COMPLETION_WORDING = tuple(
+    marker
+    for markers in RETIRED_COMPLETION_MARKERS.values()
+    for marker in markers
+)
 # The pill sentence, its five wordings and the panel rows it filled: the board
 # and its guide carry none of them.
 PREREQUISITES_PILL_DOCUMENTS = ("docs/running-nyx.md", "docs/systems/board-web/README.md")
@@ -663,10 +686,11 @@ EVENT_COMPLETION_EXAMPLE = (
     "# Organize the neighborhood festival\n"
     "Package ID: 123e4567-e89b-42d3-a456-426614174100\n"
     "Status: planning\n"
-    "Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102\n"
-    "Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed\n"
-    "Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved"
+    "Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102"
 )
+# A retired relationship row anywhere in the workspace guide would be a card
+# the board no longer serves.
+RETIRED_RELATIONSHIP_ROW = re.compile(r"^(Prerequisite:|Claim:)", re.MULTILINE)
 _START_TIMEOUT = 90.0
 
 
@@ -851,6 +875,14 @@ def test_documents_publish_the_explicit_completion_contract():
             assert marker in document, (name, marker)
 
 
+def test_documents_drop_the_retired_completion_rows_and_claim_wording():
+    """Each document that pinned a retired marker keeps none of its own markers."""
+    for name, markers in RETIRED_COMPLETION_MARKERS.items():
+        document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
+        for marker in markers:
+            assert marker not in document, (name, marker)
+
+
 def test_documents_publish_the_checkout_contract():
     for name, markers in CHECKOUT_GUIDANCE_MARKERS.items():
         document = re.sub(r"\s+", " ", (REPOSITORY_ROOT / name).read_text(encoding="utf-8"))
@@ -904,12 +936,22 @@ def test_documented_output_limit_matches_the_catalog():
     assert f"larger than the {limit} catalog limit" in normalized
 
 
-def test_event_walkthrough_shows_whole_item_and_named_outcomes():
+def test_event_walkthrough_shows_whole_item_completion():
     document = (REPOSITORY_ROOT / "docs" / "workspaces.md").read_text(encoding="utf-8")
     assert EVENT_COMPLETION_EXAMPLE in document
-    assert "event plan's whole-item requirement" in document
-    assert "literal `Done` stage" in document
-    assert "separate named outcomes" in document
+    prose = re.sub(r"\s+", " ", document)
+    assert "event plan's whole-item requirement" in prose
+    assert "names the whole permit work item rather than a part of it" in prose
+    # The example declares the whole permit item and no retired relationship row.
+    assert not RETIRED_RELATIONSHIP_ROW.search(document)
+
+
+def test_capture_procedure_expects_the_resolved_permit_edge():
+    document = re.sub(
+        r"\s+", " ", (REPOSITORY_ROOT / "docs" / "running-nyx.md").read_text(encoding="utf-8")
+    )
+    assert "still targets the permit and is served with reason `resolved`" in document
+    assert "completion_satisfied" not in document
 
 
 def test_port_conflict_guidance_matches_the_public_message():
@@ -951,11 +993,10 @@ UUID_COMMANDS = (
 )
 UUID_RULE_MARKERS = (
     "Every UUID field (`Package ID`, `Program ID`, `Program Membership`, "
-    "`Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a "
+    "`Completion Prerequisite`, and `Superseded By`) takes a "
     "lowercase version 4 UUID only",
     "An invalid `Package ID` makes the item lose its identity, so ",
-    "An invalid `Prerequisite` or `Completion Prerequisite` shows "
-    "**unresolved target**",
+    "An invalid `Completion Prerequisite` shows **unresolved target**",
     "An invalid `Program Membership` or `Superseded By` leaves the item's "
     "identity intact",
 )
@@ -1165,20 +1206,17 @@ def test_dependency_and_completion_policy_text_matches_the_board():
     assert ("The work item panel's **Needs** list names the selected card's "
             "outstanding prerequisites, with the reason for each.") in readme
     assert "**unresolved target** only when a relationship cannot be resolved" in readme
+    # The sample paragraph names two whole work items and no per-claim outcome.
+    assert "The API contract and its implementation are separate whole work items." in readme
+    assert "recorded outcomes" not in readme
     for name in RELATIONSHIP_DOCUMENTS:
-        for retired in RETIRED_RELATIONSHIP_TEXT:
+        for retired in RETIRED_RELATIONSHIP_TEXT + RETIRED_COMPLETION_WORDING:
             assert retired not in _normalized(name), (name, retired)
     assert "asks you to configure completed stages" not in _normalized("docs/workspaces.md")
     assert "actionable configuration explanation" not in _normalized(
         "docs/specification-reference.md")
-    assert "The policy is set in **Board settings**; a missing policy" in _normalized(
-        "docs/workspaces.md")
     assert ("The completion policy is configured in the collapsed **Board settings** "
             "panel") in _normalized("docs/specification-reference.md")
-    assert ("a missing policy leaves the requirement **unknown**, with no prompt "
-            "or explanation") in _normalized("docs/workspaces.md")
-    assert ("a completion dependency is **unknown**; the board shows no prompt "
-            "or explanation") in _normalized("docs/specification-reference.md")
 
 
 def test_board_relationship_text_matches_the_outstanding_filter():

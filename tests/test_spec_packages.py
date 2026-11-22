@@ -34,6 +34,23 @@ Not changed: alignment, coordinates, file schema, and the interface.
 """
 
 
+RETIRED_LABEL_UUID = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
+RETIRED_LABEL_ROWS = (
+    f"Prerequisite: {RETIRED_LABEL_UUID} | release",
+    "**Claim:** release | unsatisfied",
+    f"prerequisite: {RETIRED_LABEL_UUID}",
+)
+# The shared metadata capture keeps the bold marker that follows the colon, so
+# the Claim row's value starts with "** ", exactly as the Branch rows read it.
+RETIRED_LABEL_MESSAGES = (
+    f"retired header Prerequisite: {RETIRED_LABEL_UUID} | release is not accepted; "
+    "use Completion Prerequisite: <UUID>",
+    f"retired header Prerequisite: {RETIRED_LABEL_UUID} is not accepted; "
+    "use Completion Prerequisite: <UUID>",
+    "retired header Claim: ** release | unsatisfied is not accepted; delete the line",
+)
+
+
 class SpecificationStorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -505,3 +522,76 @@ class SpecificationStorageTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.assertEqual([], self.branch_errors(package))
+
+    def add_header_rows(self, package: Path, rows: tuple[str, ...]) -> None:
+        """Insert exact header lines above the fixture's Target repo line."""
+        spec = package / "spec.md"
+        head, separator, body = spec.read_text(encoding="utf-8").partition("\n## ")
+        head = head.replace("Target repo:", "\n".join(rows) + "\nTarget repo:", 1)
+        spec.write_text(head + separator + body, encoding="utf-8")
+
+    def retired_label_errors(self, package: Path) -> list[str]:
+        return [
+            error
+            for error in self.check(package)
+            if "retired header Prerequisite:" in error
+            or "retired header Claim:" in error
+        ]
+
+    def test_retired_relationship_labels_rejected_in_every_live_stage(self) -> None:
+        expected = list(RETIRED_LABEL_MESSAGES)
+        for stage, lifecycle in (
+            ("Under_Development", "under_development"),
+            ("Queue", "queue"),
+            ("In_Progress", "in_progress"),
+            (".pipeline", ".pipeline"),
+            ("Needs_Fixes", "needs_fixes"),
+            ("Awaiting_Retrospective", "awaiting_retrospective"),
+        ):
+            with self.subTest(stage=stage):
+                package = self.stage_package(stage)
+                self.add_header_rows(package, RETIRED_LABEL_ROWS)
+                self.assertEqual(lifecycle, VALIDATOR.package_lifecycle(
+                    package / "spec.md", self.spec_root
+                ))
+                self.assertEqual(expected, self.retired_label_errors(package))
+
+    def test_retired_relationship_labels_kept_in_history_stages(self) -> None:
+        for stage in ("Done", "Archive", "Reference"):
+            with self.subTest(stage=stage):
+                package = self.package(stage)
+                if stage == "Done":
+                    self.reports(package, "READY")
+                self.add_header_rows(package, RETIRED_LABEL_ROWS)
+                self.assertEqual([], self.retired_label_errors(package))
+
+    def test_retired_relationship_labels_ignored_outside_the_specification_root(
+        self,
+    ) -> None:
+        package = self.root / "Elsewhere" / "under_development" / "feature"
+        package.mkdir(parents=True)
+        spec = package / "spec.md"
+        spec.write_text(
+            VALID_SPEC_V3.replace("Target repo: /tmp/repo", f"Target repo: {self.repo}"),
+            encoding="utf-8",
+        )
+        self.add_header_rows(package, RETIRED_LABEL_ROWS)
+        self.assertEqual(
+            "under_development", VALIDATOR.package_lifecycle(spec, self.spec_root)
+        )
+        self.assertFalse(spec.resolve().is_relative_to(self.spec_root.resolve()))
+        self.assertEqual([], self.check(package))
+
+    def test_retired_label_rule_reads_only_header_lines_and_retired_labels(self) -> None:
+        package = self.package("Queue")
+        completion = f"Completion Prerequisite: {RETIRED_LABEL_UUID}"
+        self.add_header_rows(package, (completion,))
+        self.assertEqual([], self.retired_label_errors(package))
+        spec = package / "spec.md"
+        spec.write_text(
+            spec.read_text(encoding="utf-8").replace(
+                "## Objective\n", f"## Objective\n{RETIRED_LABEL_ROWS[0]}\n", 1
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual([], self.retired_label_errors(package))

@@ -23,6 +23,7 @@ from .models import (
 from .spec_header import (
     _HEADER_BYTE_LIMIT,
     _HEADER_LABELS,
+    RETIRED_HEADER_LABELS,
     _catalog_anchor_text,
     _uuid,
     _uuid_candidates,
@@ -65,7 +66,13 @@ _MAX_ADMITTED_PATH_UNITS = MAX_TEXT_UNITS - (
 # catalog never reads them.
 _JOIN_LABELS = {"target_repo": "Target repo", "branch": "Branch", "baseline": "Baseline"}
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
-_REPORTED_EXCLUSIONS = {label.translate(_ASCII_LOWER) for label in (*_HEADER_LABELS, "Status", "Target repo")}
+# A retired relationship label is still a header-shaped line in an old package,
+# so it is excluded beside the live labels: a finished card's All fields and
+# search never show one.
+_REPORTED_EXCLUSIONS = {
+    label.translate(_ASCII_LOWER)
+    for label in (*_HEADER_LABELS, *RETIRED_HEADER_LABELS, "Status", "Target repo")
+}
 _REPORTED_FIELD = re.compile(r"^\s*(?:\*\*)?([A-Z][^:*`<>|\[\]\x00-\x1f\x7f]{0,63}?)(?:\*\*:|:\*\*|:)(.*)$")
 
 
@@ -411,35 +418,6 @@ def _resolve_program(
             context["title"] = descriptor["title"]
 
 
-def _resolve_successor(
-    relationship: dict[str, object],
-    index: dict[str, list[dict[str, object]]],
-    identity_complete: bool,
-) -> None:
-    context = relationship["superseded_by"]
-    successor_id = context["package_id"]
-    if successor_id is None:
-        return
-    if not identity_complete:
-        context["resolution"] = "unknown"
-        return
-    candidates = index.get(successor_id, [])
-    if not candidates:
-        context["resolution"] = "unknown"
-        return
-    if len(candidates) > 1:
-        context["resolution"] = "unknown"
-        return
-    target = candidates[0]
-    if target.get("read_diagnostic") in {"unreadable_anchor", "nonregular_anchor", "changed_during_read"}:
-        context["resolution"] = "unknown"
-        return
-    if target.get("package_id") != successor_id or target.get("relationship") is None:
-        context["resolution"] = "unknown"
-        return
-    context["resolution"] = "resolved"
-
-
 def _scan_stage(
     stage_path: Path,
     lifecycle: str,
@@ -466,6 +444,7 @@ def _scan_stage(
             declared = _empty_declared()
             relationship = None
             candidates: set[str] = set()
+            package_id: str | None = None
             reported_fields = []
             join: dict[str, str | None] = dict.fromkeys(_JOIN_LABELS)
             decode_diagnostic: str | None = None
@@ -477,15 +456,8 @@ def _scan_stage(
                         key: metadata_value(lines, label)
                         for key, label in _JOIN_LABELS.items()
                     }
-                    relationship, candidates = parse_header(lines)
+                    relationship, candidates, package_id = parse_header(lines)
                     reported_fields = _reported_fields(lines)
-            package_id = (
-                next(iter(candidates))
-                if relationship
-                and relationship["participation"] == "available"
-                and len(candidates) == 1
-                else None
-            )
             records.append(
                 {
                     "package_path": package_path,
@@ -561,36 +533,26 @@ def _resolve_edge_target(
     row: dict[str, object],
     index: dict[str, list[dict[str, object]]],
     identity_complete: bool,
-) -> tuple[dict[str, object] | None, str | None]:
-    """Resolve one prerequisite row to its single target record.
+) -> dict[str, object] | None:
+    """Return the target record a prerequisite row resolves to, or None.
 
-    Returns ``(target, None)`` when the row names one readable, identified
-    package other than the source.  Otherwise returns the unresolved reason; a
-    row naming the source itself returns ``(source, "self_edge")`` and every
-    other unresolved row returns ``(None, reason)``.
+    A row resolves only when it names exactly one readable, identified package
+    other than the source, and the scan's identity coverage is complete.  A row
+    naming the source itself never resolves, so the board keeps drawing it as
+    an unresolved target.
     """
     target_id = row["target_package_id"]
-    if not row.get("valid", False) or target_id is None:
-        return None, "invalid_prerequisite"
+    if target_id is None or not identity_complete:
+        return None
     candidates = index.get(target_id, [])
-    if not candidates:
-        return None, (
-            "identity_coverage_incomplete" if not identity_complete else "missing_target"
-        )
-    if len(candidates) > 1:
-        return None, "duplicate_target"
+    if len(candidates) != 1:
+        return None
     target = candidates[0]
-    if target.get("read_diagnostic") in {"unreadable_anchor", "nonregular_anchor"}:
-        return None, "target_unreadable"
-    if target.get("read_diagnostic") == "changed_during_read":
-        return None, "target_changed_during_read"
-    if not identity_complete:
-        return None, "identity_coverage_incomplete"
+    if target is source or target.get("read_diagnostic") is not None:
+        return None
     if target.get("package_id") != target_id or not target.get("relationship"):
-        return None, "target_invalid_identity"
-    if target is source:
-        return target, "self_edge"
-    return target, None
+        return None
+    return target
 
 
 def _edge(
@@ -598,91 +560,16 @@ def _edge(
     row: dict[str, object],
     index: dict[str, list[dict[str, object]]],
     identity_complete: bool,
-    completion_policy: tuple[str, ...] | None,
-    completion_policy_valid: bool,
 ) -> dict[str, object]:
-    kind = row.get("kind")
-    target_id = row["target_package_id"]
-    if kind == "completion":
-        edge: dict[str, object] = {
-            "kind": "completion",
-            "target_package_id": target_id,
-            "observed_stage": None,
-            "resolved_state": "unknown",
-            "reason": "invalid_prerequisite",
-        }
-    else:
-        claim_name = row.get("claim_name")
-        edge = {
-            "kind": "claim",
-            "target_package_id": target_id,
-            "claim_name": claim_name,
-            "observed_state": None,
-            "observed_evidence_ref": None,
-            "resolved_state": "unknown",
-            "reason": "invalid_prerequisite",
-        }
-    target, unresolved = _resolve_edge_target(source, row, index, identity_complete)
-    if target is None:
-        edge["reason"] = unresolved
-        return edge
-    target_relationship = target.get("relationship")
-    if unresolved == "self_edge":
-        if kind == "completion":
-            edge["observed_stage"] = target["stage"]
-        else:
-            claim_name = row["claim_name"]
-            claim = next(
-                (
-                    item
-                    for item in target_relationship["claims"]
-                    if item["name"] == claim_name
-                ),
-                None,
-            )
-            if claim is not None:
-                edge["observed_state"] = claim["state"]
-                edge["observed_evidence_ref"] = claim["evidence_ref"]
-        edge["reason"] = "self_edge"
-    else:
-        if kind == "completion":
-            edge["observed_stage"] = target["stage"]
-            if not completion_policy_valid:
-                edge["reason"] = "completion_policy_invalid"
-            elif completion_policy is None or not completion_policy:
-                edge["reason"] = "completion_policy_needed"
-            elif target["stage"] in completion_policy:
-                edge["resolved_state"] = "satisfied"
-                edge["reason"] = "completion_satisfied"
-            else:
-                edge["resolved_state"] = "unsatisfied"
-                edge["reason"] = "completion_unsatisfied"
-        else:
-            claim_name = row["claim_name"]
-            claim = next(
-                (
-                    item
-                    for item in target_relationship["claims"]
-                    if item["name"] == claim_name
-                ),
-                None,
-            )
-            if claim is None:
-                edge["reason"] = "missing_claim"
-            else:
-                edge["observed_state"] = claim["state"]
-                edge["observed_evidence_ref"] = claim["evidence_ref"]
-                if claim["invalid"]:
-                    edge["reason"] = "invalid_claim"
-                elif claim["state"] == "satisfied":
-                    edge["resolved_state"] = "satisfied"
-                    edge["reason"] = "claim_satisfied"
-                elif claim["state"] == "unsatisfied":
-                    edge["resolved_state"] = "unsatisfied"
-                    edge["reason"] = "claim_unsatisfied"
-                else:
-                    edge["reason"] = "claim_unknown"
-    return edge
+    """Serve one prerequisite row as its target and resolution reason."""
+    return {
+        "target_package_id": row["target_package_id"],
+        "reason": (
+            "resolved"
+            if _resolve_edge_target(source, row, index, identity_complete)
+            else "unresolved"
+        ),
+    }
 
 
 def _render_entry(
@@ -691,23 +578,14 @@ def _render_entry(
     identity_complete: bool,
     program_index: dict[str, list[dict[str, object]]],
     program_coverage_complete: bool,
-    completion_policy: tuple[str, ...] | None,
-    completion_policy_valid: bool,
 ) -> dict[str, object]:
     relationship = record["relationship"]
     if relationship is None:
         relationship = {
-            "participation": "legacy",
-            "claims": [],
             "prerequisites": [],
-            "direct_prerequisite_state": "relationship_unavailable",
             "program": {
                 "program_id": None,
                 "title": None,
-                "resolution": "not_declared",
-            },
-            "superseded_by": {
-                "package_id": None,
                 "resolution": "not_declared",
             },
         }
@@ -716,52 +594,11 @@ def _render_entry(
         program_index,
         program_coverage_complete,
     )
-    _resolve_successor(
-        relationship,
-        index,
-        identity_complete,
-    )
-    prerequisites = relationship["prerequisites"]
     rendered_edges = [
-        _edge(
-            record, row, index, identity_complete,
-            completion_policy, completion_policy_valid,
-        )
-        for row in prerequisites
+        _edge(record, row, index, identity_complete)
+        for row in relationship["prerequisites"]
     ]
-    rendered_edges.sort(
-        key=lambda edge: (
-            str(edge["target_package_id"] or ""),
-            str(edge["kind"]),
-            str(edge.get("claim_name") or ""),
-            str(edge.get("observed_stage") or ""),
-        )
-    )
-    if relationship["participation"] != "available":
-        direct_state = "relationship_unavailable"
-    elif not rendered_edges:
-        direct_state = "no_declared_prerequisites"
-    elif any(edge["resolved_state"] == "unknown" for edge in rendered_edges):
-        direct_state = "unknown"
-    elif any(edge["resolved_state"] == "unsatisfied" for edge in rendered_edges):
-        direct_state = "unsatisfied"
-    else:
-        direct_state = "satisfied"
-    rendered_claims = [
-        {key: claim[key] for key in ("name", "state", "evidence_ref")}
-        for claim in relationship["claims"]
-    ]
-    rendered_claims.sort(key=lambda claim: str(claim["name"]))
-    rendered_program = dict(relationship["program"])
-    rendered_successor = dict(relationship["superseded_by"])
-    relationship_out = {
-        "participation": relationship["participation"],
-        "claims": rendered_claims,
-        "prerequisites": rendered_edges,
-        "direct_prerequisite_state": direct_state,
-        "program": rendered_program,
-        "superseded_by": rendered_successor,
-    }
+    rendered_edges.sort(key=lambda edge: str(edge["target_package_id"] or ""))
     package_path = str(record["package_path"])
     path_parts = package_path.split("/")
     project, stage = path_parts[0], path_parts[1]
@@ -772,7 +609,10 @@ def _render_entry(
         "stage": stage,
         "declared": record["declared"],
         "reported_fields": record["reported_fields"],
-        "relationship": relationship_out,
+        "relationship": {
+            "prerequisites": rendered_edges,
+            "program": dict(relationship["program"]),
+        },
     }
 
 
@@ -925,10 +765,10 @@ def _build_catalog(
 ) -> str:
     """Build the relationship catalog from one captured scan."""
     completion_policy_value = _completion_policy(completed_stage_names)
-    completion_policy_valid = completion_policy_value is not _INVALID_POLICY
     completion_policy = (
         completion_policy_value
-        if completion_policy_valid and completion_policy_value is not None
+        if completion_policy_value is not _INVALID_POLICY
+        and completion_policy_value is not None
         else None
     )
     # Terminal stages are the literal stages the account marks as "counts as
@@ -936,9 +776,9 @@ def _build_catalog(
     # display grouping only: the board keeps finished rows on the page and the
     # "Hide terminal rows" control decides whether they are shown.
     #
-    # Marking a stage finished is a workflow assertion that satisfies whole-item
-    # completion dependencies.  The policy is saved per workspace root; the
-    # browser-local row control changes only the displayed board.
+    # The policy also answers which packages are finished, for the package
+    # heads a checkout read joins against.  It never evaluates a prerequisite:
+    # an edge is resolved by the target it names alone.
     #
     # The completion policy is already canonical (sorted and unique) because it
     # comes from ``_validate_completed_stage_names``.  An invalid or absent
@@ -987,8 +827,6 @@ def _build_catalog(
             identity_complete,
             program_index,
             program_coverage_complete,
-            completion_policy,
-            completion_policy_valid,
         )
         for record in records
     ]
@@ -1156,8 +994,9 @@ class PackageScanRecord:
     stage folder name.  ``read_diagnostic`` is the catalog's read diagnostic for
     the specification (``None`` when it was read).  ``relationship`` is the
     parsed relationship (``None`` when the header was not readable), whose
-    ``prerequisites`` rows include rows of kind ``completion``.  A consumer that
-    needs the specification text reads ``package_path`` under the root itself.
+    ``prerequisites`` rows carry the target package ID a completion row names
+    and nothing else.  A consumer that needs the specification text reads
+    ``package_path`` under the root itself.
     """
 
     package_path: str

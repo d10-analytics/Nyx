@@ -82,9 +82,7 @@ def _write_fictional_stages(specification_root: Path) -> None:
             continue
         lines = [f"# {STAGE_LABELS[stage]} package", f"Package ID: {PACKAGE_IDS[stage]}"]
         if stage == "Queue":
-            lines.append(f"Prerequisite: {PACKAGE_IDS['Done']} | release")
-        if stage == "Done":
-            lines.append(f"Claim: release | satisfied | sha256:{'a' * 64}")
+            lines.append(f"Completion Prerequisite: {PACKAGE_IDS['Done']}")
         package_path.joinpath("spec.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -120,17 +118,11 @@ def _assert_catalog(value: dict[str, object]) -> None:
     assert all("board_visible" not in entry for entry in entries)
     assert "visibility" not in value
     queue = next(entry for entry in entries if entry["stage"] == "Queue")
-    assert queue["relationship"]["direct_prerequisite_state"] == "satisfied"
-    prerequisite = queue["relationship"]["prerequisites"][0]
-    assert prerequisite == {
-        "kind": "claim",
-        "claim_name": "release",
-        "observed_evidence_ref": "sha256:" + "a" * 64,
-        "observed_state": "satisfied",
-        "reason": "claim_satisfied",
-        "resolved_state": "satisfied",
+    assert set(queue["relationship"]) == {"prerequisites", "program"}
+    assert queue["relationship"]["prerequisites"] == [{
         "target_package_id": PACKAGE_IDS["Done"],
-    }
+        "reason": "resolved",
+    }]
     done = next(entry for entry in entries if entry["stage"] == "Done")
     assert done["declared"]["title"] == "Done package"
 

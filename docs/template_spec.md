@@ -15,18 +15,15 @@ Package ID: <lowercase UUIDv4>
 
 Every new package declares exactly one `Package ID: <lowercase UUIDv4>` scalar.
 The package may additionally declare one `Program Membership: <program UUID>`
-scalar, one `Superseded By: <package UUID>` scalar, zero or more
-`Prerequisite: <package UUID> | <claim-name>` rows, zero or more
-`Completion Prerequisite: <package UUID>` rows, and claims in either form:
-`Claim: <name> | satisfied | <typed-provenance>` or
-`Claim: <name> | <unsatisfied|unknown>`. Place all declarations in the metadata
-header above the first `##` heading; omit optional declarations that do not
-apply. Claim names match `[a-z][a-z0-9-]{0,63}`. Typed provenance is exactly a
-lowercase `git-object-sha1:<40 hex>`, `git-object-sha256:<64 hex>`, or
-`sha256:<64 hex>` token. An invalid value is not interpreted: Nyx leaves the
-affected relationship unresolved or unknown, and the validator does not check
-these fields. Existing packages without an identity remain legacy; new
-packages must replace the Package ID placeholder with a generated value.
+scalar, one `Superseded By: <package UUID>` scalar, and zero or more
+`Completion Prerequisite: <package UUID>` rows, the only prerequisite row. Place
+all declarations in the metadata header above the first `##` heading; omit
+optional declarations that do not apply. Each `Completion Prerequisite:` row
+names exactly one package UUID; a value that is not exactly one UUID leaves the
+relationship unresolved. The validator rejects a retired `Prerequisite:` or
+`Claim:` header line in a live lifecycle folder. Existing packages without an
+identity remain legacy; new packages must replace the Package ID placeholder
+with a generated value.
 
 `Branch:` names the package's feature branch exactly as git spells it, without
 Markdown formatting; write `Branch: not applicable — <reason>` when the target

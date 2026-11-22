@@ -1,17 +1,14 @@
 # Define the route API contract
 Target repo: Trail_API
 Package ID: 55555555-5555-4555-8555-555555555555
-Claim: contract-ready | satisfied | sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-Claim: implementation-ready | unsatisfied
 
 ## Purpose
 
-Record the agreed route API contract. This specification covers the contract,
-not its implementation: contract-ready is satisfied, while implementation-ready
-remains unsatisfied. Its stage does not make every claim satisfied.
+Record the agreed route API contract: the fields and endpoints the route preview
+plans against. This work item is the contract alone. Building the API is a
+separate work item, **Build the route API**.
 
-The repeated-f hash is fictional evidence for this demonstration only.
-The API contract is in the literal `Done` stage, so it can satisfy the web
-feature's whole-item completion prerequisite only when the workspace explicitly
-marks `Done` as a completed stage. That setting is separate from this item's
-named claims and does not turn the fictional evidence into verified proof.
+The API contract is in the literal `Done` stage. A dependent's arrow stays
+outstanding until the board serves that this work item merged. Marking `Done` as
+a finished stage lets **Hide terminal rows** hide this card, and it changes no
+arrow.

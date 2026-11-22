@@ -922,10 +922,11 @@ Several packages can name the same branch of the same repository, for example an
 archived package beside the one still active. They share the branch, and each has
 its own Code Status. A package counts as finished only when its stage folder is
 one of the stages selected under **Counts as finished** for the workspace (see
-[Your specification workspace](workspaces.md#define-whole-item-completion)). The
-stage's name, the `Status:` header and the package's other fields play no part. With no stage
-selected, `package_scan.finished_policy` is `not_configured` and no package is
-finished.
+[Your specification workspace](workspaces.md#mark-finished-work-items)). That
+setting decides finished rows, **Hide terminal rows** and this Code Status, and it
+decides no prerequisite. The stage's name, the `Status:` header and the package's
+other fields play no part. With no stage selected,
+`package_scan.finished_policy` is `not_configured` and no package is finished.
 
 **Remote copy.** Besides the local branches, the branch may have a copy on the
 remote. Under a live check it is the remote's own answer. Under a recorded check
@@ -1063,9 +1064,9 @@ the unsaved draft with the current saved order. Any other failed Save leaves the
 prior saved order and unsaved draft in place so you can retry.
 
 The same collapsed **Board settings** panel also lists **Counts as finished**
-beside every literal stage name. Select the stages whose names define whole-item
-completion, then choose **Save** to persist the row order and completion policy
-together. **Cancel** drops both kinds of unsaved change; **Reset** clears the
+beside every literal stage name. Select the stages whose names count as finished,
+then choose **Save** to persist the row order and completion policy together.
+**Cancel** drops both kinds of unsaved change; **Reset** clears the
 current root's row order and completed-stage set. Saved names that are
 temporarily absent remain available in the panel as literal settings,
 marked as unavailable when appropriate. If settings cannot be loaded, choose
@@ -1411,12 +1412,13 @@ a checkouts read was already in flight at the save, until the next ten-second
 check), and, after a configuration change saved elsewhere, until the next check
 installs the new catalog.
 
-An explicit completion policy affects only whole-item `Completion Prerequisite`
-relationships. Moving a work item into a selected stage can satisfy that
-relationship; moving it out reopens it. Hiding finished rows does not change
-dependency results. No stage is completed automatically because it is called
-`Done`, `Cancelled`, or `Archive`, and a completed stage is a recorded workflow
-assertion rather than evidence verification.
+An explicit completion policy decides finished work only. It decides which cards
+are finished rows, which rows **Hide terminal rows** hides, and the Code Status of
+a package. It decides no prerequisite: a prerequisite is outstanding until the
+board reads its target as served merged on `main`, and hiding a finished row
+changes no dependency result. No stage is finished automatically because it is
+called `Done`, `Cancelled`, or `Archive`, and a finished stage is a recorded
+workflow assertion rather than evidence verification.
 
 The **Hide empty rows and columns** checkbox starts checked. It compacts only
 the currently displayed catalog, and its value is persisted in browser local
@@ -1694,9 +1696,9 @@ diagnostics in `discovery_diagnostics` must be empty. Both identity and program
 coverage must be complete, and `programs` must be empty. Confirm exactly the four
 work items remain in the catalog and every project and stage inventory
 availability is complete, including the empty `Planning` stage
-and `Community_Resources` project. Confirm the festival's completion prerequisite still targets the
-permit, observes `Done`, and resolves as satisfied with reason
-`completion_satisfied`. In the actual browser, verify there is no workspace or
+and `Community_Resources` project. Confirm the festival's completion prerequisite
+still targets the permit and is served with reason `resolved`. In the actual
+browser, verify there is no workspace or
 refresh issues panel (`#board-issues` must be absent, not merely collapsed or
 hidden). Keep **Board settings** closed in every image.
 

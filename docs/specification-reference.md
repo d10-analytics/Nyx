@@ -23,9 +23,7 @@ Put metadata in that header, one field per line.
 | `Branch: name` | Optional. The git branch the work is done on, or a value starting with `not applicable` (then a reason) for work that has no branch. `nyx checkouts` reads it, and its value also stays searchable reported text. |
 | `Baseline: commit` | Optional. The default-branch commit the work started from. The first word must be a full 40 or 64 character lower-case hex commit ID, optionally in one pair of backticks; no value is `absent` and any other value is `invalid` for `nyx checkouts`, which compares it with the target clone's default branch and reports when the base has moved. Its value also stays searchable reported text. `Sanity Baseline:` is a different field. |
 | `Program Membership: UUID` | Optional membership in a named group of work. |
-| `Claim: name \| state [\| evidence]` | A named outcome this specification reports. |
-| `Prerequisite: UUID \| claim-name` | A required outcome from another specification. |
-| `Completion Prerequisite: UUID` | A whole-item requirement satisfied only when the target's literal stage is in this workspace's explicit completed-stage policy. |
+| `Completion Prerequisite: UUID` | The one prerequisite row. It names a whole work item that the dependent needs, outstanding until its target is served merged. |
 | `Superseded By: UUID` | Optional reference to a replacement specification. |
 
 ## Branch and target repository
@@ -52,7 +50,7 @@ becomes a Code Status is described under
 ## File syntax and displayed terms
 
 The field spellings above are the stable `spec.md` file contract. Keep writing
-`Package ID`, `Target repo`, `Claim`, and `Prerequisite` exactly as shown, even
+`Package ID`, `Target repo`, and `Completion Prerequisite` exactly as shown, even
 when the browser uses friendlier labels. Nyx presents each specification as a
 **work item**, its directory location as a stage, and a `Target repo` value as
 **Target Folder** on the card when that context is useful. Each card shows its
@@ -78,19 +76,15 @@ content and are never decoded as part of the header, so an undecodable byte in
 the header before the cut still makes the item an invalid package while the
 same byte after the cut does not.
 
-For example, a community-event item can point to two outcomes from one permit
-item by repeating the `Prerequisite` field:
+For example, a community-event item can wait on one whole permit item:
 
 ```text
-Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | venue-confirmed
-Prerequisite: 123e4567-e89b-42d3-a456-426614174102 | permit-approved
+Completion Prerequisite: 123e4567-e89b-42d3-a456-426614174102
 ```
 
-The providing item records those outcomes with separate `Claim` rows. The file
-syntax remains unchanged while the board draws an arrow only for an outstanding
-prerequisite. The work item panel's **Needs** list names every outstanding
-prerequisite of the card. A provider in a finished row appears when **Hide
-terminal rows** is unchecked.
+The row names the permit work item rather than a part of it. The
+[Prerequisites](#prerequisites) section says when the row is outstanding. A
+provider in a finished row appears when **Hide terminal rows** is unchecked.
 
 Other header lines of the form `Name: value`, such as `Owner Note: waiting for
 venue confirmation`, are retained as reported text. The name may be bold, as in
@@ -99,11 +93,17 @@ but are not shown on cards and do not trigger actions. Names must start with a
 capital letter (`A`–`Z`), be at most 64 characters long, and contain no `:`,
 `*`, `` ` ``, `<`, `>`, `|`, `[`, `]`, or control characters. The field names in
 the table above (`Package ID`, `Status`, `Target repo`, `Program Membership`,
-`Claim`, `Prerequisite`, `Completion Prerequisite`, and `Superseded By`) never
+`Completion Prerequisite`, and `Superseded By`) never
 become additional reported text, in any capitalization. `Branch` and `Baseline`
 are not in that list: although each has a row in the table, its value also
 stays searchable reported text, retained under the same rules as any other
-reported field.
+reported field. The retired relationship labels Prerequisite and Claim also
+never become reported text, in any capitalization. On the board, a header line
+with either label adds no prerequisite and no entry in **Workspace issues**. The
+package validator rejects such a line in a work item under `Under_Development`,
+`Queue`, `In_Progress`, `Needs_Fixes`, `Awaiting_Retrospective` or `.pipeline`.
+It accepts the line in `Done`, `Archive` and `Reference`, so a finished work
+item keeps its text.
 Nyx ignores a line whose
 name breaks these rules; it does not shorten a long name. Names are compared
 case-insensitively for `A`–`Z`; the first occurrence with a nonempty value wins.
@@ -150,11 +150,11 @@ Bold names are documented for reported-text fields only. The core field labels
 in the table above are written plain, exactly as shown.
 
 Every UUID field (`Package ID`, `Program ID`, `Program Membership`,
-`Prerequisite`, `Completion Prerequisite`, and `Superseded By`) takes a
+`Completion Prerequisite`, and `Superseded By`) takes a
 lowercase version 4 UUID only; an uppercase or otherwise invalid value is not
 accepted. The effect depends on the field. An invalid `Package ID` makes the item
 lose its identity, so its dependents show **unresolved target** and **Workspace
-issues** lists nothing. An invalid `Prerequisite` or `Completion Prerequisite`
+issues** lists nothing. An invalid `Completion Prerequisite`
 shows **unresolved target**. An invalid `Program Membership` or `Superseded By`
 leaves the item's identity intact and leaves only that relationship unresolved.
 An invalid `Program ID` makes its program descriptor invalid, as described under
@@ -164,69 +164,37 @@ Generate fresh lowercase IDs with `python3 -c 'import uuid; print(uuid.uuid4())'
 on Linux, `uuidgen | tr '[:upper:]' '[:lower:]'` on macOS (`uuidgen` prints
 uppercase), or `[guid]::NewGuid().ToString()` in Windows PowerShell. Use each
 `Package ID` once in a workspace and retain it when moving the work item. Repeat
-`Claim` and `Prerequisite` rows for distinct outcomes and requirements; do not
+`Completion Prerequisite` rows for distinct work items; do not
 repeat scalar fields such as `Package ID` or `Program Membership`.
 
-## Claims and prerequisites
+## Prerequisites
 
-A claim describes a named outcome, such as `contract-ready`. Claim names use
-lowercase letters, digits, and hyphens, start with a letter, and have at most
-64 characters. Claim states are `satisfied`, `unsatisfied`, or `unknown`.
+`Completion Prerequisite: UUID` is the one prerequisite row. It names the whole
+work item that the dependent needs, and its value is exactly one lowercase
+version 4 UUID. Repeat the row for each further work item the dependent needs,
+and never repeat a scalar field such as `Package ID`. The
+[sample walkthrough](../examples/sample-specifications/README.md) shows the row
+in use.
 
-An outcome that is not ready can be recorded as:
+A prerequisite is outstanding until the board reads its target as served merged
+on `main`. Board cards draw an arrow only for an outstanding prerequisite. The
+work item panel's **Needs** list names every outstanding prerequisite of the
+card. A provider in a finished row appears when **Hide terminal rows** is
+unchecked.
 
-```text
-Claim: implementation-ready | unsatisfied
-```
-
-Use `unknown` when its state is not known. A satisfied claim requires an evidence
-reference. This fictional example uses a repeated-f placeholder hash:
-
-```text
-Claim: contract-ready | satisfied | sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-```
-
-Supported evidence formats are `sha256:` or `git-object-sha256:` followed by
-64 lowercase hexadecimal characters, or `git-object-sha1:` followed by 40.
-Use a reference to the actual evidence in your own workspace. Nyx reads the
-reference and validates its format; it does not retrieve or verify that evidence.
-
-A dependent specification refers to the providing work item's ID and claim name:
-
-```text
-Prerequisite: 55555555-5555-4555-8555-555555555555 | contract-ready
-```
-
-This points to the API contract in the [sample workspace](../examples/sample-specifications/README.md).
-In your workspace, replace the ID and claim name with those of the outcome you need.
-
-For a whole-item completion requirement, use the distinct header below and no
-claim name:
-
-```text
-Completion Prerequisite: 55555555-5555-4555-8555-555555555555
-```
-
-`Completion Prerequisite: UUID` is the one exact completion grammar. A one-part
-`Prerequisite: UUID` is not an alternate spelling and remains invalid. Keep
-`Prerequisite: UUID | claim-name` for named outcomes; the two relationships may
-appear together on one dependent item. Completion never uses a magic claim name,
-does not rewrite claim state, and does not verify the claim's evidence.
-
-Progress and dependency information comes from your specification files. Board
-cards draw an arrow only for an outstanding prerequisite, and the work item
-panel's **Needs** list names every outstanding prerequisite. Missing, ambiguous,
-or malformed information can leave a relationship unknown or unavailable. It is
-not treated as satisfied. Moving a work item to `Done` does not satisfy its
-claims automatically.
+Progress and dependency information comes from your specification files.
+Missing, ambiguous, or malformed information can leave a relationship unknown or
+unavailable. Nyx never treats it as satisfied, and a value that is not exactly
+one UUID names no target.
 
 The completion policy is configured in the collapsed **Board settings** panel by
 selecting literal stage names beside **Counts as finished**. It is saved per
-canonical workspace root and can include temporarily absent names.
-Without a configured policy, a completion dependency is **unknown**; the board
-shows no prompt or explanation. Row order, stage spelling,
-`Cancelled`, and `Archive` do not infer completion. A completed stage is a
-recorded workflow assertion rather than evidence verification.
+canonical workspace root and can include temporarily absent names. Without a
+configured policy, no row is a finished row and no package is finished. The
+setting decides finished rows, **Hide terminal rows** and the Code Status that
+`nyx checkouts` reports, and it decides no prerequisite. Row order, stage
+spelling, `Cancelled`, and `Archive` do not infer a finished row. A completed
+stage is a recorded workflow assertion rather than evidence verification.
 
 The selected finished stages also group terminal rows on the board. The **Hide
 terminal rows** control starts checked, so finished rows are hidden until the

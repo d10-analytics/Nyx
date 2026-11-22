@@ -7750,7 +7750,6 @@ def build_prerequisite_world(base: Path) -> PrerequisiteWorld:
         f"Completion Prerequisite: {PW_MISSING_ID}",
         "Completion Prerequisite: not-an-identifier",
         *needs("on-trunk", "no-target"),
-        f"Prerequisite: {PW_IDS['pre-a']} | released",
     )
     declare("dep-finished", "Shipped", f"Target repo: {w.l}", *needs("pre-a"))
     declare("dep-missing", "Drafts", f"Target repo: {w.nowhere}", *needs("pre-a"))

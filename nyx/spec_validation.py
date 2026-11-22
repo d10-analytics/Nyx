@@ -36,7 +36,12 @@ from .spec_body import (
     transitive_referenced_ids,
     within,
 )
-from .spec_header import branch_name_is_lexical, metadata_value, metadata_values
+from .spec_header import (
+    RETIRED_HEADER_LABELS,
+    branch_name_is_lexical,
+    metadata_value,
+    metadata_values,
+)
 
 LIFECYCLE_DIRECTORIES = {
     "Under_Development": "under_development",
@@ -125,6 +130,16 @@ BRANCH_GATED_LIFECYCLES = frozenset(
 )
 
 
+# A package still being written may not keep a retired relationship label; Done,
+# Archive and Reference keep their text, and a path outside the specification
+# root is never live, because ``package_lifecycle`` reads a lifecycle from any
+# parent folder name.
+LIVE_LIFECYCLES = frozenset({"under_development"}) | BRANCH_GATED_LIFECYCLES
+
+# The retired tuple lists the replaced label first, then the deleted one.
+_REPLACED_RETIRED_LABEL = RETIRED_HEADER_LABELS[0]
+
+
 BRANCH_NOT_APPLICABLE = re.compile(r"^not applicable \u2014 \S")
 
 
@@ -156,6 +171,29 @@ def _validate_branch_header(lines: list[str], lifecycle: str) -> list[str]:
         errors.append("duplicate Branch: header")
     elif not _branch_value_is_valid(branches[0]):
         errors.append(f"invalid Branch: value: {branches[0]}")
+    return errors
+
+
+def _validate_retired_labels(
+    lines: list[str], lifecycle: str, *, inside_root: bool
+) -> list[str]:
+    """Reject each retired relationship label a live package keeps.
+
+    One error names the label, the line's value and the replacement row, or
+    tells the author to delete the line.  A finished package and a package
+    outside the specification root are not rejected.
+    """
+    if not inside_root or lifecycle not in LIVE_LIFECYCLES:
+        return []
+    errors: list[str] = []
+    for label in RETIRED_HEADER_LABELS:
+        advice = (
+            "use Completion Prerequisite: <UUID>"
+            if label == _REPLACED_RETIRED_LABEL
+            else "delete the line"
+        )
+        for value in metadata_values(lines, label):
+            errors.append(f"retired header {label}: {value} is not accepted; {advice}")
     return errors
 
 
@@ -575,6 +613,11 @@ def _validate_spec_lines(
     )
     errors.extend(_validate_closure_ledger(lines, required=ledger_required))
     errors.extend(_validate_branch_header(lines, lifecycle))
+    errors.extend(
+        _validate_retired_labels(
+            lines, lifecycle, inside_root=within(spec_path, spec_root)
+        )
+    )
 
     definitions: list[str] = []
     for line in lines:

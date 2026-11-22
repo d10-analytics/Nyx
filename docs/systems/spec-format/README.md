@@ -8,7 +8,10 @@ README is narrative only.
 - Owns the reading of a specification anchor's header: the bounded header cut,
   the BOM-aware UTF-8 header text, the single-value metadata lines, and the
   package-owned relationship rows (`Package ID`, `Program Membership`,
-  `Superseded By`, `Prerequisite`, `Completion Prerequisite`, `Claim`).
+  `Superseded By`, `Completion Prerequisite`). The retired `Prerequisite` and
+  `Claim` labels are not header labels: a header line carrying one adds no
+  relationship row. The catalog also keeps such a line out of the reported
+  fields, so it is not searchable text.
 - Owns the lexical rules of a git branch name. Callers add their own bounds and
   normalisation before calling it.
 - Owns the parsing of specification text in `nyx/spec_body.py`: section bodies,
@@ -20,8 +23,9 @@ README is narrative only.
 - Owns the package validator in `nyx/spec_validation.py`: the required
   sections, the sanity, closure and critique-contract rules, the verification
   authorities, task and traceability rules, the branch-header check (strict
-  `not applicable — <reason>` grammar, then `branch_name_is_lexical`) and the
-  lifecycle-folder rules. Its public names are `validate_spec`,
+  `not applicable — <reason>` grammar, then `branch_name_is_lexical`), the
+  retired-label rule that rejects the retired relationship rows in a live
+  package, and the lifecycle-folder rules. Its public names are `validate_spec`,
   `validate_package`, `validate_package_attachments` and `package_lifecycle`.
 - `package_lifecycle`, `validate_spec` and `validate_package`, the functions
   that determine a package's stage folder, take the specification root
@@ -52,6 +56,7 @@ README is narrative only.
 - `spec_header.py` and `spec_body.py` import nothing from Nyx;
   `spec_validation.py` imports the other two and reads the metadata lines only
   through `metadata_value` and `metadata_values`.
-- The header byte limit, the header cut, the six header labels and the metadata
-  readers are defined only in `nyx/spec_header.py`; consumers import them and
-  never define a second copy. `tests/test_spec_header.py` enforces this.
+- The header byte limit, the header cut, the four header labels, the retired
+  relationship labels and the metadata readers are defined only in
+  `nyx/spec_header.py`; consumers import them and never define a second copy.
+  `tests/test_spec_header.py` enforces this.
