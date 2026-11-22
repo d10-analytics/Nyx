@@ -2018,6 +2018,15 @@ def reported_contract_cases():
     add("entry-diagnostics", lambda v, e: e.update(diagnostics=[]))
     add("transitive", lambda v, e: e.update(transitive_diagnostics=[]))
     add("program-diagnostics", lambda v, e: e["relationship"]["program"].update(diagnostics=[]))
+    add("unresolved-edge", lambda v, e: e["relationship"].update(
+        prerequisites=[{"target_package_id": None, "reason": "unresolved"}]
+    ), True)
+    add("unresolved-edge-target", lambda v, e: e["relationship"].update(
+        prerequisites=[{
+            "target_package_id": v["entries"][1]["package_id"],
+            "reason": "unresolved",
+        }]
+    ), True)
     add("catalog-program-diagnostics", lambda v, e: v["programs"][0].update(diagnostics=[]))
     for name, fields in [
         ("sixty-four", [{"name": f"N{i:02}", "value": "ok"} for i in range(64)]),

@@ -445,7 +445,12 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
                         "status": "ready",
                     },
                     "relationship": {
-                        "prerequisites": [],
+                        "prerequisites": [
+                            {
+                                "target_package_id": "123e4567-e89b-42d3-a456-426614174099",
+                                "reason": "unresolved",
+                            }
+                        ],
                         "program": {
                             "program_id": None,
                             "title": None,
@@ -516,7 +521,19 @@ def test_installed_wheel_serves_api_and_real_browser_behavior_without_checkout_i
             body = response.read()
             connection.close()
             assert response.status == 200
-            assert json.loads(body)["entries"][0]["package_path"] == "Fictional/Queue/installed-demo"
+            served = json.loads(body)["entries"][0]
+            assert served["package_path"] == "Fictional/Queue/installed-demo"
+            assert served["relationship"] == {
+                "prerequisites": [{
+                    "target_package_id": "123e4567-e89b-42d3-a456-426614174099",
+                    "reason": "unresolved",
+                }],
+                "program": {
+                    "program_id": None,
+                    "title": None,
+                    "resolution": "not_declared",
+                },
+            }
 
             pytest.importorskip("playwright.sync_api")
             from playwright.sync_api import sync_playwright
