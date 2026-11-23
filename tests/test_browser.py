@@ -28,7 +28,7 @@ from test_checkouts import (
 from test_server import embedded_put, raw_catalog, reported_contract_cases
 
 from nyx import models
-from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
+from nyx.app_runtime import REFRESH_INTERVAL, ApplicationRuntime
 from nyx.catalog import scan_catalog
 from nyx.checkouts import PackageScan, collect_checkouts
 from nyx.models import SCHEMA_VERSION, canonical_digest, parse_catalog
@@ -614,7 +614,7 @@ def checkouts_envelope(document):
         "checkouts": document,
         "remote_checks": {
             "state": "idle",
-            "interval_seconds": REMOTE_CHECK_INTERVAL,
+            "interval_seconds": REFRESH_INTERVAL,
             "next_due_at": None,
             "last": None,
         },
@@ -905,14 +905,23 @@ def fire_poll(page):
     response.value.finished()
 
 
-# Records the status of every board response the page receives, including the
-# ones its first load sends before a test can attach a listener.
+# Records every board request the page starts, with its method and its status,
+# including the ones its first load sends before a test can attach a listener.
 RESPONSE_RECORDER = """
+window.checkoutsRequests = [];
 window.checkoutsResponses = [];
+window.catalogRequests = [];
 window.catalogResponses = [];
 const nyxRecordFetch = window.fetch;
 window.fetch = function (...args) {
   const route = String(args[0]);
+  const method = (args[1] && args[1].method) || "GET";
+  if (route.includes("/api/checkouts")) {
+    window.checkoutsRequests.push({route: route, method: method});
+  }
+  if (route.includes("/api/catalog")) {
+    window.catalogRequests.push({route: route, method: method});
+  }
   return nyxRecordFetch(...args).then(function (response) {
     if (route.includes("/api/checkouts")) window.checkoutsResponses.push(response.status);
     if (route.includes("/api/catalog")) window.catalogResponses.push(response.status);
@@ -5646,6 +5655,19 @@ def test_return_to_page_checks_at_once_and_element_focus_does_not(open_page):
     settle(5, 5)
     assert page.evaluate("window.removedCards") == 0
 
+    # The poll joins the return and the focus triggers, and none of them writes:
+    # every request to a checkouts path is a GET.
+    for _ in range(3):
+        fire_checkouts_poll(page)
+    settle_frames(page)
+    checkouts_requests = page.evaluate("window.checkoutsRequests")
+    assert checkouts_requests, "the page made no checkouts request"
+    assert {request["method"] for request in checkouts_requests} == {"GET"}
+    assert all("/api/checkouts" in request["route"] for request in checkouts_requests)
+    assert {request["method"] for request in page.evaluate("window.catalogRequests")} == {
+        "GET"
+    }
+
 
 def test_checkouts_tick_is_skipped_while_one_request_is_in_flight(open_page, real_checkouts):
     double = BrowserCheckouts(real_checkouts.document_zero)
@@ -6960,7 +6982,7 @@ def checkouts_remote_envelope(document, *, state="idle", next_due_at=None, last=
     envelope = checkouts_envelope(copy.deepcopy(document))
     envelope["remote_checks"] = {
         "state": state,
-        "interval_seconds": REMOTE_CHECK_INTERVAL,
+        "interval_seconds": REFRESH_INTERVAL,
         "next_due_at": next_due_at,
         "last": last,
     }
@@ -10268,8 +10290,13 @@ def test_checkouts_settings_sentence_follows_a_board_settings_save(
 
     page.locator("#stage-order-editor summary").click()
     page.get_by_role("checkbox", name="Counts as finished: Shipped").uncheck()
+    reads = page.evaluate("window.checkoutsResponses.length")
     page.get_by_role("button", name="Save").click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
+    # The save asks for one checkouts read, which answers with the document
+    # collected under the settings from before it, so the sentence appears now.
+    wait_for_responses(page, "checkoutsResponses", reads + 1)
+    settle_frames(page)
     assert settings.revision == "2" * 64
     playwright.expect(line).to_contain_text(SETTINGS_SENTENCE)
     assert line.inner_text().count(SETTINGS_SENTENCE) == 1
@@ -13073,17 +13100,26 @@ def test_board_settings_save_keeps_a_checkout_folders_draft_current(
     """The reader's own Board settings save is not a change made elsewhere to the folders."""
     settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
     settings.folders = ["/work/alpha"]
-    page, _ = open_two_editors(open_page, attention_checkouts, settings)
+    page, double = open_two_editors(open_page, attention_checkouts, settings)
     playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
     add_folder(page, "/work/beta")
     status = page.locator(FOLDERS_STATUS)
     playwright.expect(status).to_have_text("Unsaved checkout folder changes.")
     move_second_stage_up(page)
+    reads = page.evaluate("window.checkoutsResponses.length")
+    calls = double.calls
     board_save_button(page).click()
     playwright.expect(page.locator("#stage-order-status")).to_have_text("Board settings saved.")
     wait_for_catalog_installs(page, 2)
     saved_revision = settings.revision
     assert saved_revision != CHECKOUTS_REVISION
+
+    # The save asks for one checkout read with no poll fired, so the cards' code
+    # status follows the new settings now, not at the next tick.
+    wait_for_responses(page, "checkoutsResponses", reads + 1)
+    settle_frames(page)
+    assert page.evaluate("window.checkoutsResponses.length") == reads + 1
+    assert double.calls == calls + 1
 
     assert folder_paths(page) == ["/work/alpha", "/work/beta"]
     playwright.expect(status).to_have_text("Unsaved checkout folder changes.")

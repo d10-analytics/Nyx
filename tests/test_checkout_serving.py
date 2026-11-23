@@ -3,13 +3,13 @@
 The serving state machine runs on a manager double and an injected monotonic
 clock, so no proof spends a real interval or starts a worker: the cadence, the
 change count, the failure gate and the shutdown rules are all read from that
-double.  Real workers stay where they alone prove something: a first request's
-document is accepted by the parser, a check's live labels become a recorded
-label after the next local refresh, a push from one clone is answered against
-the other, a failed check keeps the saved record, a GitHub lookup failure
-reaches the last check's report, no service run writes a repository reference,
-and a real held check is cancelled at shutdown.  The transport is recorded by
-the program ``remote.origin.uploadpack`` names.
+double, and the double rejects a collection that asks for no network.  Real
+workers stay where they alone prove something: a first request's document is
+accepted by the parser, a run's live labels become the check record, a push
+from one clone is answered against the other, a failed check keeps the saved
+record, a GitHub lookup failure reaches the last check's report, no service run
+writes a repository reference, and a real held check is cancelled at shutdown.
+The transport is recorded by the program ``remote.origin.uploadpack`` names.
 """
 
 from __future__ import annotations
@@ -44,17 +44,15 @@ from test_server import RunningServer, StubClient, valid_catalog
 from test_server import request as http_request
 
 from nyx import checkouts, models, state, worker
-from nyx.app_runtime import (
-    LOCAL_REFRESH_INTERVAL,
-    REMOTE_CHECK_INTERVAL,
-    ApplicationRuntime,
-)
+from nyx.app_runtime import REFRESH_INTERVAL, ApplicationRuntime
 from nyx.server import CatalogError
 from nyx.worker import WorkerError
 
 # Fictional, distinct observation instants for the documents the double returns.
 _FIRST_OBSERVATION = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# The hold a run that fails with no document keeps further requests under.
+_FAILURE_HOLD = min(REFRESH_INTERVAL, 60.0)
 # The fake ``gh`` used by the lookup proof is a shell script.
 posix_only = pytest.mark.skipif(os.name == "nt", reason="needs a POSIX shell script")
 
@@ -255,6 +253,26 @@ def _settle(runtime: ApplicationRuntime, timeout: float = 10.0) -> None:
         time.sleep(0.001)
 
 
+def _threads_outside(
+    threads_before: frozenset[threading.Thread], timeout: float = 5.0
+) -> list[threading.Thread]:
+    """Live threads that were not alive before the runtime was constructed.
+
+    A run removes itself from ``_checkouts_threads`` just before its thread
+    exits, so a run thread still in its last instructions is joined first
+    instead of being counted as a stray.
+    """
+
+    deadline = time.monotonic() + timeout
+    for thread in threading.enumerate():
+        if thread in threads_before or thread.name != "nyx-checkouts-run":
+            continue
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return [
+        thread for thread in threading.enumerate() if thread not in threads_before
+    ]
+
+
 @pytest.fixture(scope="module")
 def captured_checkouts(tmp_path_factory):
     """One real collection of a real clone, captured once for the double."""
@@ -281,6 +299,7 @@ def captured_checkouts(tmp_path_factory):
 def serving(captured_checkouts):
     """A runtime over the manager double and an injected clock."""
 
+    threads_before = frozenset(threading.enumerate())
     manager = CheckoutsManagerDouble(captured_checkouts)
     clock = InjectedClock()
     runtime = ApplicationRuntime(
@@ -294,9 +313,11 @@ def serving(captured_checkouts):
         runtime=runtime,
         manager=manager,
         clock=clock,
+        threads_before=threads_before,
         captured=models.parse_checkouts(captured_checkouts),
     )
     assert manager.max_in_flight <= 1
+    assert all(call.network for call in manager.calls), "a run collected without the network"
     manager.close_admission()
     assert manager.close(time.monotonic() + 5)
 
@@ -333,12 +354,12 @@ def test_the_first_request_waits_for_one_check_and_a_concurrent_request_shares_i
     remote_checks = first_envelope["remote_checks"]
     assert set(remote_checks) == {"state", "interval_seconds", "next_due_at", "last"}
     assert remote_checks["state"] == "idle"
-    assert remote_checks["interval_seconds"] == REMOTE_CHECK_INTERVAL
+    assert remote_checks["interval_seconds"] == REFRESH_INTERVAL
     last = remote_checks["last"]
     assert set(last) == {"started_at", "finished_at", "outcome", "repositories"}
     assert last["outcome"] == "completed"
     assert remote_checks["next_due_at"] == _timestamp_after(
-        last["started_at"], REMOTE_CHECK_INTERVAL
+        last["started_at"], REFRESH_INTERVAL
     )
     [repository] = last["repositories"]
     [captured] = serving.captured["repositories"]
@@ -410,16 +431,16 @@ def test_served_requests_answer_without_a_collection(serving):
     _settle(serving.runtime)
 
 
-def test_a_clock_advance_starts_one_local_refresh_behind_the_served_document(serving):
+def test_a_clock_advance_starts_one_run_behind_the_served_document(serving):
     manager, clock = serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     refresh = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
     refresh_answer = refresh.join(timeout=5)
     assert refresh_answer["checkouts"]["observed_at"] == observed
-    assert [call.network for call in manager.calls] == [True, False]
+    assert [call.network for call in manager.calls] == [True, True]
 
     while_held = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
     assert while_held["checkouts"]["observed_at"] == observed
@@ -451,7 +472,7 @@ def test_a_held_run_from_before_a_mark_never_serves_its_document(serving):
     manager, clock = serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     trigger = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
     assert _observed(trigger.join(timeout=5)) == observed
@@ -462,7 +483,7 @@ def test_a_held_run_from_before_a_mark_never_serves_its_document(serving):
 
     manager.release(1)
     manager.wait_for_calls(3)
-    assert [call.network for call in manager.calls] == [True, False, True]
+    assert [call.network for call in manager.calls] == [True, True, True]
     manager.release(2)
 
     envelope = after_mark.join()
@@ -475,7 +496,7 @@ def test_a_held_run_that_fails_after_a_mark_opens_no_gate(serving):
     manager, clock = serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     manager.next_outcome("worker:checkouts_timeout")
     trigger = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
@@ -509,17 +530,20 @@ def test_a_failed_first_check_gates_requests_and_its_retries_reopen_it(serving):
         assert error.value.code == "checkouts_timeout"
 
     assert [call.network for call in manager.calls] == [True]
-    for _ in range(2):
-        with pytest.raises(CatalogError) as gated:
-            _Request(serving.runtime.get_checkouts).start().join(timeout=5)
-        assert gated.value.code == "checkouts_timeout"
+    # Every read inside the hold answers the same category and starts no run.
+    clock.advance(_FAILURE_HOLD - 1)
+    with pytest.raises(CatalogError) as gated:
+        _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert gated.value.code == "checkouts_timeout"
     assert len(manager.calls) == 1
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    # One second later the hold is over, well before the interval, and the
+    # read starts the next run.
+    clock.advance(1)
     manager.next_outcome("rejected")
     rejected = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
-    assert manager.calls[1].network is False
+    assert manager.calls[1].network is True
     manager.release(1)
     with pytest.raises(CatalogError) as error:
         rejected.join()
@@ -530,7 +554,7 @@ def test_a_failed_first_check_gates_requests_and_its_retries_reopen_it(serving):
     assert gated.value.code == "checkouts_protocol_error"
     assert len(manager.calls) == 2
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(_FAILURE_HOLD)
     manager.next_outcome("exception")
     crashed = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(3)
@@ -544,21 +568,21 @@ def test_a_failed_first_check_gates_requests_and_its_retries_reopen_it(serving):
     assert gated.value.code == "checkouts_failed"
     assert len(manager.calls) == 3
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(_FAILURE_HOLD)
     repaired = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(4)
     manager.release(3)
     envelope = repaired.join()
     assert envelope["checkouts"]["observed_at"] == _document_timestamp(1)
-    assert [call.network for call in manager.calls] == [True, False, False, False]
+    assert [call.network for call in manager.calls] == [True, True, True, True]
     _settle(serving.runtime)
 
 
-def test_a_due_check_answers_behind_the_served_document_and_its_failure_changes_nothing(serving):
+def test_a_due_run_answers_behind_the_served_document_and_its_failure_changes_nothing(serving):
     manager, clock = serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(REMOTE_CHECK_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     manager.next_outcome("worker:checkouts_timeout")
     requested = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
@@ -570,16 +594,25 @@ def test_a_due_check_answers_behind_the_served_document_and_its_failure_changes_
     _settle(serving.runtime)
     assert serving.runtime._checkouts_failure is None  # noqa: SLF001 - a current document exists
 
-    follow = _Request(serving.runtime.get_checkouts).start()
-    manager.wait_for_calls(3)
-    follow_answer = follow.join(timeout=5)
-    assert follow_answer["checkouts"]["observed_at"] == observed
-    last = follow_answer["remote_checks"]["last"]
+    # The failed run keeps the served document, writes its own outcome into the
+    # record, and is not retried before the interval.
+    follow = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert follow["checkouts"]["observed_at"] == observed
+    last = follow["remote_checks"]["last"]
     assert last["outcome"] == "checkouts_timeout"
     assert last["repositories"] == []
-    assert [call.network for call in manager.calls] == [True, True, False]
+    assert len(manager.calls) == 2, "a failed run behind a document was retried before the interval"
+
+    clock.advance(REFRESH_INTERVAL)
+    later = _Request(serving.runtime.get_checkouts).start()
+    manager.wait_for_calls(3)
+    assert manager.calls[2].network is True
+    assert _observed(later.join(timeout=5)) == observed
     manager.release(2)
     _settle(serving.runtime)
+    served = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
+    assert served["checkouts"]["observed_at"] == _document_timestamp(2)
+    assert [call.network for call in manager.calls] == [True, True, True]
 
 
 def test_a_mark_during_the_first_run_answers_its_waiter_and_supersedes_its_document(serving):
@@ -630,11 +663,11 @@ def test_a_mark_closes_the_failure_gate(serving):
     _settle(serving.runtime)
 
 
-def test_a_failed_local_refresh_is_retried_at_most_once_per_interval(serving):
+def test_a_failed_run_behind_a_document_is_retried_at_most_once_per_interval(serving):
     manager, clock = serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     manager.next_outcome("worker:checkouts_timeout")
     refresh = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
@@ -645,14 +678,14 @@ def test_a_failed_local_refresh_is_retried_at_most_once_per_interval(serving):
     for _ in range(2):
         inside = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
         assert inside["checkouts"]["observed_at"] == observed
-        assert inside["remote_checks"]["last"]["outcome"] == "completed"
+        assert inside["remote_checks"]["last"]["outcome"] == "checkouts_timeout"
     assert len(manager.calls) == 2
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     after = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(3)
     assert _observed(after.join(timeout=5)) == observed
-    assert [call.network for call in manager.calls] == [True, False, False]
+    assert [call.network for call in manager.calls] == [True, True, True]
     manager.release(2)
     _settle(serving.runtime)
     final = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
@@ -663,18 +696,24 @@ def test_concurrent_requests_share_the_one_waiting_run(serving):
     manager, clock = serving.manager, serving.clock
     _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     trigger = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
     trigger.join(timeout=5)
 
-    # The held local run is followed by the one run a change mark queues, and
-    # both requests share it instead of starting runs of their own.
+    # The held run is followed by the one run a change mark queues, and every
+    # request shares it instead of starting a run of its own.
     serving.runtime.mark_checkouts_changed()
     first = _Request(serving.runtime.get_checkouts).start()
     second = _Request(serving.runtime.get_checkouts).start()
     _wait_for_pending(serving.runtime)
     assert len(manager.calls) == 2
+
+    # A read past the interval still finds one run in flight and one waiting, so
+    # it queues nothing further.
+    clock.advance(REFRESH_INTERVAL)
+    third = _Request(serving.runtime.get_checkouts).start()
+    assert len(manager.calls) == 2, "a read past the interval queued another run"
 
     manager.release(1)
     manager.wait_for_calls(3)
@@ -683,7 +722,8 @@ def test_concurrent_requests_share_the_one_waiting_run(serving):
 
     assert _observed(first.join()) == _document_timestamp(3)
     assert _observed(second.join()) == _document_timestamp(3)
-    assert [call.network for call in manager.calls] == [True, False, True]
+    assert _observed(third.join()) == _document_timestamp(3)
+    assert [call.network for call in manager.calls] == [True, True, True]
     _settle(serving.runtime)
 
 
@@ -760,9 +800,9 @@ def test_a_first_run_that_cannot_start_answers_its_category_and_leaves_the_queue
         _Request(serving.runtime.get_checkouts).start().join(timeout=5)
     assert gated.value.code == "checkouts_failed"
 
-    # A due check that cannot start records its own failed outcome, which the
-    # next envelope reports in ``last``.
-    clock.advance(REMOTE_CHECK_INTERVAL)
+    # A run that cannot start records its own failed outcome, which the next
+    # envelope reports in ``last``.
+    clock.advance(REFRESH_INTERVAL)
     run_start.arm()
     with pytest.raises(CatalogError) as checked:
         _Request(serving.runtime.get_checkouts).start().join(timeout=5)
@@ -772,7 +812,7 @@ def test_a_first_run_that_cannot_start_answers_its_category_and_leaves_the_queue
     assert manager.calls == []
     _settle(serving.runtime)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     repaired = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(1)
     manager.release(0)
@@ -802,30 +842,30 @@ def test_a_queued_run_that_cannot_start_answers_every_waiter(serving, run_start)
     assert gated.value.code == "checkouts_failed"
     assert len(manager.calls) == 1
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     repaired = _Request(serving.runtime.get_checkouts).start()
     manager.wait_for_calls(2)
-    assert manager.calls[1].network is False
+    assert manager.calls[1].network is True
     manager.release(1)
     assert _observed(repaired.join()) == _document_timestamp(2)
     assert run_start.attempts == 3
     _settle(serving.runtime)
 
 
-def test_a_run_that_cannot_start_behind_a_served_document_changes_only_its_clocks(
+def test_a_run_that_cannot_start_behind_a_served_document_changes_only_its_clock(
     serving, run_start
 ):
     manager, clock = serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(REMOTE_CHECK_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     run_start.arm()
     envelope = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
     assert _observed(envelope) == observed
     assert envelope["remote_checks"]["last"]["outcome"] == "checkouts_failed"
     assert serving.runtime._checkouts_failure is None  # noqa: SLF001 - a current document exists
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     run_start.arm()
     behind = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
     assert _observed(behind) == observed
@@ -838,11 +878,11 @@ def test_a_run_that_cannot_start_behind_a_served_document_changes_only_its_clock
     assert serving.runtime._checkouts_failure is None  # noqa: SLF001
     assert len(manager.calls) == 1
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     after = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
     assert _observed(after) == observed
     manager.wait_for_calls(2)
-    assert manager.calls[1].network is False
+    assert manager.calls[1].network is True
     manager.release(1)
     _settle(serving.runtime)
     final = _Request(serving.runtime.get_checkouts).start().join(timeout=5)
@@ -918,7 +958,7 @@ def test_a_real_worker_serves_an_accepted_document_and_a_refresh_shows_a_new_com
         assert _main_heads(document) == [first_commit]
 
         second_commit = commit_file(repository, "file.txt", "two\n", "edit")
-        clock.advance(LOCAL_REFRESH_INTERVAL)
+        clock.advance(REFRESH_INTERVAL)
         served = _Request(runtime.get_checkouts).start().join(timeout=5)
         assert _main_heads(models.parse_checkouts(served["checkouts"])) == [first_commit]
 
@@ -1086,7 +1126,7 @@ def _answer(method: Any, timeout: float = 60.0) -> dict[str, Any]:
     return _Request(method).start().join(timeout=timeout)
 
 
-def test_a_real_check_serves_live_labels_and_the_local_refresh_records_them(tmp_path, monkeypatch):
+def test_a_real_check_serves_live_labels_and_the_next_run_rechecks_them(tmp_path, monkeypatch):
     world = _real_world(tmp_path, monkeypatch, hold=True)
     try:
         before = _fingerprints(world.first, world.second, world.remote)
@@ -1112,25 +1152,22 @@ def test_a_real_check_serves_live_labels_and_the_local_refresh_records_them(tmp_
         assert repository["check"] == {"status": "live", "reason": None}
         assert repository["pr_lookup"] == {"status": "off", "reason": "setting_off"}
         assert first["remote_checks"]["next_due_at"] == _timestamp_after(
-            last["started_at"], REMOTE_CHECK_INTERVAL
+            last["started_at"], REFRESH_INTERVAL
         )
-        saved_at = _saved_heads_text(key)
 
-        world.clock.advance(LOCAL_REFRESH_INTERVAL)
+        # The run after the interval is networked too: it asks the remote again
+        # and keeps the live basis.
+        world.clock.advance(REFRESH_INTERVAL)
         before = _fingerprints(world.first, world.second, world.remote)
         _answer(world.runtime.get_checkouts, timeout=5)
         _settle(world.runtime, timeout=90)
         assert _fingerprints(world.first, world.second, world.remote) == before
-        assert len(world.recorder.lines()) == calls, "a local run contacted the remote"
+        assert len(world.recorder.lines()) > calls, "the run after the interval asked no remote"
 
         recorded = _answer(world.runtime.get_checkouts)
-        assert recorded["checkouts"]["remote_checks"] == "off"
+        assert recorded["checkouts"]["remote_checks"] == "on"
         [group] = recorded["checkouts"]["repositories"]
-        assert group["remote"]["check"] == {
-            "status": "recorded",
-            "reason": "remote_checks_off",
-            "checked_at": saved_at,
-        }
+        assert group["remote"]["check"] == {"status": "live", "reason": None}
         assert recorded["remote_checks"]["last"]["outcome"] == "completed"
     finally:
         _close_world(world)
@@ -1172,7 +1209,7 @@ def test_a_real_failed_check_keeps_the_saved_record_and_its_reason_in_last(tmp_p
         world.remote.rename(world.remote.with_name("remote.git.away"))
         # The due check that finds the remote gone keeps the saved record, and
         # the request after it reads the document it published.
-        world.clock.advance(REMOTE_CHECK_INTERVAL)
+        world.clock.advance(REFRESH_INTERVAL)
         before = _fingerprints(world.first, world.second)
         _answer(world.runtime.get_checkouts, timeout=5)
         _settle(world.runtime, timeout=90)
@@ -1190,19 +1227,19 @@ def test_a_real_failed_check_keeps_the_saved_record_and_its_reason_in_last(tmp_p
         [repository] = last["repositories"]
         assert repository["check"] == {"status": "recorded", "reason": reason}
 
-        world.clock.advance(LOCAL_REFRESH_INTERVAL)
+        world.clock.advance(REFRESH_INTERVAL)
         before = _fingerprints(world.first, world.second)
         _answer(world.runtime.get_checkouts, timeout=5)
         _settle(world.runtime, timeout=90)
         assert _fingerprints(world.first, world.second) == before
-        local = _answer(world.runtime.get_checkouts)
-        [group] = local["checkouts"]["repositories"]
+        again = _answer(world.runtime.get_checkouts)
+        [group] = again["checkouts"]["repositories"]
         assert group["remote"]["check"] == {
             "status": "recorded",
-            "reason": "remote_checks_off",
+            "reason": reason,
             "checked_at": saved_at,
         }
-        [repository] = local["remote_checks"]["last"]["repositories"]
+        [repository] = again["remote_checks"]["last"]["repositories"]
         assert repository["check"] == {"status": "recorded", "reason": reason}
     finally:
         _close_world(world)
@@ -1266,6 +1303,17 @@ def _put_checkout_settings(port, revision, folders, github_lookup=True):
     )
 
 
+def _put_settings(port, revision, order, completed):
+    return http_request(
+        port,
+        "PUT",
+        "/api/settings",
+        body=json.dumps(
+            {"revision": revision, "order": list(order), "completed": list(completed)}
+        ),
+    )
+
+
 def test_a_saved_checkout_folder_marks_the_inputs_so_the_next_request_checks_it(
     tmp_path, monkeypatch
 ):
@@ -1319,6 +1367,27 @@ def test_a_saved_checkout_folder_marks_the_inputs_so_the_next_request_checks_it(
             "folders": [str(first_folder), str(second_folder)],
             "github_lookup": True,
         }
+
+        # A board settings save marks the inputs too, so the read after it waits
+        # for a run under the new settings with no interval elapsed.
+        recorded = len(world.recorder.lines())
+        status, _, body = _put_settings(port, saved["revision"], ["Shipped"], ["Shipped"])
+        assert status == 200
+        stage_saved = json.loads(body)
+        assert stage_saved["outcome"] == "success"
+        assert stage_saved["revision"] != saved["revision"]
+
+        status, _, body = http_request(port, "GET", "/api/checkouts")
+        assert status == 200
+        assert world.clock.value == 1000.0
+        after_stage = json.loads(body)
+        document = models.parse_checkouts(after_stage["checkouts"])
+        assert document["configuration_revision"] == stage_saved["revision"]
+        assert document["folders"] == [
+            {"path": str(first_folder), "status": "ok"},
+            {"path": str(second_folder), "status": "ok"},
+        ]
+        assert len(world.recorder.lines()) == recorded + 1
 
 
 def test_a_reconciled_checkout_settings_save_still_marks_the_inputs(tmp_path, monkeypatch):
@@ -1422,42 +1491,54 @@ def test_a_saved_folder_removed_from_disk_still_saves_and_lists_as_missing(
 # ---------------------------------------------------------------------------
 
 
-def test_local_refreshes_serve_the_interval_until_the_check_becomes_the_refresh(serving):
+def test_reads_inside_the_interval_serve_the_document_and_the_one_at_it_starts_a_run(serving):
+    """S2: a read one second before the interval starts nothing; the next one run."""
+
     runtime, manager, clock = serving.runtime, serving.manager, serving.clock
-    _establish_document(serving)
+    observed = _establish_document(serving)
 
-    for count in range(2, 6):
-        clock.advance(LOCAL_REFRESH_INTERVAL)
-        _Request(runtime.get_checkouts).start().join(timeout=5)
-        manager.wait_for_calls(count)
-        assert manager.calls[count - 1].network is False
-        manager.release(count - 1)
-        _settle(runtime)
-    assert [call.network for call in manager.calls] == [True, False, False, False, False]
+    elapsed = 0.0
+    while elapsed + 10 <= REFRESH_INTERVAL - 1:
+        clock.advance(10)
+        elapsed += 10
+        inside = _Request(runtime.get_checkouts).start().join(timeout=5)
+        assert _observed(inside) == observed
+        assert inside["remote_checks"]["state"] == "idle"
+        assert inside["remote_checks"]["next_due_at"] is not None
+        assert len(manager.calls) == 1, "a read inside the interval started a run"
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
-    _Request(runtime.get_checkouts).start().join(timeout=5)
-    manager.wait_for_calls(6)
-    assert manager.calls[5].network is True
-    manager.release(5)
+    clock.advance(REFRESH_INTERVAL - 1 - elapsed)
+    assert _observed(_Request(runtime.get_checkouts).start().join(timeout=5)) == observed
+    assert len(manager.calls) == 1, "the read before the interval started a run"
+
+    clock.advance(1)
+    at_interval = _Request(runtime.get_checkouts).start()
+    manager.wait_for_calls(2)
+    assert manager.calls[1].network is True
+    assert _observed(at_interval.join(timeout=5)) == observed
+    manager.release(1)
     _settle(runtime)
 
     served = _Request(runtime.get_checkouts).start().join(timeout=5)
-    assert len(manager.calls) == 6, "a local run followed the due check"
-    assert served["remote_checks"]["state"] == "idle"
-    assert served["remote_checks"]["last"]["outcome"] == "completed"
+    assert _observed(served) == _document_timestamp(2)
+    assert len(manager.calls) == 2, "a second run followed the one at the interval"
 
 
 def test_an_idle_runtime_starts_nothing_and_its_next_request_checks(serving):
+    """S1: ten intervals with no request start no run and leave no thread."""
+
     runtime, manager, clock = serving.runtime, serving.manager, serving.clock
     _establish_document(serving)
+    _settle(runtime)
     calls = len(manager.calls)
 
-    clock.advance(REMOTE_CHECK_INTERVAL * 3)
+    for _ in range(10):
+        clock.advance(REFRESH_INTERVAL)
+        assert len(manager.calls) == calls, "an unrequested runtime collected"
+        assert _threads_outside(serving.threads_before) == [], (
+            "a thread outside the ones alive before the runtime appeared"
+        )
 
-    assert len(manager.calls) == calls
-    with runtime._checkouts_condition:  # noqa: SLF001 - the serving owner's state
-        assert not runtime._checkouts_threads  # noqa: SLF001 - no run is alive
     served = _Request(runtime.get_checkouts).start().join(timeout=5)
     manager.wait_for_calls(calls + 1)
     assert manager.calls[calls].network is True
@@ -1472,14 +1553,14 @@ def test_the_envelope_reports_a_due_check_in_flight_and_an_overdue_one(serving):
 
     settled = _Request(runtime.get_checkouts).start().join(timeout=5)
     assert settled["remote_checks"]["state"] == "idle"
-    assert settled["remote_checks"]["interval_seconds"] == 300
+    assert settled["remote_checks"]["interval_seconds"] == REFRESH_INTERVAL
     last = settled["remote_checks"]["last"]
-    due_at = _timestamp_after(last["started_at"], REMOTE_CHECK_INTERVAL)
+    due_at = _timestamp_after(last["started_at"], REFRESH_INTERVAL)
     assert settled["remote_checks"]["next_due_at"] == due_at
 
     # The request that finds the check due starts it and answers behind it, so
     # its envelope reports the check while it is in flight.
-    clock.advance(REMOTE_CHECK_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     in_flight = _Request(runtime.get_checkouts).start().join(timeout=5)
     manager.wait_for_calls(2)
     assert manager.calls[1].network is True
@@ -1488,7 +1569,7 @@ def test_the_envelope_reports_a_due_check_in_flight_and_an_overdue_one(serving):
 
     # Once its interval has passed again while it still runs, no next due time
     # is stated.
-    clock.advance(REMOTE_CHECK_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     overdue = _Request(runtime.get_checkouts).start().join(timeout=5)
     assert overdue["remote_checks"]["state"] == "running"
     assert overdue["remote_checks"]["next_due_at"] is None
@@ -1502,7 +1583,7 @@ def test_three_concurrent_requests_share_the_one_run_queued_behind_a_held_run(se
     runtime, manager, clock = serving.runtime, serving.manager, serving.clock
     _establish_document(serving)
 
-    clock.advance(REMOTE_CHECK_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     _Request(runtime.get_checkouts).start().join(timeout=5)
     manager.wait_for_calls(2)
     assert manager.calls[1].network is True
@@ -1532,7 +1613,7 @@ def test_three_concurrent_requests_share_the_one_run_queued_behind_a_held_run(se
 
     served = _Request(runtime.get_checkouts).start().join(timeout=5)
     assert _observed(served) == _document_timestamp(3)
-    assert len(manager.calls) == 3, "a local run followed the check"
+    assert len(manager.calls) == 3, "a further run followed the shared one"
     _settle(runtime)
 
 
@@ -1673,14 +1754,14 @@ def test_a_request_after_shutdown_begins_starts_nothing(serving):
     assert len(manager.calls) == calls
 
 
-def test_shutdown_cancels_a_held_local_refresh_without_publishing_it(serving, captured_checkouts):
+def test_shutdown_cancels_a_held_refresh_without_publishing_it(serving, captured_checkouts):
     runtime, manager, clock = serving.runtime, serving.manager, serving.clock
     observed = _establish_document(serving)
 
-    clock.advance(LOCAL_REFRESH_INTERVAL)
+    clock.advance(REFRESH_INTERVAL)
     _Request(runtime.get_checkouts).start().join(timeout=5)
     manager.wait_for_calls(2)
-    assert manager.calls[1].network is False
+    assert manager.calls[1].network is True
 
     assert runtime.shutdown(time.monotonic() + 5) is True
     with runtime._checkouts_condition:  # noqa: SLF001 - the serving owner's state

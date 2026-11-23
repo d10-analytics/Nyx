@@ -16,7 +16,7 @@ import pytest
 from test_checkouts import NOT_ROOT, isolate_git
 
 from nyx import server, state
-from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
+from nyx.app_runtime import REFRESH_INTERVAL, ApplicationRuntime
 from nyx.models import (
     SCHEMA_VERSION,
     ProtocolError,
@@ -889,7 +889,7 @@ def test_application_checkouts_route_serves_the_published_envelope(tmp_path, mon
         remote_checks = envelope["remote_checks"]
         assert set(remote_checks) == {"state", "interval_seconds", "next_due_at", "last"}
         assert remote_checks["state"] == "idle"
-        assert remote_checks["interval_seconds"] == REMOTE_CHECK_INTERVAL
+        assert remote_checks["interval_seconds"] == REFRESH_INTERVAL
         assert isinstance(remote_checks["next_due_at"], str)
         document = parse_checkouts(envelope["checkouts"])
         assert document["folders"] == []
@@ -937,7 +937,7 @@ def _checkouts_double_envelope():
         "checkouts": {"marker": "served by the installed provider"},
         "remote_checks": {
             "state": "idle",
-            "interval_seconds": REMOTE_CHECK_INTERVAL,
+            "interval_seconds": REFRESH_INTERVAL,
             "next_due_at": None,
             "last": None,
         },
