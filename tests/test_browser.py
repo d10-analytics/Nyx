@@ -4246,6 +4246,11 @@ def test_focus_indicators_contrast_with_their_surface(open_page, theme, card_out
     ):
         expected = card_outline if selector.endswith(("heading", "summary")) else None
         assert_focus_indicator(page.locator(selector).first, expected=expected)
+    # The quiet checkbox is the moved group's third label, shown only on
+    # Repositories; it takes the same white toolbar ring as its siblings.
+    page.locator("#view-checkouts").press("Enter")
+    playwright.expect(page.locator("#checkouts")).to_be_visible()
+    assert_focus_indicator(page.locator("#hide-quiet-checkouts"), expected="rgb(255, 255, 255)")
 
     failed = BrowserSettings()
     failed.fail_next_load = True
@@ -4760,6 +4765,113 @@ def test_terminal_preference_uses_storage_and_checked_fallback(open_page):
     )
     assert blocked.get_by_label("Hide terminal rows", exact=True).is_checked()
 
+
+# The closed toolbar's flex children flatten through ``display: contents`` below
+# 700 px, so every visible item witnesses its own line: counting distinct top
+# edges counts the wrapped lines, and a larger count means a taller toolbar band.
+TOOLBAR_ROW_COUNT_JS = """() => {
+  const items = [];
+  const walk = (parent) => {
+    for (const child of parent.children) {
+      if (child.hidden) continue;
+      const display = getComputedStyle(child).display;
+      if (display === 'none') continue;
+      if (display === 'contents') { walk(child); continue; }
+      if (child.getBoundingClientRect().height > 0) items.push(child);
+    }
+  };
+  walk(document.querySelector('header.toolbar'));
+  return new Set(items.map((item) =>
+    Math.round(item.getBoundingClientRect().top))).size;
+}"""
+
+# Measured on the same page and by the same count before the group moved.
+TOOLBAR_BASELINE_ROWS = {
+    ("board", 1280): 2, ("board", 700): 7, ("board", 520): 7,
+    ("checkouts", 1280): 2, ("checkouts", 700): 7, ("checkouts", 520): 7,
+}
+
+TOOLBAR_CONTROLS_JS = """() => {
+  const measure = (selector) => {
+    const node = document.querySelector(selector);
+    const style = getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return {visible: style.display !== 'none' && style.visibility !== 'hidden'
+                     && rect.width > 0 && rect.height > 0,
+            left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom};
+  };
+  const toolbar = document.querySelector('header.toolbar');
+  const band = toolbar.getBoundingClientRect();
+  return {
+    viewport: window.innerWidth,
+    overflow: toolbar.scrollWidth - toolbar.clientWidth,
+    toolbarTop: band.top, toolbarBottom: band.bottom,
+    summary: measure('#stage-order-heading'),
+    viewSwitch: measure('.view-switch'),
+    compact: measure('label[for="compact-view"]'),
+    terminal: measure('label[for="hide-terminal-rows"]'),
+    quiet: measure('label[for="hide-quiet-checkouts"]'),
+  };
+}"""
+
+
+def _in_one_row(first, second):
+    """True when two boxes overlap vertically, so they share a toolbar line."""
+    return min(first["bottom"], second["bottom"]) - max(first["top"], second["top"]) > 1
+
+
+def _precedes(first, second):
+    """True when ``first`` reads before ``second``: top to bottom, then left to right."""
+    if _in_one_row(first, second):
+        return first["left"] < second["left"]
+    return first["top"] < second["top"]
+
+
+def test_checkbox_group_sits_left_of_settings_at_every_width_and_view(open_page):
+    """The group reads before Settings on the Board and on Repositories, at every width."""
+    page = open_page(StaticClient(board_payload()), settings=BrowserSettings())
+    for view in ("board", "checkouts"):
+        if view == "checkouts":
+            show_checkouts_view(page)
+        for width in (1280, 700, 520, 390):
+            page.set_viewport_size({"width": width, "height": 800})
+            settle_frames(page)
+            layout = page.evaluate(TOOLBAR_CONTROLS_JS)
+            if view == "board":
+                group = [layout["compact"], layout["terminal"]]
+                hidden = [layout["quiet"]]
+            else:
+                group = [layout["quiet"]]
+                hidden = [layout["compact"], layout["terminal"]]
+            # Each view shows its own group and none of the other view's labels.
+            assert all(control["visible"] for control in group), (view, width)
+            assert not any(control["visible"] for control in hidden), (view, width)
+            # Nothing in the toolbar is clipped or pushed outside the window.
+            assert layout["overflow"] == 0, (view, width)
+            for control in (*group, layout["summary"], layout["viewSwitch"]):
+                assert control["left"] >= -0.5, (view, width)
+                assert control["right"] <= layout["viewport"] + 0.5, (view, width)
+                assert control["top"] >= layout["toolbarTop"] - 1, (view, width)
+                assert control["bottom"] <= layout["toolbarBottom"] + 1, (view, width)
+            for control in group:
+                # Wide: the same line as Settings, entirely left of it. Narrow:
+                # the same reading order, which is all a wrapped toolbar keeps.
+                if width == 1280:
+                    assert _in_one_row(control, layout["summary"]), (view, width)
+                    assert control["right"] <= layout["summary"]["left"] + 0.5, (view, width)
+                else:
+                    assert _precedes(control, layout["summary"]), (view, width)
+            assert _precedes(layout["summary"], layout["viewSwitch"]), (view, width)
+            if width in (1280, 700, 520):
+                rows = page.evaluate(TOOLBAR_ROW_COUNT_JS)
+                assert rows <= TOOLBAR_BASELINE_ROWS[(view, width)], (view, width, rows)
+    # One container before the panel holds all three labels, the quiet one last,
+    # so no view shows an empty box beside the other view's controls.
+    assert page.locator(".toolbar-actions > .compact-controls").count() == 1
+    assert page.locator(".controls .compact-controls").count() == 0
+    assert page.locator(".compact-controls > label").evaluate_all(
+        "labels => labels.map(label => label.htmlFor)"
+    ) == ["compact-view", "hide-terminal-rows", "hide-quiet-checkouts"]
 
 
 def test_terminal_only_board_explains_hidden_finished_rows(open_page):
