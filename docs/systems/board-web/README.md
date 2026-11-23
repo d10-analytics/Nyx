@@ -31,7 +31,7 @@ README is narrative only.
   when the page becomes visible or the window regains focus, with no button and
   no pending state. It keeps the reader's place across an install: the selected
   card and its panel, the position of the focused or selected card when it keeps
-  its row and column, the window scroll, the search and the Board settings draft,
+  its row and column, the window scroll, the search and the **Settings** draft,
   and it marks the new or changed cards for a few seconds. Keyboard focus on a
   card that still exists stays with it; focus inside the work item panel is kept
   by the panel's own rewrite on every cause (an install, a checkout scan, a
@@ -76,7 +76,7 @@ README is narrative only.
   with the card's other text and rewritten in place on each scan. The text is Nyx's last successful checkout scan, and Nyx rescans
   about every three minutes while a board page is open.
 - Shows a line only while the served document was scanned under the configuration
-  the board displays, so a Board settings save on the same page hides every line
+  the board displays, so a board settings save on the same page hides every line
   until that save's own checkouts read answers with a scan of the new settings,
   and a configuration change
   saved elsewhere hides them until the next check installs the new catalog;
@@ -132,7 +132,7 @@ README is narrative only.
   checkout settings (folders, GitHub lookup and revision) with the server's
   answer for each outcome, offers the document's `folder_suggestions`, shows the
   folders the server refused beside them and shares one configuration revision
-  with the Board settings editor. A successful save installs a fresh catalog and
+  with the stage settings editor. A successful save installs a fresh catalog and
   asks for a checkouts read at once, unless one is already in flight, when the
   next tick shows the new folders; the view changes no repository.
 

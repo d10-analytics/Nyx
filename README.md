@@ -36,7 +36,7 @@ document. The work item panel's **Needs** list names the selected card's
 outstanding prerequisites, with the reason for each.
 
 Search helps you find work by its title, project, or program—a named group of
-related specifications. Mark finished stages in **Board settings** and use
+related specifications. Mark finished stages in **Settings** and use
 **Hide terminal rows** to focus on unfinished work. Uncheck it to reveal finished
 rows.
 
@@ -99,7 +99,7 @@ finished.
 Setup saves the workspace location for your account on this host. This setup
 choice is separate from the browser's personal
 **Hide empty rows and columns** and **Hide terminal rows** preferences, which are
-stored only in that browser. The **Board settings** panel saves the board row order in the same account-local
+stored only in that browser. The **Settings** panel saves the board row order in the same account-local
 configuration, shared by that account's browser and desktop views. The saved order
 survives browser reload and a supported Nyx restart, and is keyed by workspace root:
 switching from workspace A to workspace B does not apply A's order, while returning
@@ -111,7 +111,7 @@ options.
 
 `Completion Prerequisite: UUID` is the one prerequisite row. It names one whole
 work item as a prerequisite. A prerequisite is outstanding until the board reads
-its target as served merged on `main`. **Board settings** holds a
+its target as served merged on `main`. **Settings** holds a
 literal set of stage names that you pick beside **Counts as finished**. That
 setting decides only which cards are finished rows, which rows **Hide terminal
 rows** hides, and the Code Status that `nyx checkouts` reports. Nyx does not

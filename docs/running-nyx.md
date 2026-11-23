@@ -875,7 +875,7 @@ line updates on its own. The line is part of the card's
 search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
-A Board settings save on the same page keeps it hidden until that save's own
+A board settings save on the same page keeps it hidden until that save's own
 checkouts read answers with a scan of the new configuration. The page requests
 that read at once. A checkout folder save on the
 same page keeps it hidden only until that save's own checkouts read answers with
@@ -1050,7 +1050,7 @@ worktrees` instead. The `--json` document keeps every path.
 
 ## Choose board row order
 
-When account settings are available, the toolbar includes a collapsed **Board settings**
+When account settings are available, the toolbar includes a collapsed **Settings**
 panel with a row-order editor. It lists the literal stage names known to the current workspace. Use
 **Move up** and **Move down** to arrange them, then choose **Save**. Save writes
 the order to this account's configuration and the board applies it without moving
@@ -1069,7 +1069,7 @@ can retry. A conflict or reload-needed Save requires that reload, which replaces
 the unsaved draft with the current saved order. Any other failed Save leaves the
 prior saved order and unsaved draft in place so you can retry.
 
-The same collapsed **Board settings** panel also lists **Counts as finished**
+The same collapsed **Settings** panel also lists **Counts as finished**
 beside every literal stage name. Select the stages whose names count as finished,
 then choose **Save** to persist the row order and completion policy together.
 **Cancel** drops both kinds of unsaved change; **Reset** clears the
@@ -1088,7 +1088,7 @@ it loads the saved settings. With an unsaved draft it keeps the draft, disables
 replace this unsaved draft." Choose **Reload board settings** to replace the
 draft with the saved settings; Nyx never discards the draft on its own.
 
-**Click empty space to deselect** is a separate checkbox in Board settings.
+**Click empty space to deselect** is a separate checkbox in **Settings**.
 It starts unchecked, so clicking a selected card again clears the selection.
 When checked, clicking an empty cell, row label, or other empty board space
 also clears it; clicking another card selects that card. The choice applies
@@ -1400,7 +1400,7 @@ is not shown in **Repositories**.
 Nyx checks for changed information every ten seconds, and at once when you return
 to the window. A changed catalog is installed at the next check, at most ten
 seconds after the change, without any button. Your selection, keyboard focus,
-scroll position, search and **Board settings** draft are kept, and the cards that
+scroll position, search and **Settings** draft are kept, and the cards that
 changed are marked for a few seconds.
 
 A card whose package has a Code Status shows a Code Status tag under its
@@ -1413,7 +1413,7 @@ served, every declared prerequisite is outstanding. The board then draws every
 arrow, no marker shows, and only a card that declares no prerequisite is teal.
 The lines are
 also hidden, with no message, while the board displays a configuration other
-than the one the scan was made under: after a Board settings save on the same
+than the one the scan was made under: after a board settings save on the same
 page, until that save's own checkouts read answers with a scan of the new
 configuration, or until the checkouts read that a checkout folder
 save on the same page requests answers with a scan of the new folders (or, when
@@ -1544,9 +1544,9 @@ the saved folders. An editor with no draft reloads quietly when it sees a
 changed record, and one with a draft says `The checkout folders changed elsewhere.`
 and offers the same reload. While that reload is offered, the list, the path
 field, the suggestions and the checkbox take no edits; **Cancel checkout folder
-changes** still drops the draft. The Board settings editor and this editor share one
-record revision, so a Board settings save never marks a folder draft as changed
-elsewhere, and a folder save never marks a Board settings draft.
+changes** still drops the draft. The stage settings editor in **Settings** and this editor share one
+record revision, so a board settings save never marks a folder draft as changed
+elsewhere, and a folder save never marks a board settings draft.
 
 A successful save installs the new catalog on the page and asks at once for a
 scan of the new folders, so the view shows them without waiting for the next
@@ -1693,7 +1693,7 @@ example.
 Use an isolated temporary account home outside the repository for every fixture
 setup, start, status, and stop command and the browser session. Stop the owner's
 Nyx instance first, record the SHA-256 of the owner's `.nyx/config/config.json`,
-and verify that `/api/workspace` reports the fixture root before saving Board
+and verify that `/api/workspace` reports the fixture root before saving board
 settings. After visual acceptance, stop the isolated
 instance, remove its temporary home, and confirm the owner's configuration hash
 is unchanged.
@@ -1701,7 +1701,7 @@ is unchanged.
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
 fresh browser context so the compact preference starts checked and **Board** is
 the selected view. Before saving the
-first image, open **Board settings**, use the row-order editor to move **Queue**
+first image, open **Settings**, use the row-order editor to move **Queue**
 above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
 **Save**. Keep that saved account-local order and completion policy, and keep
 **Hide terminal rows** checked for all three board images.
@@ -1715,7 +1715,7 @@ and `Community_Resources` project. Confirm the festival's completion prerequisit
 still targets the permit and is served with reason `resolved`. In the actual
 browser, verify there is no workspace or
 refresh issues panel (`#board-issues` must be absent, not merely collapsed or
-hidden). Keep **Board settings** closed in every image.
+hidden). Keep **Settings** closed in every image.
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
@@ -1758,15 +1758,15 @@ never fetched. Use a short, neutral fixture path such as `/tmp/nyx-capture-fixtu
 Start the isolated instance, choose **Repositories**, and configure the clones'
 parent folder through the **Checkout folders** editor (see [Use the Repositories
 view](#use-the-repositories-view)): add the parent folder, clear the GitHub lookup
-checkbox, and choose **Save checkout folders**; a Board settings save keeps
+checkbox, and choose **Save checkout folders**; a board settings save keeps
 that entry. Close the editor again before the capture so only its summary shows.
-Then save the Board
+Then save the board
 settings described above, which also clears the
 `finished_stages_not_configured` attention item. If the owner's instance holds
 the control port, run the isolated instance on another free port rather than
 stopping it. Wait until the status line no longer says `Collected under
 different settings from the board shown.`, which clears once the checkouts read
-that follows a Board settings save answers with a scan of the new settings.
+that follows a board settings save answers with a scan of the new settings.
 
 Before saving the fourth image, read the live `/api/checkouts` document: git is
 `available`, there is exactly one folder and its status is `ok`, `diagnostics`

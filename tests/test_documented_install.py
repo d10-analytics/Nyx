@@ -98,7 +98,7 @@ DESKTOP_GUIDANCE_MARKERS = (
 )
 STAGE_ORDER_GUIDANCE_MARKERS = {
     "README.md": (
-        "The **Board settings** panel saves the board row order in the same "
+        "The **Settings** panel saves the board row order in the same "
         "account-local configuration",
         "account-local",
         "browser and desktop views",
@@ -107,7 +107,7 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "does not rename or move",
     ),
     "docs/running-nyx.md": (
-        "the toolbar includes a collapsed **Board settings** panel with a "
+        "the toolbar includes a collapsed **Settings** panel with a "
         "row-order editor",
         "Move up",
         "Move down",
@@ -141,12 +141,12 @@ COMPLETION_GUIDANCE_MARKERS = {
         "Completion Prerequisite: UUID",
         "is the one prerequisite row",
         "literal set of stage names",
-        "Board settings",
+        "**Settings**",
         "workspace root",
         "evidence verification",
     ),
     "docs/running-nyx.md": (
-        "collapsed **Board settings**",
+        "collapsed **Settings**",
         "Counts as finished",
         "**Save** to persist the row order and completion policy together",
         "**Cancel** drops both kinds of unsaved change",
@@ -177,7 +177,7 @@ COMPLETION_GUIDANCE_MARKERS = {
     "docs/specification-reference.md": (
         "is the one prerequisite row",
         "outstanding until the board reads its target as served merged",
-        "collapsed **Board settings**",
+        "collapsed **Settings**",
         "temporarily absent names",
         "recorded workflow assertion",
     ),
@@ -859,7 +859,7 @@ def test_documents_remove_stage_hiding_and_retain_finished_rows(name):
         document, re.IGNORECASE,
     )
     assert "Hide terminal rows" in document
-    assert "Board settings" in document
+    assert "**Settings**" in document
 
 
 def test_documents_publish_the_saved_stage_order_contract():
@@ -1224,7 +1224,7 @@ def test_dependency_and_completion_policy_text_matches_the_board():
     assert "asks you to configure completed stages" not in _normalized("docs/workspaces.md")
     assert "actionable configuration explanation" not in _normalized(
         "docs/specification-reference.md")
-    assert ("The completion policy is configured in the collapsed **Board settings** "
+    assert ("The completion policy is configured in the collapsed **Settings** "
             "panel") in _normalized("docs/specification-reference.md")
 
 
@@ -1576,7 +1576,7 @@ def test_documents_describe_the_automatic_board_update():
         "Nyx checks for changed information every ten seconds, and at once when you "
         "return to the window. A changed catalog is installed at the next check, at "
         "most ten seconds after the change, without any button. Your selection, "
-        "keyboard focus, scroll position, search and **Board settings** draft are "
+        "keyboard focus, scroll position, search and **Settings** draft are "
         "kept, and the cards that changed are marked for a few seconds.",
         "- **An edit has not appeared:** the edit appears at the next check, within "
         "ten seconds, or at once when you return to the window.",

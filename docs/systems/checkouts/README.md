@@ -127,7 +127,7 @@ never through this system. It
   scan, refreshed about every three minutes by `application-serving` and updated
   in place on its own, searchable with the card's other
   text, and hidden while the served document's `configuration_revision` differs
-  from the displayed catalog's, which adds no entry and lasts after a Board
+  from the displayed catalog's, which adds no entry and lasts after a board
   settings save on the same page until that save's own checkouts read answers
   with a scan of the new settings, until the checkouts
   read that a checkout folder save on the same page requests answers with a scan

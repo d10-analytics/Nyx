@@ -63,7 +63,7 @@ scan, which Nyx repeats about every three minutes while a board page is open, so
 the line updates in place. No line is shown while Nyx has
 no scan to serve, when the issues panel then says `Code Status unavailable`; and
 no line is shown, with no issues-panel entry, while the board displays a
-configuration the scan was not made under: after a Board settings save on the
+configuration the scan was not made under: after a board settings save on the
 same page until that save's own checkouts read answers, or, after a
 configuration change saved elsewhere, until the next check installs the new
 catalog.
@@ -188,7 +188,7 @@ Missing, ambiguous, or malformed information can leave a relationship unknown or
 unavailable. Nyx never treats it as satisfied, and a value that is not exactly
 one UUID names no target.
 
-The completion policy is configured in the collapsed **Board settings** panel by
+The completion policy is configured in the collapsed **Settings** panel by
 selecting literal stage names beside **Counts as finished**. It is saved per
 canonical workspace root and can include temporarily absent names. Without a
 configured policy, no row is a finished row and no package is finished. The

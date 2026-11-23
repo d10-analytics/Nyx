@@ -95,7 +95,7 @@ disposable fixture. The normal scanner must retain all four work items, resolve
 the permit item, and report zero workspace diagnostics with complete identity and program
 coverage and complete project and stage inventory. Configure the fixture
 with `nyx --setup <fixture-root>` and start the normal local server and scanner.
-In **Board settings**, check **Counts as finished** beside `Done` and choose
+In **Settings**, check **Counts as finished** beside `Done` and choose
 **Save**; keep **Hide terminal rows** checked for every capture, as described in
 the [capture procedure](running-nyx.md#capture-and-review-the-fictional-example).
 Before each capture, verify the live catalog is complete and has no workspace diagnostics
@@ -214,7 +214,7 @@ seconds.
 ### Mark finished work items
 
 Finished work is an explicit, literal setting for this workspace. Open the
-collapsed **Board settings** panel, select **Counts as finished** beside each
+collapsed **Settings** panel, select **Counts as finished** beside each
 stage whose literal name should count, and choose **Save**. There is no implicit
 `Done` or `Archive` rule: row order, visual position, and cancellation never infer
 a finished row. A cancelled or archived item therefore counts as finished only
@@ -251,8 +251,8 @@ stage rows.
 The selected stage names are saved per canonical workspace root and shared by
 all projects in that root. Switching roots keeps each root's own setting, and a
 root with no saved names makes no row finished.
-Names that are temporarily absent remain retained in the Board
-settings panel so they can be used again when available. **Cancel** leaves the
+Names that are temporarily absent remain retained in the **Settings** panel
+so they can be used again when available. **Cancel** leaves the
 saved policy unchanged; **Reset** removes the current root's completion policy.
 
 Saved stage order and completion names stay keyed to the workspace's original
@@ -349,7 +349,7 @@ columns without changing the workspace or configuration. It does not override
 **Hide terminal rows**: uncheck that control to show finished rows and their
 cards and dependency connections.
 
-The **Board settings** panel's row-order editor is another presentation control. It saves a
+The **Settings** panel's row-order editor is another presentation control. It saves a
 root-keyed order map in the current account's configuration, so browser and
 desktop views for that account share the order and a supported restart restores
 it. Switching between workspace roots does not carry one root's order into
