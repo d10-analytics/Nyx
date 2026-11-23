@@ -10577,13 +10577,14 @@ CENTERING_DEPENDENT = "Repo/Drafts/dependent"
 CENTERING_NEIGHBOUR = "Repo/Drafts/afiller19"
 
 
-def _project_package_spec(root, project, name, package_id, fields=()):
+def _project_package_spec(root, project, name, package_id, fields=(), title=None):
     """Write one fictional package under ``<root>/<project>/Drafts/<name>``."""
     folder = root / project / "Drafts" / name
     folder.mkdir(parents=True)
     (folder / "spec.md").write_text(
-        "\n".join([f"# {name.title()}", f"Package ID: {package_id}",
-                   "Status: approved", *fields]) + "\n", encoding="utf-8")
+        "\n".join([f"# {name.title() if title is None else title}",
+                   f"Package ID: {package_id}", "Status: approved", *fields]) + "\n",
+        encoding="utf-8")
 
 
 def centering_catalog(root):
@@ -10602,7 +10603,13 @@ def centering_catalog(root):
     _project_package_spec(root, "ZuluWorks", "further", package_id(2))
     for number in range(20):
         _project_package_spec(root, "Repo", f"afiller{number:02d}", package_id(number))
-    _project_package_spec(root, "Repo", "alpha", ATTENTION_PACKAGE_IDS["alpha"])
+    # The target's own title is long, so its card wraps taller than the area of a
+    # narrow window whatever fonts the platform renders with.
+    _project_package_spec(
+        root, "Repo", "alpha", ATTENTION_PACKAGE_IDS["alpha"],
+        title="Alpha keeps a title long enough to wrap its own card over five lines,"
+              " so the card stays larger than the area of a narrow window whatever"
+              " fonts the platform renders with")
     _project_package_spec(root, "Repo", "zeta", ATTENTION_PACKAGE_IDS["zeta"])
     for number in range(20):
         _project_package_spec(root, "Repo", f"zfiller{number:02d}", package_id(number + 100))
