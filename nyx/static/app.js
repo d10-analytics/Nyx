@@ -3565,11 +3565,21 @@
   }
 
   // The work item branches a repository still shows: those naming a live work
-  // item.
+  // item that exists somewhere the view can read it.  A branch exists when a
+  // readable listed clone holds it, when its served remote copy is `present` or
+  // `unknown`, or when some listed clone could not be read, so what it holds is
+  // unknown.  A branch that exists nowhere has no row; the table, the search
+  // text and the served work items all read this one list, while the panel keeps
+  // the full served list on purpose.
   function livePackageBranches(document, group) {
     const live = livePackagePaths(document);
+    const unreadable = group.clones.some((clone) => clone.status !== "ok");
     return (group.package_branches || []).filter((entry) =>
-      entry.packages.some((path) => live.has(path)));
+      entry.packages.some((path) => live.has(path)) &&
+      (unreadable ||
+        localBranchOf(group, entry.name) !== null ||
+        (entry.remote !== null && entry.remote !== undefined &&
+          (entry.remote.state === "present" || entry.remote.state === "unknown"))));
   }
 
   // A repository is quiet when its served facts say nothing about it needs a
