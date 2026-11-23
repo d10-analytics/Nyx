@@ -876,8 +876,8 @@ search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
 A Board settings save on the same page keeps it hidden until that save's own
-checkouts read answers with a scan of the new configuration, which the page
-requests at once. A checkout folder save on the
+checkouts read answers with a scan of the new configuration. The page requests
+that read at once. A checkout folder save on the
 same page keeps it hidden only until that save's own checkouts read answers with
 a scan of the new folders, which the page requests at once, and the page installs
 the new catalog itself. When a checkouts read is already in flight at the save,
