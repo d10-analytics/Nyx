@@ -1199,7 +1199,7 @@ def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_
     ).inner_text()
     assert page.get_by_role("checkbox", name="Counts as finished: Done").is_enabled()
     page.get_by_role("checkbox", name="Counts as finished: Done").uncheck()
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.completed == ["Absent"]
 
@@ -1218,7 +1218,7 @@ def test_empty_board_click_preference_changes_selection_immediately(open_page):
     open_stage_editor(page)
     assert not preference.is_checked()
     preference.check()
-    assert page.get_by_role("button", name="Save").is_disabled()
+    assert page.get_by_role("button", name="Save", exact=True).is_disabled()
     page.locator(".row-head").first.click()
     assert first.get_attribute("aria-pressed") == "false"
     assert page.locator(".card.selected").count() == 0
@@ -1279,14 +1279,14 @@ def test_post_save_refresh_rejects_late_other_revision_and_reloads_current_board
         page.locator(f'.card[data-package-id="{GATE}"]').click()
 
     page_a.get_by_role("checkbox", name="Counts as finished: Under Development").check()
-    page_a.get_by_role("button", name="Save").click()
+    page_a.get_by_role("button", name="Save", exact=True).click()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").check()
-    page_b.get_by_role("button", name="Save").click()
+    page_b.get_by_role("button", name="Save", exact=True).click()
     page_b.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
-    page_b.get_by_role("button", name="Reload board settings").click()
+    page_b.get_by_role("button", name="Reload board settings", exact=True).click()
     page_b.get_by_text("Current board settings loaded.", exact=True).wait_for()
     page_b.get_by_role("checkbox", name="Counts as finished: Under Development").uncheck()
-    page_b.get_by_role("button", name="Save").click()
+    page_b.get_by_role("button", name="Save", exact=True).click()
     # The competing save must commit, and its own catalog refresh must consume
     # the next snapshot, before the delayed refresh is released; otherwise the
     # delayed snapshot could be stamped with a revision that is still current.
@@ -1342,7 +1342,7 @@ def test_post_save_refresh_rejects_invalid_revision_and_schema_payloads(open_pag
         page.locator("#stage-order-editor").wait_for()
         open_stage_editor(page)
         page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
-        page.get_by_role("button", name="Save").click()
+        page.get_by_role("button", name="Save", exact=True).click()
         assert client.started.wait(timeout=5)
         # The save message only lasts until the blocked post-save refresh resolves.
         page.get_by_text("Board settings saved.", exact=True).wait_for(timeout=15000)
@@ -1379,7 +1379,7 @@ def test_successful_save_updates_needs_selection_and_arrows_together(open_page):
     open_stage_editor(page)
     page.locator(f'.card[data-package-id="{LOOSE}"]').click()
     page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
 
     # The refreshed board arrives after the save message, so wait for the arrow
@@ -1419,7 +1419,7 @@ def test_real_producer_completion_policy_save_hides_finished_target_and_rail(ope
 
     open_stage_editor(page)
     page.get_by_role("checkbox", name="Counts as finished: Queue").check()
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     # Queue now counts as finished, so the refreshed board hides its row and
     # the arrow from the target while terminal rows are hidden; the panel keeps
@@ -1611,7 +1611,7 @@ def test_root_switch_during_post_save_refresh_reloads_the_new_root_policy(open_p
     page.locator("#stage-order-editor").wait_for()
     open_stage_editor(page)
     page.get_by_role("checkbox", name="Counts as finished: Under Development").check()
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     assert client.started.wait(timeout=5)
     settings.switch_root()
     assert page.locator("#stage-order-list .stage-order-item[data-stage='Under_Development']").locator(
@@ -2022,7 +2022,7 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
     assert row_labels(page) == ["Queue", "Under Development", "Review"]
     assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
-    assert page.get_by_role("button", name="Save").is_disabled()
+    assert page.get_by_role("button", name="Save", exact=True).is_disabled()
     assert settings.calls == []
     return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 2")
@@ -2035,7 +2035,7 @@ def test_saved_order_survives_natural_add_hide_remove_and_refill_updates(open_pa
     assert row_labels(page) == ["Queue", "Under Development"]
     assert page.locator("[data-lifecycle='Review']").count() == 0
     assert stage_editor_order(page) == ["Queue", "Under_Development"]
-    assert page.get_by_role("button", name="Save").is_disabled()
+    assert page.get_by_role("button", name="Save", exact=True).is_disabled()
     assert settings.calls == []
     return_check(page)
     page.wait_for_function("() => document.querySelectorAll('.row-head').length === 3")
@@ -2070,7 +2070,7 @@ def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
     assert stage_editor_order(page) == ["Queue", "Under_Development", "Review"]
     page.get_by_role("button", name="Move Review up").press("Enter")
     assert stage_editor_order(page) == ["Queue", "Review", "Under_Development"]
-    assert page.get_by_role("button", name="Save").is_enabled()
+    assert page.get_by_role("button", name="Save", exact=True).is_enabled()
     assert settings.calls == []
 
     return_check(page)
@@ -2080,7 +2080,7 @@ def test_genuine_stage_order_draft_survives_natural_stage_removal(open_page):
     assert "not currently available" in page.locator(
         "#stage-order-list .stage-order-item[data-stage='Review']"
     ).inner_text()
-    assert page.get_by_role("button", name="Save").is_enabled()
+    assert page.get_by_role("button", name="Save", exact=True).is_enabled()
     assert settings.calls == []
 
 
@@ -2095,13 +2095,13 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
         page.get_by_role("button", name="Move Under Development down")
     ).to_be_focused()
     assert settings.calls == []
-    page.get_by_role("button", name="Cancel").click()
+    page.get_by_role("button", name="Cancel", exact=True).click()
     assert settings.calls == []
     assert page.locator("#stage-order-status").inner_text() == (
         "Unsaved board settings changes cancelled."
     )
     page.get_by_role("button", name="Move Under Development up").press("Enter")
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
     page.wait_for_function(
@@ -2114,7 +2114,7 @@ def test_keyboard_stage_editor_save_cancel_reset_and_reload(open_page):
     page2.locator("#stage-order-editor").wait_for()
     open_stage_editor(page2)
     assert row_labels(page2) == ["Under Development", "Queue"]
-    page2.get_by_role("button", name="Reset").click()
+    page2.get_by_role("button", name="Reset", exact=True).click()
     page2.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.order == []
     page2.wait_for_function(
@@ -2206,9 +2206,15 @@ def test_stage_editor_focus_stays_on_used_control_or_successor(open_page):
     assert len(settings.calls) == 4
     assert settings.get_calls == 5
     assert_focus_sampler_clean(page)
+    # The folders section shares the open panel, so a restorer that collected both
+    # sections would hand focus to one of its controls instead of Reset.
+    playwright.expect(page.locator(FOLDERS_EDITOR)).to_be_visible()
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()
     reload.press("Enter")
     playwright.expect(page.locator("#stage-order-status")).to_have_text("Current board settings loaded.")
     playwright.expect(page.get_by_role("button", name="Reset", exact=True)).to_be_focused()
+    assert page.evaluate(
+        "document.activeElement.closest('#checkout-folders-editor') === null") is True
     assert settings.get_calls == 6
     assert len(settings.calls) == 4
     assert_focus_sampler_clean(page)
@@ -2301,8 +2307,8 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
         "Could not load board settings: producer_unavailable", exact=True
     ).wait_for()
     assert settings.get_calls == 1
-    assert page.get_by_role("button", name="Save").is_disabled()
-    retry = page.get_by_role("button", name="Reload board settings")
+    assert page.get_by_role("button", name="Save", exact=True).is_disabled()
+    retry = page.get_by_role("button", name="Reload board settings", exact=True)
     assert retry.is_visible()
 
     retry.click()
@@ -2310,7 +2316,7 @@ def test_stage_order_retries_failed_initial_load_without_page_reload(open_page):
     assert settings.get_calls == 2
     assert stage_editor_order(page) == ["Queue", "Under_Development"]
     page.get_by_role("button", name="Move Under Development up").click()
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", ["Under_Development", "Queue"], [])]
 
@@ -2325,19 +2331,19 @@ def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_re
     open_stage_editor(winning_page)
     assert settings.get_calls == 2
 
-    winning_page.get_by_role("button", name="Reset").click()
+    winning_page.get_by_role("button", name="Reset", exact=True).click()
     winning_page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [("revision-1", [], [])]
 
     stale_page.get_by_role("button", name="Move Under Development up").click()
-    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_role("button", name="Save", exact=True).click()
     stale_page.get_by_text(
         "Save not applied: conflict. Reload board settings to replace this unsaved draft and try again.",
         exact=True,
     ).wait_for()
     assert stage_editor_order(stale_page) == ["Under_Development", "Queue"]
-    assert stale_page.get_by_role("button", name="Save").is_disabled()
-    reload = stale_page.get_by_role("button", name="Reload board settings")
+    assert stale_page.get_by_role("button", name="Save", exact=True).is_disabled()
+    reload = stale_page.get_by_role("button", name="Reload board settings", exact=True)
     assert reload.is_visible()
 
     reload.click()
@@ -2345,7 +2351,7 @@ def test_stage_order_conflict_reloads_current_revision_and_saves_without_page_re
     assert settings.get_calls == 4
     assert stage_editor_order(stale_page) == ["Queue", "Under_Development"]
     stale_page.get_by_role("button", name="Move Under Development up").click()
-    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_role("button", name="Save", exact=True).click()
     stale_page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.calls == [
         ("revision-1", [], []),
@@ -2364,7 +2370,7 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     open_stage_editor(winning_page)
 
     winning_page.get_by_role("button", name="Move Under Development up").press("Enter")
-    winning_page.get_by_role("button", name="Save").click()
+    winning_page.get_by_role("button", name="Save", exact=True).click()
     winning_page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
     winning_page.wait_for_function(
@@ -2374,15 +2380,15 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
     assert row_labels(winning_page) == ["Under Development", "Queue"]
 
     stale_page.get_by_role("button", name="Move Under Development up").press("Enter")
-    stale_page.get_by_role("button", name="Save").click()
+    stale_page.get_by_role("button", name="Save", exact=True).click()
     stale_page.get_by_text(re.compile("Save not applied: conflict"), exact=False).wait_for()
     assert settings.order == ["Under_Development", "Queue"]
-    assert stale_page.get_by_role("button", name="Save").is_disabled()
-    assert stale_page.get_by_role("button", name="Reload board settings").is_visible()
+    assert stale_page.get_by_role("button", name="Save", exact=True).is_disabled()
+    assert stale_page.get_by_role("button", name="Reload board settings", exact=True).is_visible()
 
     settings.fail_next = True
     winning_page.get_by_role("button", name="Move Under Development down").press("Enter")
-    winning_page.get_by_role("button", name="Save").click()
+    winning_page.get_by_role("button", name="Save", exact=True).click()
     winning_page.get_by_text(
         "Save failed: the board settings were not persisted.", exact=True
     ).wait_for()
@@ -2394,7 +2400,7 @@ def test_stage_order_save_failure_keeps_editor_usable_and_stale_response_require
         "Queue",
         "Under_Development",
     ]
-    assert winning_page.get_by_role("button", name="Save").is_enabled()
+    assert winning_page.get_by_role("button", name="Save", exact=True).is_enabled()
 
 
 def test_stage_order_save_reports_an_error_code_then_reload_needed(open_page):
@@ -2422,7 +2428,7 @@ def test_stage_order_save_reports_an_error_code_then_reload_needed(open_page):
     open_stage_editor(page)
     page.get_by_role("button", name="Move Under Development up").click()
     draft = ["Under_Development", "Queue"]
-    save = page.get_by_role("button", name="Save")
+    save = page.get_by_role("button", name="Save", exact=True)
 
     save.click()
     page.get_by_text("Save failed: settings_unavailable", exact=True).wait_for()
@@ -2435,7 +2441,7 @@ def test_stage_order_save_reports_an_error_code_then_reload_needed(open_page):
         exact=True,
     ).wait_for()
     assert stage_editor_order(page) == draft
-    assert page.get_by_role("button", name="Reload board settings").is_visible()
+    assert page.get_by_role("button", name="Reload board settings", exact=True).is_visible()
     assert save.is_disabled()
     assert [call[1] for call in settings.calls] == [draft, draft]
 
@@ -2700,7 +2706,7 @@ def test_stage_reorder_keeps_selection_focus_and_rail_pairs(open_page):
     ).to_be_focused()
     assert page.locator("#stage-order-status").inner_text() == "Unsaved board row order changes."
     assert page.locator("#filter").input_value() == "dependent"
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     assert page.locator(f'.card[data-package-id="{STEP_TWO}"].selected').count() == 1
     assert page.locator("#filter").input_value() == "dependent"
@@ -4257,6 +4263,10 @@ def test_stage_editor_busy_focus_indicators_keep_composited_contrast(open_page, 
     page = open_page(StaticClient(board_payload()), settings=settings)
     page.get_by_label("Theme", exact=True).select_option(theme)
     page.locator("#stage-order-heading").press("Enter")
+    # A folders draft is held, so the folders controls carry no markup
+    # aria-disabled and a stage request must leave them alone.
+    add_folder(page, "/work/draft")
+    playwright.expect(folders_save_button(page)).to_be_enabled()
     if request_kind == "save":
         page.get_by_role("button", name="Move Under Development up", exact=True).press("Enter")
         selectors = [
@@ -4276,8 +4286,11 @@ def test_stage_editor_busy_focus_indicators_keep_composited_contrast(open_page, 
         used.press("Enter")
         assert settings.entered.wait(timeout=2)
         playwright.expect(used).to_be_focused()
-        busy = page.locator('#stage-order-editor [aria-disabled="true"]:visible')
+        busy = page.locator('#stage-order-section [aria-disabled="true"]:visible')
         assert busy.count() == len(selectors)
+        # The other section keeps its own state: no folders control is dimmed.
+        assert page.locator(f'{FOLDERS_EDITOR} [aria-disabled="true"]').count() == 0
+        playwright.expect(folders_save_button(page)).to_be_enabled()
         for selector in selectors:
             control = page.locator(selector)
             assert control.get_attribute("aria-disabled") == "true"
@@ -7281,7 +7294,7 @@ def test_change_marks_follow_poll_installs_only(open_page):
     client.payloads = [fourth]
     open_stage_editor(page)
     page.get_by_role("button", name="Move Under Development up").click()
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     playwright.expect(page.locator(f'.card[data-package-id="{GATE}"] .card-title')).to_have_text(
         "Gate saved")
@@ -7880,7 +7893,7 @@ def test_checkouts_words_block_names_the_view_markers_once():
     words = checkout_words()
     # The rows, headers and setup sentences the view shows are in the block too.
     assert words["text"]["noFolders"] == (
-        "No checkout folders are configured. Choose Checkout folders above to add one."
+        "No checkout folders are configured. Choose Checkout folders in Settings to add one."
     )
     assert words["column"]["default"] == "Local {trunk} vs remote {trunk}"
     assert words["column"]["tree"] == "Uncommitted changes"
@@ -8345,7 +8358,7 @@ def test_checkouts_setup_panel_names_the_setup_story_in_order(
     setup = body.locator(".checkouts-setup")
     sentence = setup.locator(".checkouts-setup-item").inner_text()
     assert sentence == (
-        "No checkout folders are configured. Choose Checkout folders above to add one."
+        "No checkout folders are configured. Choose Checkout folders in Settings to add one."
     )
     assert setup.locator("input, button, select, textarea, [contenteditable]").count() == 0
     assert body.locator(".checkouts-group").count() == 0
@@ -10303,7 +10316,7 @@ def test_checkouts_settings_sentence_follows_a_board_settings_save(
     page.locator("#stage-order-editor summary").click()
     page.get_by_role("checkbox", name="Counts as finished: Shipped").uncheck()
     reads = page.evaluate("window.checkoutsResponses.length")
-    page.get_by_role("button", name="Save").click()
+    page.get_by_role("button", name="Save", exact=True).click()
     page.get_by_text("Board settings saved.", exact=True).wait_for()
     # The save asks for one checkouts read, which answers with the document
     # collected under the settings from before it, so the sentence appears now.
@@ -11160,31 +11173,27 @@ def test_checkouts_refresh_keeps_state_across_the_settings_sentence_and_a_failur
     focus = open_clone_two_state(page)
     sentence = "Collected under different settings from the board shown."
     line = page.locator("#checkouts-status-line")
-    row = page.locator(".checkouts-status")
-    # The status row is the reader's top edge, so the sentence that grows it is
-    # a reflow above everything the reader opened.
+    # The status row is the reader's top edge, so a change there sits above
+    # everything the reader opened.
     scroll = page.evaluate("""() => {
       const row = document.querySelector('.checkouts-status').getBoundingClientRect();
       window.scrollTo(0, Math.ceil(row.top + window.scrollY) + 4);
       return window.scrollY;
     }""")
-    row_height = row.evaluate("el => el.getBoundingClientRect().height")
     arm_focus_sampler(page)
     observe_checkouts_mutations(page)
 
-    # A revision that differs from the board's adds the sentence, which takes
-    # the row to another flex line; the same revision clears both.  Neither
-    # touches a block or moves the reader.
+    # A revision that differs from the board's adds the sentence above the
+    # reader's place; the same revision clears it.  Neither touches a block or
+    # moves the reader.
     double.serve(checkouts_with_revision(before, "2" * 64))
     fire_checkouts_poll(page)
     settle_frames(page)
     assert sentence in line.inner_text()
     assert_clone_two_state_kept(page, focus, scroll)
-    assert row.evaluate("el => el.getBoundingClientRect().height") > row_height
     serve_checkouts(page, double, before)
     assert sentence not in line.inner_text()
     assert_clone_two_state_kept(page, focus, scroll)
-    assert row.evaluate("el => el.getBoundingClientRect().height") == row_height
     assert all(status for status, _ in checkouts_records(page))
 
     # A failed outcome shows the failed panel in place of the view; the next
@@ -11329,7 +11338,7 @@ def test_checkouts_narrow_layout_stacks_values_under_their_column_names(
         assert page.evaluate("""() => [document.documentElement.scrollWidth,
           document.documentElement.clientWidth]""") == [360, 360]
         editor_rights = page.evaluate("""() => [...document.querySelectorAll(
-          '#checkout-folders-editor summary, #checkout-folders-editor input, ' +
+          '#checkout-folders-editor input, ' +
           '#checkout-folders-editor button, #checkout-folders-editor .checkout-folders-path')]
           .filter(node => node.getClientRects().length)
           .map(node => [node.id || node.className, node.getBoundingClientRect().right])""")
@@ -11408,7 +11417,7 @@ CHECKOUTS_TEXT_SAMPLES = {
     "freshness words": ".checkouts-freshness",
     "panel text": ".checkouts-panel, .checkouts-panel h2, .checkouts-panel li",
     "folders editor": (
-        "#checkout-folders-editor summary, #checkout-folders-editor label, "
+        "#checkout-folders-editor h3, #checkout-folders-editor label, "
         ".checkout-folders-path, .checkout-folders-status, "
         "#checkout-folders-editor button"),
 }
@@ -11511,7 +11520,6 @@ def test_checkouts_text_and_focus_rings_have_readable_contrast(
         "attention item": ".checkouts-attention-go",
         "Show on board": ".checkouts-show-on-board",
         "Show quiet repositories": ".checkouts-quiet-show",
-        "folders summary": "#checkout-folders-editor summary",
         "folders path": "#checkout-folders-path",
         "folders Add": "#checkout-folders-add",
         "folders Remove": ".checkout-folders-remove",
@@ -11995,10 +12003,11 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     playwright.expect(page.locator("#checkouts")).to_be_visible()
     assert page.evaluate("document.activeElement.id") == "view-checkouts"
 
-    # The folders editor: Enter on its summary opens it, a path is typed and
-    # added with Enter, and Space on a Remove drops that folder.  Focus goes to
-    # the next folder's Remove, else the previous one, else the path input.
-    tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
+    # The Settings panel: Enter on its summary opens it and loads the folders,
+    # a path is typed and added with Enter, and Space on a Remove drops that
+    # folder.  Focus goes to the next folder's Remove, else the previous one,
+    # else the path input.
+    tab_until(page, "document.activeElement.id === 'stage-order-heading'")
     page.keyboard.press("Enter")
     playwright.expect(page.locator("#checkout-folders-status")).to_have_text(
         "Current checkout folders loaded.")
@@ -12029,10 +12038,10 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
     page.keyboard.press("Enter")
     assert page.locator("#checkout-folders-github").is_checked()
     assert page.evaluate(
-        "document.activeElement.closest('#checkout-folders-editor') !== null")
-    tab_until(page, "document.activeElement.matches('#checkout-folders-editor summary')")
+        "document.activeElement.closest('#stage-order-editor') !== null")
+    tab_until(page, "document.activeElement.id === 'stage-order-heading'")
     page.keyboard.press("Enter")
-    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
+    assert page.evaluate("document.querySelector('#stage-order-editor').open") is False
 
     # A repository line opens with Enter and closes with Space, and the body
     # it holds is shown only while it is open.
@@ -12138,13 +12147,13 @@ def test_checkouts_every_control_works_by_keyboard_alone(open_page, view_checkou
 
 
 def test_checkouts_refreshed_content_is_never_announced(open_page, view_checkouts):
-    """Refreshed content is never announced; the editor's own status is the one region."""
+    """Refreshed content is never announced, and a tick never writes the folder status."""
     ready = view_checkouts.document_topic_committed
     setup = checkout_variant(view_checkouts.document_checked, add_setup_problems(view_checkouts))
     page, double = open_view_checkouts(open_page, view_checkouts, ready)
     observe_checkouts_mutations(page)
-    # A write to the one region the view keeps would be counted here, even one
-    # that rewrote the empty text it already shows.
+    # A write to the panel's folder status would be counted here, even one that
+    # rewrote the empty text it already shows.
     page.evaluate("""() => {
       window.foldersStatusWrites = 0;
       new MutationObserver((records) => { window.foldersStatusWrites += records.length; })
@@ -12161,14 +12170,14 @@ def test_checkouts_refreshed_content_is_never_announced(open_page, view_checkout
             playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
         else:
             serve_checkouts(page, double, step)
-        assert page.evaluate(live) == ["checkout-folders-status"]
-        # A tick never writes the region.
+        assert page.evaluate(live) == []
+        # A tick never writes the panel's folder status.
         assert page.evaluate("window.foldersStatusWrites") == 0
         assert page.locator("#checkout-folders-status").inner_text() == ""
     # Pressing a bar pill announces nothing and adds no region.
     serve_checkouts(page, double, ready)
     open_bar_list(page, "red")
-    assert page.evaluate(live) == ["checkout-folders-status"]
+    assert page.evaluate(live) == []
     assert page.evaluate("window.foldersStatusWrites") == 0
     assert page.locator(".checkouts-bar-pill[aria-live], .checkouts-attention-listbox[aria-live]"
                         ).count() == 0
@@ -12176,7 +12185,7 @@ def test_checkouts_refreshed_content_is_never_announced(open_page, view_checkout
     assert page.locator(".checkouts-quiet-line[aria-live], .checkouts-quiet-line [aria-live]"
                         ).count() == 0
     page.locator(".checkouts-quiet-show").click()
-    assert page.evaluate(live) == ["checkout-folders-status"]
+    assert page.evaluate(live) == []
     assert page.evaluate("window.foldersStatusWrites") == 0
 
 
@@ -12206,11 +12215,20 @@ def test_checkouts_quiet_line_counts_only_the_matching_repositories(
 
 
 # ---------------------------------------------------------------------------
-# The checkout folders editor: host, load and the one auto-open
+# The checkout folders editor: its place in Settings, its loading and visibility
 # ---------------------------------------------------------------------------
 
 FOLDERS_EDITOR = "#checkout-folders-editor"
 FOLDERS_LIST_ITEMS = "#checkout-folders-list .checkout-folders-path"
+SETTINGS_PANEL = "#stage-order-editor"
+FOLDER_ROUTE_COUNTER = """
+window.folderRequests = 0;
+const nyxCountFolders = window.fetch;
+window.fetch = function (...args) {
+  if (String(args[0]).includes('/api/checkout-settings')) window.folderRequests++;
+  return nyxCountFolders(...args);
+};
+"""
 
 
 def folder_paths(page):
@@ -12221,8 +12239,8 @@ def folder_paths(page):
 
 
 def toggle_folders_editor(page):
-    """Press the editor's summary and let its toggle event run."""
-    page.locator(f"{FOLDERS_EDITOR} summary").click()
+    """Press the Settings summary, opening or closing the panel and its editors."""
+    page.locator("#stage-order-editor summary").click()
     settle_frames(page)
 
 
@@ -12239,44 +12257,72 @@ def open_folders_page(launch, attention_checkouts, settings, double=None, client
     return page, double
 
 
-def test_checkout_folders_editor_sits_in_the_status_row_for_ready_and_failed_outcomes(
+def test_checkout_folders_editor_is_the_panels_second_section(
     open_page, attention_checkouts
 ):
-    """Only a settled ready or failed outcome shows the editor, in the status row."""
+    """The editor is a section of Settings, shown for every offered outcome."""
     double = BrowserCheckouts(attention_checkouts.document)
+    settings = BrowserSettings(revision=CHECKOUTS_REVISION)
     gate = double.hold()
     page = open_page(
         StaticClient(attention_checkouts.catalog_all),
-        settings=BrowserSettings(revision=CHECKOUTS_REVISION), checkouts=double,
+        settings=settings, checkouts=double,
         fake_clock=True, init_script=RESPONSE_RECORDER,
     )
     assert double.entered.wait(timeout=10)
     show_checkouts_view(page)
     editor = page.locator(FOLDERS_EDITOR)
-    # Nothing has settled, so the held first request leaves the editor hidden.
-    playwright.expect(editor).to_be_hidden()
+    # The first request is held, so the section is in its idle state: shown.
+    assert page.evaluate("""() => {
+      const section = document.querySelector('#checkout-folders-editor');
+      const panel = document.querySelector('#stage-order-editor');
+      const stage = document.querySelector('#stage-order-section');
+      const headings = [...section.querySelectorAll('h3')]
+        .map((node) => node.textContent.trim());
+      return section.tagName === 'SECTION' &&
+        section.closest('#stage-order-editor') === panel &&
+        section.closest('#checkouts') === null &&
+        section.closest('details') === panel &&
+        section.parentElement.parentElement === panel &&
+        stage.compareDocumentPosition(section) === Node.DOCUMENT_POSITION_FOLLOWING &&
+        headings.length === 1 && headings[0] === 'Checkout folders';
+    }""")
+    # The panel's first open, with no draft, loads the saved folders once.
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(SETTINGS_PANEL)).to_have_attribute("open", "")
+    playwright.expect(editor).to_be_visible()
+    playwright.expect(page.locator("#stage-order-section")).to_be_visible()
+    playwright.expect(
+        page.get_by_role("heading", name="Checkout folders", exact=True)
+    ).to_be_visible()
     gate.set()
     wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
     playwright.expect(editor).to_be_visible()
-    assert page.evaluate("""() => {
-      const editor = document.querySelector('#checkout-folders-editor');
-      return editor.tagName === 'DETAILS' &&
-        editor.parentElement.classList.contains('checkouts-status') &&
-        editor.closest('#checkouts-status-line, #checkouts-body') === null &&
-        editor.querySelector('summary').textContent === 'Checkout folders';
-    }""")
-    # No remote-check control replaces it in the status row.
-    assert page.locator("#check-remotes").count() == 0
-    assert "Check remotes now" not in page.locator("#checkouts").inner_text()
-    page.evaluate("document.querySelector('#checkout-folders-editor').dataset.mark = 'same'")
+    assert settings.folder_gets == 1
+    # It stays shown on both views, and a draft in hand asks for nothing on a reopen.
+    for view in ("#view-checkouts", "#view-board"):
+        page.locator(view).click()
+        settle_frames(page)
+        playwright.expect(editor).to_be_visible()
+    page.locator("#view-checkouts").click()
+    add_folder(page, "/work/draft")
+    toggle_folders_editor(page)
+    assert page.evaluate(
+        "document.querySelector('#stage-order-editor').open") is False
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/draft"])
+    assert settings.folder_gets == 1
 
     # A failed outcome keeps it, and the node a tick leaves is the one marked.
+    page.evaluate("document.querySelector('#checkout-folders-editor').dataset.mark = 'same'")
     double.fail("checkouts_unavailable")
     fire_checkouts_poll(page)
     playwright.expect(page.locator(".checkouts-panel")).to_have_count(1)
     assert page.locator("#checkouts-status-line").inner_text() == ""
     playwright.expect(editor).to_be_visible()
     assert editor.get_attribute("data-mark") == "same"
+    # No remote-check control replaces it in the view.
     assert page.locator("#check-remotes").count() == 0
     assert "Check remotes now" not in page.locator("#checkouts").inner_text()
     fire_checkouts_poll(page)
@@ -12284,7 +12330,7 @@ def test_checkout_folders_editor_sits_in_the_status_row_for_ready_and_failed_out
     playwright.expect(editor).to_be_visible()
     assert editor.get_attribute("data-mark") == "same"
 
-    # The standalone server has no checkouts route, so the editor stays hidden.
+    # A server that serves no checkout state hides the section and loads nothing.
     plain = open_page(
         StaticClient(attention_checkouts.catalog_all), fake_clock=True,
         init_script=RESPONSE_RECORDER,
@@ -12294,6 +12340,67 @@ def test_checkout_folders_editor_sits_in_the_status_row_for_ready_and_failed_out
     settle_frames(plain)
     show_checkouts_view(plain)
     playwright.expect(plain.locator(FOLDERS_EDITOR)).to_be_hidden()
+    plain.evaluate(FOLDER_ROUTE_COUNTER)
+    toggle_folders_editor(plain)
+    playwright.expect(plain.locator(SETTINGS_PANEL)).to_have_attribute("open", "")
+    playwright.expect(plain.locator(FOLDERS_EDITOR)).to_be_hidden()
+    assert plain.evaluate("window.folderRequests") == 0
+
+
+def test_open_settings_panel_bound_keeps_the_board_reachable(open_page, attention_checkouts):
+    """The open panel scrolls inside a bound, so its toolbar never covers most of a window."""
+    document = suggestion_document(attention_checkouts, [
+        {"path": "/work/aaa", "package_count": 1},
+        {"path": "/work/bbb", "package_count": 2},
+        {"path": "/work/ccc", "package_count": 3},
+    ])
+    settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
+    settings.folders = ["/work/alpha", "/work/beta", "/work/gamma"]
+    page, _ = open_folders_page(
+        open_page, attention_checkouts, settings, BrowserCheckouts(document),
+        client=StaticClient(lifecycle_payload()))
+    toggle_folders_editor(page)
+    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_count(3)
+    assert folder_buttons(page, "suggest") == [
+        "Add /work/aaa (1 work item)", "Add /work/bbb (2 work items)",
+        "Add /work/ccc (3 work items)"]
+    assert page.locator("#stage-order-list .stage-order-item").count() >= 3
+    for width, height in ((1280, 720), (390, 800)):
+        page.set_viewport_size({"width": width, "height": height})
+        settle_frames(page)
+        bounds = page.evaluate("""() => {
+          const toolbar = document.querySelector('header.toolbar').getBoundingClientRect();
+          const content = document.querySelector('.stage-order-content');
+          const control = document.querySelector('#checkout-folders-cancel');
+          return {
+            toolbarBottom: toolbar.bottom,
+            viewportHeight: window.innerHeight,
+            scrollHeight: content.scrollHeight,
+            clientHeight: content.clientHeight,
+            controlBottom: control.getBoundingClientRect().bottom,
+            contentBottom: content.getBoundingClientRect().bottom,
+          };
+        }""")
+        assert bounds["toolbarBottom"] <= 0.7 * bounds["viewportHeight"], (width, bounds)
+        assert bounds["scrollHeight"] > bounds["clientHeight"], (width, bounds)
+        # The content scrolls to its last control inside the bound.
+        assert bounds["controlBottom"] > bounds["contentBottom"], (width, bounds)
+        page.evaluate(
+            "() => { const content = document.querySelector('.stage-order-content');"
+            " content.scrollTop = content.scrollHeight; }")
+        settle_frames(page)
+        scrolled = page.evaluate("""() => {
+          const content = document.querySelector('.stage-order-content');
+          const control = document.querySelector('#checkout-folders-cancel');
+          const box = content.getBoundingClientRect();
+          const placed = control.getBoundingClientRect();
+          return {scrollTop: content.scrollTop, controlTop: placed.top,
+                  controlBottom: placed.bottom,
+                  contentTop: box.top, contentBottom: box.bottom};
+        }""")
+        assert scrolled["scrollTop"] > 0, (width, scrolled)
+        assert scrolled["controlTop"] >= scrolled["contentTop"] - 1, (width, scrolled)
+        assert scrolled["controlBottom"] <= scrolled["contentBottom"] + 1, (width, scrolled)
 
 
 def test_checkout_folders_editor_loads_the_saved_folders_on_every_open_without_a_draft(
@@ -12479,27 +12586,31 @@ def test_checkout_folders_edits_are_ignored_while_the_saved_folders_load(
     assert settings.folder_calls == []
 
 
-def test_checkout_folders_editor_opens_itself_once_with_no_saved_folders(
+def assert_panel_stayed_closed(page, settings):
+    """The panel is closed and has asked for no saved folders."""
+    assert page.evaluate(
+        "document.querySelector('#stage-order-editor').open") is False
+    assert settings.folder_gets == 0
+
+
+def test_settings_panel_never_opens_itself_with_no_saved_folders(
     open_page, attention_checkouts
 ):
-    """A ready document with no folders opens the editor once; the reader's close sticks."""
+    """No folder list opens the panel by itself, and the view names where to go."""
     settings = BrowserSettings(revision=CHECKOUTS_REVISION)
-    settings.folders = ["/work/alpha"]
-    double = BrowserCheckouts()
     page = open_page(
-        StaticClient(attention_checkouts.catalog_all), settings=settings, checkouts=double,
+        StaticClient(attention_checkouts.catalog_all), settings=settings, checkouts=BrowserCheckouts(),
         fake_clock=True, init_script=RESPONSE_RECORDER,
     )
     wait_for_responses(page, "checkoutsResponses", 1)
-    editor = page.locator(FOLDERS_EDITOR)
-    # The view is still the board; the panel opens itself and loads once.
-    playwright.expect(editor).to_have_attribute("open", "")
-    playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
-    assert settings.folder_gets == 1
+    settle_frames(page)
+    panel = page.locator(SETTINGS_PANEL)
+    # The view's empty list names Settings as the way in, and no tick opens the panel.
+    assert panel.get_attribute("open") is None
     show_checkouts_view(page)
-    toggle_folders_editor(page)
-    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
-
+    playwright.expect(page.locator("#checkouts-body")).to_contain_text(
+        "No checkout folders are configured. Choose Checkout folders in Settings to add one.")
+    assert_panel_stayed_closed(page, settings)
     fire_checkouts_poll(page)
     settle_frames(page)
     page.locator("#view-board").click()
@@ -12507,16 +12618,15 @@ def test_checkout_folders_editor_opens_itself_once_with_no_saved_folders(
     playwright.expect(page.locator("#checkouts")).to_be_visible()
     fire_checkouts_poll(page)
     settle_frames(page)
-    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is False
-    assert settings.folder_gets == 1
+    assert_panel_stayed_closed(page, settings)
 
-    # A document with a folder never opens it.
+    # A ready document with one folder configured never opens it either.
     other = BrowserSettings(revision=CHECKOUTS_REVISION)
+    other.folders = ["/work/alpha"]
     full, _ = open_folders_page(open_page, attention_checkouts, other)
     fire_checkouts_poll(full)
     settle_frames(full)
-    assert full.evaluate("document.querySelector('#checkout-folders-editor').open") is False
-    assert other.folder_gets == 0
+    assert_panel_stayed_closed(full, other)
 
 
 def folder_buttons(page, role):
@@ -12667,11 +12777,12 @@ def test_checkout_folders_suggestions_offer_unconfigured_parents_with_their_coun
 def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switches(
     open_page, attention_checkouts
 ):
-    """Nothing the view redraws touches an open editor, its draft or the focus in it."""
+    """Nothing the view redraws touches the open panel, its drafts or the focus in it."""
     settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
     settings.folders = ["/work/alpha"]
     client = StaticClient(attention_checkouts.catalog_all)
-    page, _ = open_folders_page(open_page, attention_checkouts, settings, client=client)
+    page, double = open_folders_page(
+        open_page, attention_checkouts, settings, client=client)
     toggle_folders_editor(page)
     playwright.expect(page.locator(FOLDERS_LIST_ITEMS)).to_have_text(["/work/alpha"])
     add_folder(page, "/work/draft")
@@ -12687,7 +12798,8 @@ def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switch
     }""")
 
     def intact():
-        assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is True
+        assert page.evaluate(
+            "document.querySelector('#stage-order-editor').open") is True
         assert folder_paths(page) == ["/work/alpha", "/work/draft"]
         assert path_input.input_value() == "typed"
         playwright.expect(path_input).to_be_focused()
@@ -12699,25 +12811,48 @@ def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switch
     assert page.evaluate("window.editorRecords") == []
     intact()
 
-    # Installing a changed catalog leaves the editor alone.
+    # Installing a changed catalog rewrites the stage section and leaves the
+    # folders section alone: focus stays on the second folder's Remove, the same
+    # node (S10).  A restorer that collected both sections would pick the first
+    # control it cannot tell apart.
+    page.get_by_role(
+        "button", name="Remove checkout folder /work/draft", exact=True).focus()
+    page.evaluate("() => { window.removeNode = document.activeElement; }")
     changed = copy.deepcopy(attention_checkouts.catalog_all)
     changed["entries"][0]["declared"]["title"] = "Retitled by the install"
     _reseal(changed)
     client.payload = changed
-    page.locator("#view-board").click()
     fire_poll(page)
     settle_frames(page)
-    assert page.locator(
+    assert page.evaluate("window.editorRecords") == []
+    assert page.evaluate("document.activeElement === window.removeNode") is True
+    # The installed catalog reaches the board as well.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator(
         f'.card[data-package-path="{changed["entries"][0]["package_path"]}"] .card-title'
-    ).text_content() == "Retitled by the install"
+    )).to_have_text("Retitled by the install")
     page.locator("#view-checkouts").click()
     playwright.expect(page.locator("#checkouts")).to_be_visible()
     settle_frames(page)
     assert page.evaluate("window.editorRecords") == []
-    assert page.evaluate("document.querySelector('#checkout-folders-editor').open") is True
+    assert page.evaluate(
+        "document.querySelector('#stage-order-editor').open") is True
     assert folder_paths(page) == ["/work/alpha", "/work/draft"]
     assert path_input.input_value() == "typed"
     assert settings.folder_gets == 1
+
+    # A checkouts tick that rewrites the folders suggestions leaves the stage
+    # list's focus on the stage control it was on (S11).
+    page.locator("#stage-order-list .stage-order-item").nth(1).get_by_role(
+        "button", name=re.compile(r"^Move .* up$")).focus()
+    page.evaluate("() => { window.stageNode = document.activeElement; }")
+    serve_checkouts(page, double, suggestion_document(
+        attention_checkouts, [{"path": "/work/aaa", "package_count": 1}]))
+    assert folder_buttons(page, "suggest") == ["Add /work/aaa (1 work item)"]
+    assert page.evaluate("document.activeElement === window.stageNode") is True
+    assert folder_paths(page) == ["/work/alpha", "/work/draft"]
+    assert path_input.input_value() == "typed"
+
     path_input.focus()
     fire_checkouts_poll(page)
     settle_frames(page)
@@ -12947,6 +13082,8 @@ def test_checkout_folders_save_in_flight_keeps_focus_on_save(open_page, attentio
             control = controls.nth(index)
             assert control.get_attribute("aria-disabled") == "true"
             assert control.get_attribute("disabled") is None
+        # Only the folders controls are dimmed: the stage section keeps its own.
+        assert page.locator('#stage-order-section [aria-disabled="true"]').count() == 0
         measurement = assert_focus_indicator(save)
         assert 0 < measurement["opacity"] < 1, measurement
         # A dimmed control does nothing: the draft is untouched by its click.
@@ -13003,10 +13140,13 @@ def test_checkout_folders_save_refusals_keep_focus_in_the_editor(
     playwright.expect(save).to_be_focused()
     assert folder_marks(page)[0][0] == "true"
 
-    # A conflict disables Save until a reload; focus must not fall to the body.
+    # A conflict disables Save until a reload; focus must not fall to the body,
+    # and the next operable control in the section takes it.
     settings.revision = "e" * 64
     save.press("Enter")
     playwright.expect(status).to_contain_text("changed elsewhere")
+    playwright.expect(page.get_by_role(
+        "button", name="Cancel checkout folder changes", exact=True)).to_be_focused()
     assert focus_is_in_editor_and_operable()
 
 
@@ -13066,12 +13206,12 @@ def move_second_stage_up(page):
 
 
 def open_two_editors(open_page, attention_checkouts, settings, double=None):
-    """Open the checkouts view with the folder editor open beside the Settings panel."""
+    """Open the Settings panel over the checkouts view, with both editors in it."""
     double = double or BrowserCheckouts(attention_checkouts.document)
     settings.checkouts = double
     page, double = open_folders_page(open_page, attention_checkouts, settings, double)
-    playwright.expect(page.locator("#stage-order-status")).to_contain_text("board settings loaded")
     toggle_folders_editor(page)
+    playwright.expect(page.locator("#stage-order-status")).to_contain_text("board settings loaded")
     return page, double
 
 
@@ -13231,7 +13371,10 @@ def test_checkout_folders_save_refreshes_the_catalog_and_reads_the_new_folders(
     page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
     body = page.locator("#checkouts-body")
     playwright.expect(body).to_contain_text(NO_FOLDERS_WORDS)
-    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()  # opens itself
+    # No folder list opens the panel; the reader opens it and adds the folder.
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_hidden()
+    toggle_folders_editor(page)
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()
     catalogs = page.evaluate("window.catalogResponses.length")
     reads = page.evaluate("window.checkoutsResponses.length")
     calls = double.calls
@@ -13261,7 +13404,8 @@ def test_checkout_folders_save_sends_no_second_checkouts_request_while_one_is_in
     double = BrowserCheckouts()
     settings.checkouts = double
     page, _ = open_folders_page(open_page, attention_checkouts, settings, double)
-    playwright.expect(page.locator("#checkout-folders-path")).to_be_visible()  # opens itself
+    playwright.expect(page.locator("#checkout-folders-path")).to_be_hidden()
+    toggle_folders_editor(page)
     add_folder(page, "/work/alpha")
     calls = double.calls
     gate = double.hold()
