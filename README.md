@@ -121,12 +121,13 @@ the account-local configuration for the current workspace root. Another root can
 use a different set, and returning to this root restores its own choice.
 
 The same finished-stage selection drives the board's **Hide terminal rows**
-control in the top bar. It starts checked, so rows for finished stages are hidden
-until you reveal them, and the preference lives in the browser like **Hide empty
-rows and columns**. This is presentation only: it never changes setup, the
-catalog, or which prerequisites are outstanding. Every discovered stage has rows
-in the catalog; **Hide terminal rows** is the only control that hides populated
-stage rows. Unchecking it reveals finished rows and their cards.
+control left of **Settings** in the top bar. It starts checked, so rows for
+finished stages are hidden until you reveal them, and the preference lives in
+the browser like **Hide empty rows and columns**. This is presentation only: it
+never changes setup, the catalog, or which prerequisites are outstanding. Every
+discovered stage has rows in the catalog; **Hide terminal rows** is the only
+control that hides populated stage rows. Unchecking it reveals finished rows and
+their cards.
 
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.
 This is intentionally a fresh state root: legacy Linux state is neither read nor

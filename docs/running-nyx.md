@@ -1098,12 +1098,13 @@ available if saved board settings cannot load. **Save**, **Cancel**, and
 **Reset** affect the saved row settings, not this checkbox.
 
 Selecting a stage as finished also marks its rows as terminal on the board. The
-**Hide terminal rows** checkbox in the top bar starts checked, so finished rows
-are hidden until you reveal them, and the choice is stored in the browser like
-**Hide empty rows and columns**. This grouping is presentation only: it does not
-change setup, the catalog, or which dependencies count as satisfied. Every
-discovered stage remains in the catalog; uncheck **Hide terminal rows** to reveal
-finished rows. This is the only control that hides populated stage rows.
+**Hide terminal rows** checkbox left of **Settings** in the top bar starts
+checked. It hides finished rows until you reveal them, and the choice is stored
+in the browser like **Hide empty rows and columns**. This grouping is
+presentation only: it does not change setup, the catalog, or which dependencies
+count as satisfied. Every discovered stage remains in the catalog; uncheck
+**Hide terminal rows** to reveal finished rows. This is the only control that
+hides populated stage rows.
 
 ## Change the checkout folders
 

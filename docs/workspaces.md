@@ -241,12 +241,12 @@ finished when it reads a package's Code Status (see
 treats no package as finished.
 
 The same selection groups finished rows on the board. The **Hide terminal rows**
-checkbox in the top bar starts checked, so rows for the selected stages are hidden
-until you reveal them, and the choice is stored in the browser. This is
-presentation only: it does not change the policy, the catalog, or dependency
-results. Every discovered stage remains in the catalog. Uncheck **Hide terminal
-rows** to reveal finished rows; this is the only control that hides populated
-stage rows.
+checkbox left of **Settings** in the top bar starts checked. Rows for the
+selected stages are hidden until you reveal them, and the choice is stored in the
+browser. This is presentation only: it does not change the policy, the catalog,
+or dependency results. Every discovered stage remains in the catalog. Uncheck
+**Hide terminal rows** to reveal finished rows; this is the only control that
+hides populated stage rows.
 
 The selected stage names are saved per canonical workspace root and shared by
 all projects in that root. Switching roots keeps each root's own setting, and a
