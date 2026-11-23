@@ -10398,15 +10398,17 @@ def test_checkouts_show_on_board_follows_the_card_the_board_shows(
 
     # Unchecking the box on the board restores gamma's card, and returning shows
     # its button at both sites with no reload.
+    page.evaluate("() => { window.showOnBoardPage = 'kept'; }")
     set_box(False)
     assert not box.is_checked()
     assert show_on_board_paths(topic_g) == ["Repo/Shipped/gamma"]
     assert show_on_board_paths(gamma_detail) == ["Repo/Shipped/gamma"]
 
-    # Checking it again removes them.
+    # Checking it again removes them, in the same page.
     set_box(True)
     assert show_on_board_paths(topic_g) == []
     assert show_on_board_paths(gamma_detail) == []
+    assert page.evaluate("() => window.showOnBoardPage") == "kept"
 
     # The same item over a board whose catalog has no zeta card keeps its words
     # and loses its button.
