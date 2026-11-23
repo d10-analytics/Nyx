@@ -8477,6 +8477,31 @@ def with_unfinished(document, path):
     return checkout_raw_variant(document, mutate)
 
 
+def without_remote_copy(document, name):
+    """One capture whose named Work item branch serves no remote copy at all.
+
+    The collector serves ``remote: None`` for a repository without a remote, so
+    this is that shape without a git world that has no remote.  The parser's
+    cross-field rules are not the subject, so it is not consulted.
+    """
+    def mutate(variant):
+        entry = next(
+            entry for entry in checkout_group(variant, "remote")["package_branches"]
+            if entry["name"] == name
+        )
+        entry["remote"] = None
+    return checkout_raw_variant(document, mutate)
+
+
+def copy_state(document, name):
+    """The served remote copy state of the group's named Work item branch."""
+    entry = next(
+        entry for entry in checkout_group(document, "remote")["package_branches"]
+        if entry["name"] == name
+    )
+    return None if entry["remote"] is None else entry["remote"]["state"]
+
+
 def open_view_checkouts(launch, view_checkouts, document):
     """Open the checkouts view over this fixture's catalog and ``document``."""
     double = BrowserCheckouts(document)
@@ -8774,9 +8799,27 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
         'table.checkouts-package-branches tr[data-branch="topic-c"]')
     assert topic_c.count() == 0
     assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+    # Every clone of the group was read in each capture whose missing rows this
+    # test asserts, so a missing row means the branch exists nowhere rather
+    # than that a clone could not be read.
+    for capture in (document, checked, view_checkouts.document_recorded):
+        assert [clone["status"] for clone in checkout_group(capture, "remote")["clones"]] == (
+            ["ok"] * len(checkout_group(capture, "remote")["clones"]))
+    assert copy_state(checked, "topic-c") == "absent"
+    assert copy_state(view_checkouts.document_recorded, "topic-c") == "absent"
+    # A live check and the saved check both recorded the branch absent, and no
+    # clone holds it, so there is no row to show.
     serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
-    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
-
+    assert topic_c.count() == 0
+    serve_checkouts(
+        page, double,
+        with_unfinished(view_checkouts.document_recorded, "Repo/Shipped/gamma"))
+    assert topic_c.count() == 0
+    # A repository with no remote serves no copy at all, which reads as absent.
+    serve_checkouts(
+        page, double,
+        without_remote_copy(with_unfinished(document, "Repo/Shipped/gamma"), "topic-c"))
+    assert topic_c.count() == 0
 
 
 def test_checkouts_freshness_reads_cached_live_and_recorded(
@@ -8908,6 +8951,20 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
     playwright.expect(group).to_be_visible()
     assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
     playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+
+    # A branch that exists nowhere leaves the search text too: the checked
+    # capture recorded its copy absent, while the work item that names it stays
+    # searchable through its target clone.
+    checked = with_unfinished(view_checkouts.document_checked, "Repo/Shipped/gamma")
+    assert copy_state(checked, "topic-c") == "absent"
+    serve_checkouts(page, double, checked)
+    search = group.get_attribute("data-search")
+    assert "topic-c" not in search
+    assert "repo/shipped/gamma" in search
+    page.fill("#filter", "topic-c")
+    playwright.expect(group).to_be_hidden()
+    page.fill("#filter", "repo/shipped/gamma")
+    playwright.expect(group).to_be_visible()
 
 
 def test_checkouts_search_counts_the_quiet_repositories_it_matches(
@@ -9203,6 +9260,22 @@ def test_checkouts_word_tables_show_their_served_values(
             has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
         ).get_attribute("data-search")
 
+    def verdict_ink(scope, branch):
+        """One verdict's words, their colour and the colour of the cell holding them."""
+        row = body.locator(f'{scope} tr[data-branch="{branch}"]')
+        words = row.locator(".checkouts-verdict-words")
+        return (
+            words.text_content(),
+            words.evaluate("node => getComputedStyle(node).color"),
+            row.locator("td.checkouts-verdict").evaluate(
+                "node => getComputedStyle(node).color"),
+        )
+
+    # The verdict words, the cell that holds them, and the page's done green.
+    work_item_branches = "table.checkouts-package-branches"
+    clone_details = 'tr.checkouts-detail[data-detail-for$="Repo Clone 2"]'
+    done = baseline_token_color(page, "--state-done")
+
     # The built capture: comparison relation and basis, availability state and
     # reason, the assignment basis, status, remote copy, verdict state, the
     # branch blocker, the branch package basis and the check/lookup words.
@@ -9221,6 +9294,12 @@ def test_checkouts_word_tables_show_their_served_values(
     assert "not merged" in body.locator(
         'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] tr[data-branch="topic-a"]'
     ).text_content()
+    # An unmerged verdict's words keep the colour of the cell that holds them, in
+    # both tables.
+    for scope in (work_item_branches, clone_details):
+        words, ink, cell = verdict_ink(scope, "topic-a")
+        assert words == "not merged"
+        assert ink == cell and ink != done
     assert page.locator(".checkouts-group-check").first.inner_text() == "remote checks off"
     assert page.locator(".checkouts-group-lookup").first.inner_text() == (
         "pull request lookup off")
@@ -9234,9 +9313,38 @@ def test_checkouts_word_tables_show_their_served_values(
     serve_checkouts(page, double, checked)
     assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
     shows("on the remote (live)")
-    serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
-    shows("not on the remote")
     shows("live")
+    # A branch whose copy the check found absent keeps its row while a readable
+    # clone holds it, and its cell reads the absent words.
+    def absent_topic_a(variant):
+        entry = next(
+            entry for entry in checkout_group(variant, "remote")["package_branches"]
+            if entry["name"] == "topic-a"
+        )
+        entry["remote"] = {"state": "absent", "sha": None, "basis": None}
+
+    def absent_while_unreadable(variant):
+        absent_topic_a(variant)
+        _, clone_two = checkout_clone(variant, "Repo Clone 2")
+        set_clone_status(clone_two, "failed")
+
+    serve_checkouts(page, double, checkout_raw_variant(checked, absent_topic_a))
+    topic_a_row = body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]')
+    assert topic_a_row.count() == 1
+    assert topic_a_row.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
+    assert topic_a_row.locator(
+        ".checkouts-work-items .checkouts-package-path").inner_text() == "Repo/Drafts/alpha"
+    # The same branch keeps its row while the only clone that holds it cannot be
+    # read, because the view cannot tell what that clone holds.
+    serve_checkouts(
+        page, double, checkout_raw_variant(checked, absent_while_unreadable))
+    assert topic_a_row.count() == 1
+    assert topic_a_row.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
+    # A branch only the remote holds reads its unknown reason in the cell's colour.
+    serve_checkouts(page, double, checked)
+    words, ink, cell = verdict_ink(work_item_branches, "topic-d")
+    assert words == "merge state unknown — no clone holds its commits"
+    assert ink == cell and ink != done
 
     # A saved check from a later local collection, and one that then failed.
     recorded = view_checkouts.document_recorded
@@ -9315,6 +9423,12 @@ def test_checkouts_word_tables_show_their_served_values(
     assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                         " .checkouts-verdict-words").inner_text() == (
         "merged — pull request #7 merged")
+    # A merged verdict's words take the done green in both tables; the cell that
+    # holds them stays as it is.
+    for scope in (work_item_branches, clone_details):
+        words, ink, cell = verdict_ink(scope, "topic-a")
+        assert words == "merged — pull request #7 merged"
+        assert ink == done and cell != done
     pulls = body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                          " .checkouts-pulls").inner_text()
     assert pulls == "#3 open (different head) · #7 merged"
@@ -9325,6 +9439,38 @@ def test_checkouts_word_tables_show_their_served_values(
         page, double, checkout_variant(document, mutate_merged_branch))
     assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                         " .checkouts-verdict-words").inner_text() == "merged — tip is in trunk"
+    for scope in (work_item_branches, clone_details):
+        words, ink, cell = verdict_ink(scope, "topic-a")
+        assert words == "merged — tip is in trunk"
+        assert ink == done and cell != done
+
+    # The board's work item panel prints its verdict through the same function,
+    # so its All fields row reads the done green too, for either rung.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    page.locator('.card[data-package-path="Repo/Drafts/alpha"]').click()
+
+    def panel_verdict():
+        """The panel's All fields Verdict row: its words, their colour and the row's."""
+        row = page.locator(
+            "#work-item-panel-body .panel-all-fields .panel-row").filter(
+                has=page.locator('dt:text-is("Verdict")'))
+        words = row.locator(".checkouts-verdict-words")
+        return (
+            words.text_content(),
+            words.evaluate("node => getComputedStyle(node).color"),
+            row.locator("dd").evaluate("node => getComputedStyle(node).color"),
+        )
+
+    words, ink, row_ink = panel_verdict()
+    assert words == "merged — tip is in trunk"
+    assert ink == done and row_ink != done
+    serve_checkouts(
+        page, double, checkout_variant(checked, mutate_lookup_and_pull_requests))
+    words, ink, row_ink = panel_verdict()
+    assert words == "merged — pull request #7 merged"
+    assert ink == done and row_ink != done
 
 
 def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
@@ -9349,9 +9495,9 @@ def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
 
 
 def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts):
-    """Each work item's table action shows its card, or says why it cannot."""
+    """Each work item's table action shows its card."""
     document = view_checkouts.document_built
-    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
     open_repository(page, "remote")
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
@@ -9364,18 +9510,6 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
     playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
     assert page.evaluate(
         "() => document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
-
-    # A work item in a finished row the board is hiding says so and stays put.
-    show_checkouts_view(page)
-    serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
-    remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
-    topic_c = remote_view.locator(
-        'table.checkouts-package-branches tr[data-branch="topic-c"]')
-    topic_c.locator('[data-show-on-board="Repo/Shipped/gamma"]').click()
-    playwright.expect(page.locator("#checkouts")).to_be_visible()
-    playwright.expect(page.locator("#board")).to_be_hidden()
-    assert page.locator("#checkouts-action-status").inner_text() == (
-        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
 
 
 def test_checkouts_status_line_names_a_scan_from_other_settings(
@@ -10263,33 +10397,179 @@ def test_checkouts_show_on_board_clears_a_search_that_hides_the_card(
     assert focused_checkouts_target(page)["packagePath"] == "Repo/Drafts/zeta"
 
 
-def test_checkouts_show_on_board_refuses_a_finished_row_and_an_absent_work_item(
+def show_on_board_paths(scope):
+    """The work item each Show on board button in ``scope`` names, in order."""
+    return scope.locator("[data-show-on-board]").evaluate_all(
+        "nodes => nodes.map(node => node.dataset.showOnBoard)")
+
+
+def attention_naming_gamma(document):
+    """One raw capture whose work-items attention item names the finished gamma.
+
+    The collector derives the attention list from the packages, so only a
+    capture served as written can name another item's package; the parser is not
+    consulted, which is what ``checkout_raw_variant`` is for.
+    """
+    variant = checkout_raw_variant(document, lambda value: None)
+    next(entry for entry in variant["attention"]
+         if entry["code"] == "target_repo_missing")["packages"] = ["Repo/Shipped/gamma"]
+    return redigest(variant)
+
+
+def alpha_in_the_finished_stage(catalog):
+    """One catalog whose alpha has moved into the finished Shipped stage."""
+    changed = copy.deepcopy(catalog)
+    entry = next(item for item in changed["entries"]
+                 if item["package_path"] == "Repo/Drafts/alpha")
+    entry["package_path"] = "Repo/Shipped/alpha"
+    entry["stage"] = "Shipped"
+    changed["entries"].sort(key=lambda item: item["package_path"])
+    return _reseal(changed)
+
+
+def test_checkouts_show_on_board_follows_the_card_the_board_shows(
     open_page, attention_checkouts
 ):
-    """Where the card cannot be shown the view stays and says why; the preference is left alone."""
+    """Every site prints the button exactly while the board renders that card."""
     document = attention_checkouts.document
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
-    key = "spec-tracker-hide-terminal-rows"
-    stored = page.evaluate("key => window.localStorage.getItem(key)", key)
-    detail = open_clone_detail(page, "Repo Clone 2")
-    detail.locator('li[data-package="Repo/Shipped/gamma"] [data-show-on-board]').click()
-    playwright.expect(page.locator("#checkouts")).to_be_visible()
-    playwright.expect(page.locator("#board")).to_be_hidden()
-    assert page.locator("#checkouts-action-status").inner_text() == (
-        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
-    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
-    assert page.evaluate("key => window.localStorage.getItem(key)", key) == stored
+    remote = open_repository(page, "remote")
+    topic_a = remote.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-a"]')
+    topic_g = remote.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-g"]')
+    open_clone_detail(page, "Repo Clone 2")
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+    alpha_detail = detail.locator('li[data-package="Repo/Drafts/alpha"]')
+    gamma_detail = detail.locator('li[data-package="Repo/Shipped/gamma"]')
+    zeta = page.locator('#checkouts-body li[data-code="target_repo_missing"]')
+    box = page.get_by_label("Hide terminal rows", exact=True)
+    preference = "spec-tracker-hide-terminal-rows"
 
-    # A work item the displayed catalog does not hold.
-    other, _ = open_attention_checkouts(
+    def set_box(value):
+        """Press the board's own control, then return to the view."""
+        page.locator("#view-board").click()
+        playwright.expect(page.locator("#board")).to_be_visible()
+        box.set_checked(value)
+        assert page.evaluate(
+            "key => window.localStorage.getItem(key)", preference) == str(value).lower()
+        show_checkouts_view(page)
+
+    # The default hides the finished stage, so the finished gamma keeps its path,
+    # basis and Code Status at both sites and loses only its button, while the
+    # unfinished alpha keeps its button at both; the attention item naming the
+    # unfinished zeta keeps its own.  Nothing but the control has written the
+    # stored preference.
+    assert box.is_checked()
+    assert page.evaluate(
+        "key => window.localStorage.getItem(key)", preference) is None
+    assert show_on_board_paths(topic_g) == []
+    assert topic_g.locator(".checkouts-work-item .checkouts-package-path").inner_text() == \
+        "Repo/Shipped/gamma"
+    assert topic_g.locator(".checkouts-work-item .checkouts-basis").inner_text() == \
+        "(Target repo)"
+    assert show_on_board_paths(topic_a) == ["Repo/Drafts/alpha"]
+    assert show_on_board_paths(gamma_detail) == []
+    assert gamma_detail.locator(".checkouts-package-path").inner_text() == \
+        "Repo/Shipped/gamma"
+    assert gamma_detail.locator(".checkouts-basis").inner_text() == "(Target repo)"
+    assert gamma_detail.locator(".checkouts-code-status").inner_text() == \
+        "awaiting merge (no PR)"
+    assert show_on_board_paths(alpha_detail) == ["Repo/Drafts/alpha"]
+    assert show_on_board_paths(zeta) == ["Repo/Drafts/zeta"]
+
+    # Unchecking the box on the board restores gamma's card, and returning shows
+    # its button at both sites with no reload.
+    page.evaluate("() => { window.showOnBoardPage = 'kept'; }")
+    set_box(False)
+    assert not box.is_checked()
+    assert show_on_board_paths(topic_g) == ["Repo/Shipped/gamma"]
+    assert show_on_board_paths(gamma_detail) == ["Repo/Shipped/gamma"]
+
+    # Checking it again removes them, in the same page.
+    set_box(True)
+    assert show_on_board_paths(topic_g) == []
+    assert show_on_board_paths(gamma_detail) == []
+    assert page.evaluate("() => window.showOnBoardPage") == "kept"
+
+    # The same item over a board whose catalog has no zeta card keeps its words
+    # and loses its button.
+    absent, absent_checkouts = open_attention_checkouts(
         open_page, attention_checkouts, document, catalog=attention_checkouts.catalog)
-    stored = other.evaluate("key => window.localStorage.getItem(key)", key)
-    other.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
-    playwright.expect(other.locator("#checkouts")).to_be_visible()
-    playwright.expect(other.locator("#board")).to_be_hidden()
-    assert other.locator("#checkouts-action-status").inner_text() == (
-        "This work item is not on the board. The board shows catalog changes within ten seconds.")
-    assert other.evaluate("key => window.localStorage.getItem(key)", key) == stored
+    zeta = absent.locator('#checkouts-body li[data-code="target_repo_missing"]')
+    assert "Repo/Drafts/zeta" in zeta.inner_text()
+    assert show_on_board_paths(zeta) == []
+
+    # A work-items item that names the finished gamma follows the box too.
+    serve_checkouts(absent, absent_checkouts, attention_naming_gamma(document))
+    zeta = absent.locator('#checkouts-body li[data-code="target_repo_missing"]')
+    playwright.expect(zeta).to_contain_text("Repo/Shipped/gamma")
+    assert show_on_board_paths(zeta) == []
+    absent_box = absent.get_by_label("Hide terminal rows", exact=True)
+    absent.locator("#view-board").click()
+    playwright.expect(absent.locator("#board")).to_be_visible()
+    absent_box.set_checked(False)
+    show_checkouts_view(absent)
+    assert show_on_board_paths(zeta) == ["Repo/Shipped/gamma"]
+    absent.locator("#view-board").click()
+    playwright.expect(absent.locator("#board")).to_be_visible()
+    absent_box.set_checked(True)
+    show_checkouts_view(absent)
+    assert show_on_board_paths(zeta) == []
+
+
+def test_checkouts_show_on_board_follows_a_catalog_that_arrives_later(
+    open_page, attention_checkouts
+):
+    """The board's own writer redraws the shown view, not the next checkouts settle."""
+    catalog = attention_checkouts.catalog_all
+    client = BlockingSequenceClient([catalog, catalog], blocked_call=2)
+    double = BrowserCheckouts(attention_checkouts.document)
+    page = open_page(
+        client,
+        settings=BrowserSettings(revision=CHECKOUTS_REVISION),
+        checkouts=double,
+        fake_clock=True,
+        init_script="localStorage.setItem('spec-tracker-view', 'checkouts');"
+        + RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    body = page.locator("#checkouts-body")
+    assert show_on_board_paths(body) != []
+
+    # A load opens on the remembered view with the first catalog request held:
+    # the checkouts answer draws the view with no button anywhere.
+    page.reload()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    assert client.started.is_set()
+    assert page.evaluate("() => window.catalogResponses") == []
+    playwright.expect(body.locator("tr.checkouts-clone")).to_have_count(3)
+    assert show_on_board_paths(body) == []
+    reads = double.calls
+
+    # Releasing the catalog draws the buttons with no further checkouts answer.
+    client.release.set()
+    wait_for_responses(page, "catalogResponses", 1)
+    alpha = body.locator('[data-show-on-board="Repo/Drafts/alpha"]')
+    playwright.expect(alpha).to_have_count(2)
+    assert double.calls == reads
+
+    # A later catalog that moves alpha into the finished stage removes its
+    # buttons while that tick's checkouts read is still held.
+    gate = double.hold()
+    client.payloads[-1] = alpha_in_the_finished_stage(catalog)
+    fire_poll(page)
+    assert double.entered.wait(timeout=5)
+    playwright.expect(alpha).to_have_count(0)
+    assert not gate.is_set()
+    assert show_on_board_paths(body) == ["Repo/Drafts/zeta"]
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", 2)
+    settle_frames(page)
+    playwright.expect(alpha).to_have_count(0)
+    assert "Repo/Drafts/alpha" in body.text_content()
 
 
 class HexRevisionSettings(BrowserSettings):
@@ -10373,57 +10653,306 @@ def test_checkouts_settings_sentence_shows_when_the_catalog_request_failed(
     assert page.locator("#checkouts-body .checkouts-group").count() == 1
 
 
-def covered_card_clearance(page):
-    """How far the focused card's edges lie outside the area the sticky heads leave."""
-    return page.evaluate("""() => {
-      const rect = document.activeElement.getBoundingClientRect();
-      let covered = 0;
-      document.querySelectorAll('.toolbar, .board-corner, .column-head').forEach((head) => {
-        covered = Math.max(covered, head.getBoundingClientRect().bottom);
-      });
-      return {top: rect.top, bottom: rect.bottom, covered, height: window.innerHeight,
-              scrolled: window.scrollY, path: document.activeElement.dataset.packagePath};
-    }""")
+CENTERING_TARGET = "Repo/Drafts/alpha"
+CENTERING_ATTENTION_TARGET = "Repo/Drafts/zeta"
+CENTERING_DEPENDENT = "Repo/Drafts/dependent"
+CENTERING_NEIGHBOUR = "Repo/Drafts/afiller19"
 
 
-def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
+def _project_package_spec(root, project, name, package_id, fields=(), title=None):
+    """Write one fictional package under ``<root>/<project>/Drafts/<name>``."""
+    folder = root / project / "Drafts" / name
+    folder.mkdir(parents=True)
+    (folder / "spec.md").write_text(
+        "\n".join([f"# {name.title() if title is None else title}",
+                   f"Package ID: {package_id}", "Status: approved", *fields]) + "\n",
+        encoding="utf-8")
+
+
+def centering_catalog(root):
+    """One catalog whose board is wider than a 1000 px window and taller than 720.
+
+    ``AlphaWorks`` and ``ZuluWorks`` stand on either side of ``Repo``, so the
+    targets' column is neither first nor last.  Their own Drafts cell carries
+    fillers on both sides of the targets and, last, a work item that declares
+    ``alpha`` as its prerequisite, so its panel offers a link to that card.
+    Nothing here reads git: the catalog is scanned from these spec files.
+    """
+    def package_id(number):
+        return f"123e4567-e89b-42d3-a456-426614{number:06d}"
+
+    _project_package_spec(root, "AlphaWorks", "elsewhere", package_id(1))
+    _project_package_spec(root, "ZuluWorks", "further", package_id(2))
+    for number in range(20):
+        _project_package_spec(root, "Repo", f"afiller{number:02d}", package_id(number))
+    # The target's own title is long, so its card wraps taller than the area of a
+    # narrow window whatever fonts the platform renders with.
+    _project_package_spec(
+        root, "Repo", "alpha", ATTENTION_PACKAGE_IDS["alpha"],
+        title="Alpha keeps a title long enough to wrap its own card over five lines,"
+              " so the card stays larger than the area of a narrow window whatever"
+              " fonts the platform renders with")
+    _project_package_spec(root, "Repo", "zeta", ATTENTION_PACKAGE_IDS["zeta"])
+    for number in range(20):
+        _project_package_spec(root, "Repo", f"zfiller{number:02d}", package_id(number + 100))
+    _project_package_spec(root, "Repo", "dependent", package_id(200),
+                          [f"Completion Prerequisite: {ATTENTION_PACKAGE_IDS['alpha']}"])
+    return json.loads(scan_catalog(
+        root, completed_stage_names=["Shipped"],
+        configuration_revision=CHECKOUTS_REVISION))
+
+
+def board_card_geometry(page, path=None):
+    """One card's rectangle, the area it must sit in, and the window scroll.
+
+    The area is the board's own definition (``boardCardArea`` in
+    ``nyx/static/app.js``) recomputed from the real layout, so a layout change
+    that the board no longer accounts for fails here instead of drifting
+    silently: where the sticky heads come to rest once stuck, which the current
+    scroll does not change, the strip painted after the row labels, and the
+    window's visible edges.  ``labelsRight`` is where the labels themselves end,
+    before that strip.  The card is the named one, else the focused one.
+    """
+    return page.evaluate("""(path) => {
+      const focused = document.activeElement instanceof Element
+        ? document.activeElement.closest('.card') : null;
+      const card = path === null ? focused : [...document.querySelectorAll('.card')]
+        .find((item) => item.dataset.packagePath === path);
+      if (card === null || card === undefined) return null;
+      const rect = card.getBoundingClientRect();
+      const corner = document.querySelector('.board-corner');
+      const rowHead = document.querySelector('.row-head');
+      const labels = [rowHead, corner].filter((head) => head !== null);
+      const heads = [corner, ...document.querySelectorAll('.column-head')]
+        .filter((head) => head !== null);
+      const stuckLeft = Math.max(0, ...labels.map((head) =>
+        parseFloat(getComputedStyle(head).left) || 0));
+      const labelsWidth = Math.max(0, ...labels.map((head) => head.offsetWidth));
+      const strip = rowHead === null ? 0 : (() => {
+        const after = getComputedStyle(rowHead, '::after');
+        return (parseFloat(after.width) || 0) + (parseFloat(after.borderRightWidth) || 0);
+      })();
+      const headHeight = Math.max(0, ...heads.map((head) => head.offsetHeight));
+      const toolbarHeight = parseFloat(getComputedStyle(document.documentElement)
+        .getPropertyValue('--toolbar-height')) || 0;
+      const root = document.documentElement;
+      return {
+        path: card.dataset.packagePath,
+        rect: {left: rect.left, top: rect.top, width: rect.width, height: rect.height},
+        area: {
+          left: stuckLeft + labelsWidth + strip,
+          top: Math.max(document.querySelector('.toolbar').getBoundingClientRect().bottom,
+            toolbarHeight + headHeight),
+          right: root.clientWidth,
+          bottom: root.clientHeight,
+        },
+        labelsRight: stuckLeft + labelsWidth,
+        scroll: {x: window.scrollX, y: window.scrollY,
+                 maxX: root.scrollWidth - root.clientWidth,
+                 maxY: root.scrollHeight - root.clientHeight},
+      };
+    }""", path)
+
+
+def assert_card_revealed(geometry):
+    """One revealed card reads the way the board area requires on both axes.
+
+    Each axis is asserted reachable first, so the browser clamped neither target
+    and the exact rule applies: a card that fits is centered in the area, and one
+    larger than it starts 8 px inside, never before the area's start.
+    """
+    rect, area, scroll = geometry["rect"], geometry["area"], geometry["scroll"]
+    for name, start, size, end, offset, limit in (
+        ("horizontal", "left", "width", "right", "x", "maxX"),
+        ("vertical", "top", "height", "bottom", "y", "maxY"),
+    ):
+        assert 0 < scroll[offset] < scroll[limit], (name, geometry)
+        if rect[size] <= area[end] - area[start]:
+            middle = rect[start] + rect[size] / 2
+            assert abs(middle - (area[start] + area[end]) / 2) <= 1, (name, geometry)
+        else:
+            assert abs(rect[start] - (area[start] + 8)) <= 1, (name, geometry)
+        assert rect[start] >= area[start], (name, geometry)
+
+
+def test_checkouts_show_on_board_centers_the_card_in_the_board_area(
     open_page, attention_checkouts, tmp_path
 ):
-    """Whether the card lies above or below the window, it ends fully below the heads."""
-    spec_root = tmp_path / "tall-root"
-    _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"], [])
-    _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"], [])
-    for number in range(60):
-        _package_spec(spec_root, "Drafts", f"filler-{number:02d}",
-                      f"123e4567-e89b-42d3-a456-4266141750{number:02d}", [])
-    catalog = json.loads(scan_catalog(
-        spec_root, completed_stage_names=["Shipped"],
-        configuration_revision=CHECKOUTS_REVISION,
-    ))
+    """Both callers center a card in the area the sticky heads leave, from any start."""
+    catalog = centering_catalog(tmp_path / "centering-root")
     page, _ = open_attention_checkouts(
         open_page, attention_checkouts, attention_checkouts.document, catalog=catalog)
-    page.locator("#view-board").click()
-    assert page.evaluate("document.documentElement.scrollHeight") > 3 * 720
+    page.set_viewport_size({"width": 1000, "height": 720})
+    page.evaluate("() => document.fonts.ready.then(() => undefined)")
+    settle_frames(page)
+    # Two projects stand on either side of Repo, so its column is neither first
+    # nor last.
+    assert page.locator(".column-head").all_inner_texts() == [
+        "AlphaWorks", "Repo", "ZuluWorks"]
 
-    for target, scroll_to in (("Repo/Drafts/alpha", "bottom"), ("Repo/Drafts/zeta", "top")):
-        page.locator("#view-board").click()
+    def scroll_window(where):
+        """Put the window at the Repositories view's own top or maximum scroll."""
         page.evaluate(
-            "where => window.scrollTo(0, where === 'bottom' ? document.documentElement.scrollHeight : 0)",
-            scroll_to)
-        show_checkouts_view(page)
-        if target == "Repo/Drafts/zeta":
-            page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
-        else:
-            detail = open_clone_detail(page, "Repo Clone 2")
-            detail.locator(f'li[data-package="{target}"] [data-show-on-board]').click()
+            "(where) => window.scrollTo(where === 'maximum'"
+            " ? {left: document.documentElement.scrollWidth,"
+            "    top: document.documentElement.scrollHeight}"
+            " : {left: 0, top: 0})", where)
+        return page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+
+    def ensure_clone_detail():
+        """Open Repo Clone 2's row unless it is already open, and return it."""
+        row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+        group = page.locator(".checkouts-group").filter(has=row)
+        if group.locator(".checkouts-group-body").evaluate("el => el.hidden"):
+            group.locator(".checkouts-line-toggle").click()
+        if row.locator(".checkouts-toggle").get_attribute("aria-expanded") != "true":
+            row.locator(".checkouts-toggle").click()
+        detail = row.locator("xpath=following-sibling::tr[1]")
+        playwright.expect(detail).to_be_visible()
+        return detail
+
+    def scroll_after_a_plain_switch():
+        """Press the board switch alone, then read the board's scroll and its limits."""
+        page.locator("#view-board").click()
         playwright.expect(page.locator("#board")).to_be_visible()
-        # The checkouts toolbar is shorter than the board's, so the heads settle
-        # lower once the switch is painted; the card must clear where they end.
         settle_frames(page)
-        box = covered_card_clearance(page)
-        assert box["path"] == target
-        assert box["top"] >= box["covered"], (target, box)
-        assert box["bottom"] <= box["height"], (target, box)
+        return page.evaluate(
+            "() => ({x: window.scrollX, y: window.scrollY,"
+            " maxX: document.documentElement.scrollWidth"
+            " - document.documentElement.clientWidth,"
+            " maxY: document.documentElement.scrollHeight"
+            " - document.documentElement.clientHeight})")
+
+    def press_show_on_board(site, target):
+        """Press the Show on board button itself, without scrolling it into view."""
+        if site == "details":
+            detail = ensure_clone_detail()
+            button = detail.locator(
+                f'li[data-package="{target}"] [data-show-on-board]')
+        else:
+            button = page.locator(
+                'li[data-code="target_repo_missing"] [data-show-on-board]')
+        assert button.get_attribute("data-show-on-board") == target
+        button.evaluate("node => node.click()")
+
+    def current_scroll():
+        return page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+
+    # Each caller's button, started from the top of the Repositories view and
+    # from its own maximum scroll.  Switching views keeps the window scroll the
+    # browser clamps it to, so the board starts where the Repositories view left
+    # it: from the view's top it starts at the board's top, where the heads still
+    # sit inside the board's padding rather than at their stuck places.
+    for site, target in (("details", CENTERING_TARGET),
+                         ("attention", CENTERING_ATTENTION_TARGET)):
+        for where in ("top", "maximum"):
+            show_checkouts_view(page)
+            if site == "details":
+                ensure_clone_detail()
+            begun = scroll_window(where)
+            switched = scroll_after_a_plain_switch()
+            assert (switched["x"], switched["y"]) == (
+                min(begun["x"], switched["maxX"]), min(begun["y"], switched["maxY"]))
+            if where == "top":
+                assert (begun["x"], begun["y"]) == (0, 0)
+                assert (switched["x"], switched["y"]) == (0, 0)
+
+            show_checkouts_view(page)
+            if site == "details":
+                ensure_clone_detail()
+            assert scroll_window(where) == begun
+            press_show_on_board(site, target)
+            playwright.expect(page.locator("#board")).to_be_visible()
+            # The work item panel is open, so the board reserves its width.
+            assert page.evaluate(
+                "() => getComputedStyle(document.body)"
+                ".getPropertyValue('--panel-space').trim()") == "22rem"
+            switched = current_scroll()
+            settle_frames(page)
+            geometry = board_card_geometry(page)
+            assert geometry["path"] == target, (site, where)
+            # The one scroll has already settled: the position read right after
+            # the switch is the one the whole page ends at.
+            assert (switched["x"], switched["y"]) == (
+                geometry["scroll"]["x"], geometry["scroll"]["y"]), (site, where, geometry)
+            assert_card_revealed(geometry)
+            # A target whose column is neither first nor last is centered with its
+            # left edge right of the row labels.
+            assert geometry["rect"]["left"] > geometry["labelsRight"], (site, where, geometry)
+
+    # The panel's relationship link centers the card it names, from the board's
+    # top-left and from its bottom-right corner.
+    for where in ("top-left", "bottom-right"):
+        dependent = page.locator(f'.card[data-package-path="{CENTERING_DEPENDENT}"]')
+        if dependent.get_attribute("aria-pressed") != "true":
+            dependent.click()
+        assert dependent.get_attribute("aria-pressed") == "true"
+        link = page.locator(
+            f'#work-item-panel-body [data-select-path="{CENTERING_TARGET}"]')
+        playwright.expect(link).to_be_visible()
+        page.evaluate(
+            "(where) => window.scrollTo(where === 'bottom-right'"
+            " ? {left: document.documentElement.scrollWidth,"
+            "    top: document.documentElement.scrollHeight}"
+            " : {left: 0, top: 0})", where)
+        begun = current_scroll()
+        if where == "top-left":
+            assert (begun["x"], begun["y"]) == (0, 0)
+        link.click()
+        switched = current_scroll()
+        settle_frames(page)
+        geometry = board_card_geometry(page, CENTERING_TARGET)
+        assert geometry["path"] == CENTERING_TARGET, (where, geometry)
+        assert (switched["x"], switched["y"]) == (
+            geometry["scroll"]["x"], geometry["scroll"]["y"]), (where, geometry)
+        assert_card_revealed(geometry)
+        assert geometry["rect"]["left"] > geometry["labelsRight"], (where, geometry)
+
+    # A click on a card moves nothing: the neighbour above the centered target is
+    # wholly inside the area, so pressing it needs no scrolling either.
+    neighbour = board_card_geometry(page, CENTERING_NEIGHBOUR)
+    rect, area = neighbour["rect"], neighbour["area"]
+    assert rect["left"] >= area["left"] and rect["top"] >= area["top"], neighbour
+    assert rect["left"] + rect["width"] <= area["right"], neighbour
+    assert rect["top"] + rect["height"] <= area["bottom"], neighbour
+    before = current_scroll()
+    page.locator(f'.card[data-package-path="{CENTERING_NEIGHBOUR}"]').click()
+    settle_frames(page)
+    assert current_scroll() == before
+
+    # A window small enough that the target is larger than the area on both axes:
+    # its start edge takes the area's start plus the margin instead of its center.
+    page.set_viewport_size({"width": 800, "height": 320})
+    page.evaluate("() => document.fonts.ready.then(() => undefined)")
+    settle_frames(page)
+    show_checkouts_view(page)
+    assert scroll_window("top") == {"x": 0, "y": 0}
+    press_show_on_board("details", CENTERING_TARGET)
+    playwright.expect(page.locator("#board")).to_be_visible()
+    switched = current_scroll()
+    settle_frames(page)
+    geometry = board_card_geometry(page)
+    assert geometry["path"] == CENTERING_TARGET, geometry
+    rect, area, scroll = geometry["rect"], geometry["area"], geometry["scroll"]
+    assert (switched["x"], switched["y"]) == (scroll["x"], scroll["y"]), geometry
+    assert rect["width"] > area["right"] - area["left"], geometry
+    assert rect["height"] > area["bottom"] - area["top"], geometry
+    assert 0 < scroll["x"] < scroll["maxX"], geometry
+    assert 0 < scroll["y"] < scroll["maxY"], geometry
+    assert abs(rect["left"] - (area["left"] + 8)) <= 1, geometry
+    assert abs(rect["top"] - (area["top"] + 8)) <= 1, geometry
+    assert rect["left"] >= area["left"] and rect["top"] >= area["top"], geometry
+
+    # Repeating the same Show on board leaves the scroll exactly where it was.
+    show_checkouts_view(page)
+    assert scroll_window("top") == {"x": 0, "y": 0}
+    press_show_on_board("details", CENTERING_TARGET)
+    playwright.expect(page.locator("#board")).to_be_visible()
+    settle_frames(page)
+    repeated = board_card_geometry(page)
+    assert repeated["path"] == CENTERING_TARGET, repeated
+    assert (repeated["scroll"]["x"], repeated["scroll"]["y"]) == (
+        scroll["x"], scroll["y"]), repeated
 
 
 # ---------------------------------------------------------------------------

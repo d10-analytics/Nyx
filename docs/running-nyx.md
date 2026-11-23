@@ -1613,10 +1613,9 @@ focuses that worktree's own row under its clone (the clone's row when it is the
 main worktree). An item that names a repository and a branch but no clone focuses
 the branch's row in that repository's **Work item branches**, and the line when
 no such row exists. An item that names work items has a **Show on board** button
-for each of them, which switches to the board and selects that card. If the work
-item is in a finished row the view says to uncheck **Hide terminal rows**, and if
-the board does not show it the view says: This work item is not on the board. The
-board shows catalog changes within ten seconds.
+for each of them whose card the board shows, which switches to the board and
+selects that card. A work item in a finished row that **Hide terminal rows**
+hides has none until you uncheck that box on the board and return.
 
 Opened, a repository shows a caption line with its remote check, pull request
 lookup and free clones, listed best place to start first (the ranking is in
@@ -1627,9 +1626,16 @@ only while it has a Code Status, which then names a merge still to make or a
 branch or worktree still to remove. Such a work item adds no branch row, no
 package name and no search text, and does not make its repository quiet. When the
 remaining work items name branches of the repository, the **Work item branches**
-table has one row for each such branch with its remote copy, its merge verdict,
-its pull requests and the work items that name it, each with **Show on board**,
-even when no listed clone holds the branch. The clone table has five columns:
+table has one row for each branch they name. The row shows its remote copy,
+merge verdict, pull requests and work items. Each work item it names has
+**Show on board** while the board shows its card. A branch keeps its row when a
+listed clone holds it or its remote copy reads `on the remote` or `unknown`. A
+branch only the remote holds therefore keeps its row. A branch that no listed
+clone holds has no row when its remote copy reads `not on the remote`. A branch
+of a repository with no remote has no row either, because no copy exists. Such
+a branch has no row only while every listed clone of the repository could be
+read. A branch pushed since the last check appears after **Check remotes now**.
+The clone table has five columns:
 **Checkout**, **HEAD**, `Local main vs remote main` (with the repository's own
 default branch name), **Uncommitted changes** and **Branches**. A cell with
 nothing to report shows a muted `—`. Coloured phrases are red for uncommitted
@@ -1641,7 +1647,8 @@ branch takes at most one phrase, in that order. A branch of a finished work item
 never green. Without a red or amber phrase it takes no phrase, and the **Cleanup**
 column in **Details** names what blocks its removal. A merge verdict reads `merged` with the proof that decided
 it (such as `tip is in main` or `pull request #7 merged`), `not merged`, or `merge
-state unknown` with the reason. **Details** opens a clone's row to show its
+state unknown` with the reason. A `merged` verdict is green in **Work item branches**,
+in **Details** and in the work item panel's **All fields**. **Details** opens a clone's row to show its
 path, branches, linked worktrees and work items. The branch and linked-worktree
 tables there each end with a **Cleanup** column. That column names what blocks a
 branch or worktree that is not removable, such as `not merged`, `merge state

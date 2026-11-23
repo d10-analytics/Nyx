@@ -389,6 +389,7 @@ button { cursor: pointer; background: var(--surface); color: var(--heading); fon
 .checkouts-phrase[data-tone="amber"],
 .checkouts-relation[data-tone="amber"] { color: var(--state-waiting); }
 .checkouts-phrase[data-tone="green"] { color: var(--state-done); }
+.checkouts-verdict-words[data-tone="green"] { color: var(--state-done); }
 /* The column header names each cell at wider widths; the stacked layout shows
    the name before the value instead. */
 .cell-label { display: none; }

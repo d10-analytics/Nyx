@@ -408,8 +408,6 @@
       "panelPackageId": "Package ID",
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
-      "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
-      "showOnBoardMissing": "This work item is not on the board. The board shows catalog changes within ten seconds.",
       "uncommittedOperation": "{worktree} has an unfinished git operation",
       "awaitingMergePullRequest": "(pull request #{n})",
       "settingsDiffer": "Collected under different settings from the board shown.",
@@ -1535,6 +1533,12 @@
     renderWorkItemPanel();
     restoreReaderPlace(place);
     renderedCatalog = displayed;
+    // Every board change rebuilds the rendered entry set, and the Repositories
+    // view's buttons follow it, so the writer redraws that view in the same step
+    // instead of leaving it to the next checkouts settle.  Nothing is captured or
+    // restored for the reader's place here: the view keeps its own on redraw, and
+    // captureReaderPlace ignores the board while this view is shown.
+    if (shownView === VIEW_CHECKOUTS && checkoutsOutcome.state === "ready") renderCheckouts();
   }
 
   function renderBoardGrid() {
@@ -3561,11 +3565,21 @@
   }
 
   // The work item branches a repository still shows: those naming a live work
-  // item.
+  // item that exists somewhere the view can read it.  A branch exists when a
+  // readable listed clone holds it, when its served remote copy is `present` or
+  // `unknown`, or when some listed clone could not be read, so what it holds is
+  // unknown.  A branch that exists nowhere has no row; the table, the search
+  // text and the served work items all read this one list, while the panel keeps
+  // the full served list on purpose.
   function livePackageBranches(document, group) {
     const live = livePackagePaths(document);
+    const unreadable = group.clones.some((clone) => clone.status !== "ok");
     return (group.package_branches || []).filter((entry) =>
-      entry.packages.some((path) => live.has(path)));
+      entry.packages.some((path) => live.has(path)) &&
+      (unreadable ||
+        localBranchOf(group, entry.name) !== null ||
+        (entry.remote !== null && entry.remote !== undefined &&
+          (entry.remote.state === "present" || entry.remote.state === "unknown"))));
   }
 
   // A repository is quiet when its served facts say nothing about it needs a
@@ -3867,7 +3881,10 @@
       verdict.reason !== null && verdict.reason !== undefined) {
       words = `${state} — ${text(codeWords("verdictReason", verdict.reason))}`;
     }
-    return `<span class="checkouts-verdict-words">${words}</span>${basis}`;
+    // Only a merged verdict reads green; every other state keeps the cell's
+    // colour.
+    const tone = verdict.state === "merged" ? ' data-tone="green"' : "";
+    return `<span class="checkouts-verdict-words"${tone}>${words}</span>${basis}`;
   }
 
   function verdictWords(document, group, entry) {
@@ -3918,7 +3935,16 @@
     return [...bases].sort();
   }
 
+  // Whether the board renders this work item's card right now.  The rendered
+  // entry set is the board's own truth: it already leaves out the finished rows
+  // the reader is hiding, so one predicate serves every Show on board button.
+  function boardShowsWorkItem(path) {
+    return renderedEntries.has(path);
+  }
+
+  // A work item the board does not show keeps its listing and loses the button.
   function showOnBoardButtonHtml(path, key) {
+    if (!boardShowsWorkItem(path)) return "";
     return '<button type="button" class="checkouts-show-on-board" ' +
       `data-show-on-board="${text(path)}" ${controlAttrs(key, `show:${path}`)}>` +
       `${text(codeWords("text", "showOnBoard"))}</button>`;
@@ -4531,8 +4557,11 @@
       `data-code="${text(item.code)}" data-attention-kind="${kind}" ${blockAttrs(key)}>`;
     if (kind === "text") return `${head}<span class="checkouts-attention-words">${words}</span></li>`;
     if (kind === "work-items") {
-      return `${head}<span class="checkouts-attention-words">${words}</span> ` +
-        `${item.packages.map((path) => showOnBoardButtonHtml(path, key)).join(" ")}</li>`;
+      const buttons = item.packages
+        .filter((path) => boardShowsWorkItem(path))
+        .map((path) => showOnBoardButtonHtml(path, key)).join(" ");
+      return `${head}<span class="checkouts-attention-words">${words}</span>` +
+        (buttons === "" ? "" : ` ${buttons}`) + "</li>";
     }
     return `${head}<button type="button" class="checkouts-attention-go" ` +
       `${controlAttrs(key, "go")}>${words}</button></li>`;
@@ -5060,19 +5089,9 @@
   }
 
   // Show one work item on the board: the selection moves to it and is never
-  // toggled off, a search that hides its card is cleared first, and a work item
-  // the board cannot show says why and leaves the view where it is.
+  // toggled off, and a search that hides its card is cleared first.  The button
+  // is drawn only beside a card the board shows, so the path is one of them.
   function showOnBoard(path) {
-    const known = displayed !== null &&
-      displayed.entries.some((entry) => entry.package_path === path);
-    if (!known) {
-      setCheckoutsActionStatus(codeWords("text", "showOnBoardMissing"));
-      return;
-    }
-    if (!renderedEntries.has(path)) {
-      setCheckoutsActionStatus(codeWords("text", "showOnBoardFinished"));
-      return;
-    }
     const card = [...board.querySelectorAll(".card")]
       .find((item) => item.dataset.packagePath === path);
     // The reader's search survives the jump unless it is what hides the card;
@@ -5089,20 +5108,56 @@
     card.focus({preventScroll: true});
   }
 
-  // Scroll just far enough that the card clears the sticky toolbar and column
-  // heads above it and the window's lower edge, so it is never covered.
+  // The board area a revealed card is read against.  It starts where the sticky
+  // heads come to rest once they stick, so the reader's current scroll cannot
+  // change it, and ends at the window's visible lower and right edges.  The row
+  // labels begin at the space the work item panel reserves and the strip painted
+  // after them masks the cards beside the labels, so the area's left start
+  // clears both; the column heads and the corner settle below the toolbar.  A
+  // panel that lies over the board instead of reserving width moves neither
+  // bound, because only the reserved space reaches the labels.
+  function boardCardArea() {
+    const corner = board.querySelector(".board-corner");
+    const rowHead = board.querySelector(".row-head");
+    const labels = [rowHead, corner].filter((head) => head !== null);
+    const heads = [corner, ...board.querySelectorAll(".column-head")]
+      .filter((head) => head !== null);
+    const stuckLeft = Math.max(0, ...labels.map((head) =>
+      parseFloat(getComputedStyle(head).left) || 0));
+    const labelsWidth = Math.max(0, ...labels.map((head) => head.offsetWidth));
+    const strip = rowHead === null ? 0 : (() => {
+      const after = getComputedStyle(rowHead, "::after");
+      return (parseFloat(after.width) || 0) + (parseFloat(after.borderRightWidth) || 0);
+    })();
+    const headHeight = Math.max(0, ...heads.map((head) => head.offsetHeight));
+    const toolbarHeight = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue("--toolbar-height")) || 0;
+    return {
+      left: stuckLeft + labelsWidth + strip,
+      top: Math.max(toolbar.getBoundingClientRect().bottom, toolbarHeight + headHeight),
+      right: document.documentElement.clientWidth,
+      bottom: document.documentElement.clientHeight,
+    };
+  }
+
+  // Bring the card into the middle of that area with one instant scroll, so the
+  // focus and the scroll settle together.  On an axis where the card is larger
+  // than the area its start edge takes the area's start plus the clearance
+  // margin instead, an axis whose difference is under a pixel does not move, and
+  // the browser clamps a target past either end of the page.
   function revealCard(card) {
-    let clearance = 0;
-    document.querySelectorAll(".toolbar, .board-corner, .column-head").forEach((head) => {
-      clearance = Math.max(clearance, head.getBoundingClientRect().bottom);
-    });
+    const area = boardCardArea();
     const rect = card.getBoundingClientRect();
     const margin = 8;
-    if (rect.top < clearance + margin) {
-      window.scrollBy(0, rect.top - clearance - margin);
-    } else if (rect.bottom > window.innerHeight - margin) {
-      window.scrollBy(0, rect.bottom - window.innerHeight + margin);
-    }
+    const offset = (start, size, areaStart, areaEnd) => size > areaEnd - areaStart
+      ? start - areaStart - margin
+      : start + size / 2 - (areaStart + areaEnd) / 2;
+    let left = offset(rect.left, rect.width, area.left, area.right);
+    let top = offset(rect.top, rect.height, area.top, area.bottom);
+    if (Math.abs(left) < 1) left = 0;
+    if (Math.abs(top) < 1) top = 0;
+    if (left === 0 && top === 0) return;
+    window.scrollBy({left, top, behavior: "instant"});
   }
 
   checkoutsBody.addEventListener("click", (event) => {
