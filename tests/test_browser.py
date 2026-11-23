@@ -9203,6 +9203,22 @@ def test_checkouts_word_tables_show_their_served_values(
             has=page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
         ).get_attribute("data-search")
 
+    def verdict_ink(scope, branch):
+        """One verdict's words, their colour and the colour of the cell holding them."""
+        row = body.locator(f'{scope} tr[data-branch="{branch}"]')
+        words = row.locator(".checkouts-verdict-words")
+        return (
+            words.text_content(),
+            words.evaluate("node => getComputedStyle(node).color"),
+            row.locator("td.checkouts-verdict").evaluate(
+                "node => getComputedStyle(node).color"),
+        )
+
+    # The verdict words, the cell that holds them, and the page's done green.
+    work_item_branches = "table.checkouts-package-branches"
+    clone_details = 'tr.checkouts-detail[data-detail-for$="Repo Clone 2"]'
+    done = baseline_token_color(page, "--state-done")
+
     # The built capture: comparison relation and basis, availability state and
     # reason, the assignment basis, status, remote copy, verdict state, the
     # branch blocker, the branch package basis and the check/lookup words.
@@ -9221,6 +9237,12 @@ def test_checkouts_word_tables_show_their_served_values(
     assert "not merged" in body.locator(
         'tr.checkouts-detail[data-detail-for$="Repo Clone 2"] tr[data-branch="topic-a"]'
     ).text_content()
+    # An unmerged verdict's words keep the colour of the cell that holds them, in
+    # both tables.
+    for scope in (work_item_branches, clone_details):
+        words, ink, cell = verdict_ink(scope, "topic-a")
+        assert words == "not merged"
+        assert ink == cell and ink != done
     assert page.locator(".checkouts-group-check").first.inner_text() == "remote checks off"
     assert page.locator(".checkouts-group-lookup").first.inner_text() == (
         "pull request lookup off")
@@ -9237,6 +9259,10 @@ def test_checkouts_word_tables_show_their_served_values(
     serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
     shows("not on the remote")
     shows("live")
+    # A branch only the remote holds reads its unknown reason in the cell's colour.
+    words, ink, cell = verdict_ink(work_item_branches, "topic-d")
+    assert words == "merge state unknown — no clone holds its commits"
+    assert ink == cell and ink != done
 
     # A saved check from a later local collection, and one that then failed.
     recorded = view_checkouts.document_recorded
@@ -9315,6 +9341,12 @@ def test_checkouts_word_tables_show_their_served_values(
     assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                         " .checkouts-verdict-words").inner_text() == (
         "merged — pull request #7 merged")
+    # A merged verdict's words take the done green in both tables; the cell that
+    # holds them stays as it is.
+    for scope in (work_item_branches, clone_details):
+        words, ink, cell = verdict_ink(scope, "topic-a")
+        assert words == "merged — pull request #7 merged"
+        assert ink == done and cell != done
     pulls = body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                          " .checkouts-pulls").inner_text()
     assert pulls == "#3 open (different head) · #7 merged"
@@ -9325,6 +9357,38 @@ def test_checkouts_word_tables_show_their_served_values(
         page, double, checkout_variant(document, mutate_merged_branch))
     assert body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]'
                         " .checkouts-verdict-words").inner_text() == "merged — tip is in trunk"
+    for scope in (work_item_branches, clone_details):
+        words, ink, cell = verdict_ink(scope, "topic-a")
+        assert words == "merged — tip is in trunk"
+        assert ink == done and cell != done
+
+    # The board's work item panel prints its verdict through the same function,
+    # so its All fields row reads the done green too, for either rung.
+    page.locator("#view-board").click()
+    playwright.expect(page.locator("#board")).to_be_visible()
+    playwright.expect(page.locator("#checkouts")).to_be_hidden()
+    page.locator('.card[data-package-path="Repo/Drafts/alpha"]').click()
+
+    def panel_verdict():
+        """The panel's All fields Verdict row: its words, their colour and the row's."""
+        row = page.locator(
+            "#work-item-panel-body .panel-all-fields .panel-row").filter(
+                has=page.locator('dt:text-is("Verdict")'))
+        words = row.locator(".checkouts-verdict-words")
+        return (
+            words.text_content(),
+            words.evaluate("node => getComputedStyle(node).color"),
+            row.locator("dd").evaluate("node => getComputedStyle(node).color"),
+        )
+
+    words, ink, row_ink = panel_verdict()
+    assert words == "merged — tip is in trunk"
+    assert ink == done and row_ink != done
+    serve_checkouts(
+        page, double, checkout_variant(checked, mutate_lookup_and_pull_requests))
+    words, ink, row_ink = panel_verdict()
+    assert words == "merged — pull request #7 merged"
+    assert ink == done and row_ink != done
 
 
 def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
