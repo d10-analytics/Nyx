@@ -1577,8 +1577,6 @@ def test_documents_describe_the_automatic_board_update():
         "kept, and the cards that changed are marked for a few seconds.",
         "- **An edit has not appeared:** the edit appears at the next check, within "
         "ten seconds, or at once when you return to the window.",
-        "This work item is not on the board. The board shows catalog changes within "
-        "ten seconds.",
     ):
         assert guide.count(marker) == 1, marker
     assert (

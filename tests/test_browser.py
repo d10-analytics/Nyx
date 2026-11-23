@@ -9413,9 +9413,9 @@ def test_checkouts_missing_word_renders_the_raw_code(open_page, view_checkouts):
 
 
 def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts):
-    """Each work item's table action shows its card, or says why it cannot."""
+    """Each work item's table action shows its card."""
     document = view_checkouts.document_built
-    page, double = open_view_checkouts(open_page, view_checkouts, document)
+    page, _ = open_view_checkouts(open_page, view_checkouts, document)
     open_repository(page, "remote")
     page.get_by_label("Hide quiet repositories", exact=True).uncheck()
     remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
@@ -9428,18 +9428,6 @@ def test_checkouts_show_on_board_reveals_one_work_item(open_page, view_checkouts
     playwright.expect(card).to_have_class(re.compile(r"\bselected\b"))
     assert page.evaluate(
         "() => document.activeElement.dataset.packagePath") == "Repo/Drafts/alpha"
-
-    # A work item in a finished row the board is hiding says so and stays put.
-    show_checkouts_view(page)
-    serve_checkouts(page, double, with_unfinished(document, "Repo/Shipped/gamma"))
-    remote_view = page.locator(".checkouts-group").nth(group_index(document, "remote"))
-    topic_c = remote_view.locator(
-        'table.checkouts-package-branches tr[data-branch="topic-c"]')
-    topic_c.locator('[data-show-on-board="Repo/Shipped/gamma"]').click()
-    playwright.expect(page.locator("#checkouts")).to_be_visible()
-    playwright.expect(page.locator("#board")).to_be_hidden()
-    assert page.locator("#checkouts-action-status").inner_text() == (
-        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
 
 
 def test_checkouts_status_line_names_a_scan_from_other_settings(
@@ -10327,33 +10315,177 @@ def test_checkouts_show_on_board_clears_a_search_that_hides_the_card(
     assert focused_checkouts_target(page)["packagePath"] == "Repo/Drafts/zeta"
 
 
-def test_checkouts_show_on_board_refuses_a_finished_row_and_an_absent_work_item(
+def show_on_board_paths(scope):
+    """The work item each Show on board button in ``scope`` names, in order."""
+    return scope.locator("[data-show-on-board]").evaluate_all(
+        "nodes => nodes.map(node => node.dataset.showOnBoard)")
+
+
+def attention_naming_gamma(document):
+    """One raw capture whose work-items attention item names the finished gamma.
+
+    The collector derives the attention list from the packages, so only a
+    capture served as written can name another item's package; the parser is not
+    consulted, which is what ``checkout_raw_variant`` is for.
+    """
+    variant = checkout_raw_variant(document, lambda value: None)
+    next(entry for entry in variant["attention"]
+         if entry["code"] == "target_repo_missing")["packages"] = ["Repo/Shipped/gamma"]
+    return redigest(variant)
+
+
+def alpha_in_the_finished_stage(catalog):
+    """One catalog whose alpha has moved into the finished Shipped stage."""
+    changed = copy.deepcopy(catalog)
+    entry = next(item for item in changed["entries"]
+                 if item["package_path"] == "Repo/Drafts/alpha")
+    entry["package_path"] = "Repo/Shipped/alpha"
+    entry["stage"] = "Shipped"
+    changed["entries"].sort(key=lambda item: item["package_path"])
+    return _reseal(changed)
+
+
+def test_checkouts_show_on_board_follows_the_card_the_board_shows(
     open_page, attention_checkouts
 ):
-    """Where the card cannot be shown the view stays and says why; the preference is left alone."""
+    """Every site prints the button exactly while the board renders that card."""
     document = attention_checkouts.document
     page, _ = open_attention_checkouts(open_page, attention_checkouts, document)
-    key = "spec-tracker-hide-terminal-rows"
-    stored = page.evaluate("key => window.localStorage.getItem(key)", key)
-    detail = open_clone_detail(page, "Repo Clone 2")
-    detail.locator('li[data-package="Repo/Shipped/gamma"] [data-show-on-board]').click()
-    playwright.expect(page.locator("#checkouts")).to_be_visible()
-    playwright.expect(page.locator("#board")).to_be_hidden()
-    assert page.locator("#checkouts-action-status").inner_text() == (
-        "This work item is in a finished row; uncheck Hide terminal rows to show it.")
-    assert page.get_by_label("Hide terminal rows", exact=True).is_checked()
-    assert page.evaluate("key => window.localStorage.getItem(key)", key) == stored
+    remote = open_repository(page, "remote")
+    topic_a = remote.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-a"]')
+    topic_g = remote.locator(
+        'table.checkouts-package-branches tr[data-branch="topic-g"]')
+    open_clone_detail(page, "Repo Clone 2")
+    detail = page.locator('tr.checkouts-detail[data-detail-for$="Repo Clone 2"]')
+    alpha_detail = detail.locator('li[data-package="Repo/Drafts/alpha"]')
+    gamma_detail = detail.locator('li[data-package="Repo/Shipped/gamma"]')
+    zeta = page.locator('#checkouts-body li[data-code="target_repo_missing"]')
+    box = page.get_by_label("Hide terminal rows", exact=True)
+    preference = "spec-tracker-hide-terminal-rows"
 
-    # A work item the displayed catalog does not hold.
-    other, _ = open_attention_checkouts(
+    def set_box(value):
+        """Press the board's own control, then return to the view."""
+        page.locator("#view-board").click()
+        playwright.expect(page.locator("#board")).to_be_visible()
+        box.set_checked(value)
+        assert page.evaluate(
+            "key => window.localStorage.getItem(key)", preference) == str(value).lower()
+        show_checkouts_view(page)
+
+    # The default hides the finished stage, so the finished gamma keeps its path,
+    # basis and Code Status at both sites and loses only its button, while the
+    # unfinished alpha keeps its button at both; the attention item naming the
+    # unfinished zeta keeps its own.  Nothing but the control has written the
+    # stored preference.
+    assert box.is_checked()
+    assert page.evaluate(
+        "key => window.localStorage.getItem(key)", preference) is None
+    assert show_on_board_paths(topic_g) == []
+    assert topic_g.locator(".checkouts-work-item .checkouts-package-path").inner_text() == \
+        "Repo/Shipped/gamma"
+    assert topic_g.locator(".checkouts-work-item .checkouts-basis").inner_text() == \
+        "(Target repo)"
+    assert show_on_board_paths(topic_a) == ["Repo/Drafts/alpha"]
+    assert show_on_board_paths(gamma_detail) == []
+    assert gamma_detail.locator(".checkouts-package-path").inner_text() == \
+        "Repo/Shipped/gamma"
+    assert gamma_detail.locator(".checkouts-basis").inner_text() == "(Target repo)"
+    assert gamma_detail.locator(".checkouts-code-status").inner_text() == \
+        "awaiting merge (no PR)"
+    assert show_on_board_paths(alpha_detail) == ["Repo/Drafts/alpha"]
+    assert show_on_board_paths(zeta) == ["Repo/Drafts/zeta"]
+
+    # Unchecking the box on the board restores gamma's card, and returning shows
+    # its button at both sites with no reload.
+    set_box(False)
+    assert not box.is_checked()
+    assert show_on_board_paths(topic_g) == ["Repo/Shipped/gamma"]
+    assert show_on_board_paths(gamma_detail) == ["Repo/Shipped/gamma"]
+
+    # Checking it again removes them.
+    set_box(True)
+    assert show_on_board_paths(topic_g) == []
+    assert show_on_board_paths(gamma_detail) == []
+
+    # The same item over a board whose catalog has no zeta card keeps its words
+    # and loses its button.
+    absent, absent_checkouts = open_attention_checkouts(
         open_page, attention_checkouts, document, catalog=attention_checkouts.catalog)
-    stored = other.evaluate("key => window.localStorage.getItem(key)", key)
-    other.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
-    playwright.expect(other.locator("#checkouts")).to_be_visible()
-    playwright.expect(other.locator("#board")).to_be_hidden()
-    assert other.locator("#checkouts-action-status").inner_text() == (
-        "This work item is not on the board. The board shows catalog changes within ten seconds.")
-    assert other.evaluate("key => window.localStorage.getItem(key)", key) == stored
+    zeta = absent.locator('#checkouts-body li[data-code="target_repo_missing"]')
+    assert "Repo/Drafts/zeta" in zeta.inner_text()
+    assert show_on_board_paths(zeta) == []
+
+    # A work-items item that names the finished gamma follows the box too.
+    serve_checkouts(absent, absent_checkouts, attention_naming_gamma(document))
+    zeta = absent.locator('#checkouts-body li[data-code="target_repo_missing"]')
+    playwright.expect(zeta).to_contain_text("Repo/Shipped/gamma")
+    assert show_on_board_paths(zeta) == []
+    absent_box = absent.get_by_label("Hide terminal rows", exact=True)
+    absent.locator("#view-board").click()
+    playwright.expect(absent.locator("#board")).to_be_visible()
+    absent_box.set_checked(False)
+    show_checkouts_view(absent)
+    assert show_on_board_paths(zeta) == ["Repo/Shipped/gamma"]
+    absent.locator("#view-board").click()
+    playwright.expect(absent.locator("#board")).to_be_visible()
+    absent_box.set_checked(True)
+    show_checkouts_view(absent)
+    assert show_on_board_paths(zeta) == []
+
+
+def test_checkouts_show_on_board_follows_a_catalog_that_arrives_later(
+    open_page, attention_checkouts
+):
+    """The board's own writer redraws the shown view, not the next checkouts settle."""
+    catalog = attention_checkouts.catalog_all
+    client = BlockingSequenceClient([catalog, catalog], blocked_call=2)
+    double = BrowserCheckouts(attention_checkouts.document)
+    page = open_page(
+        client,
+        settings=BrowserSettings(revision=CHECKOUTS_REVISION),
+        checkouts=double,
+        fake_clock=True,
+        init_script="localStorage.setItem('spec-tracker-view', 'checkouts');"
+        + RESPONSE_RECORDER,
+    )
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    body = page.locator("#checkouts-body")
+    assert show_on_board_paths(body) != []
+
+    # A load opens on the remembered view with the first catalog request held:
+    # the checkouts answer draws the view with no button anywhere.
+    page.reload()
+    wait_for_responses(page, "checkoutsResponses", 1)
+    settle_frames(page)
+    assert client.started.is_set()
+    assert page.evaluate("() => window.catalogResponses") == []
+    playwright.expect(body.locator("tr.checkouts-clone")).to_have_count(3)
+    assert show_on_board_paths(body) == []
+    reads = double.calls
+
+    # Releasing the catalog draws the buttons with no further checkouts answer.
+    client.release.set()
+    wait_for_responses(page, "catalogResponses", 1)
+    alpha = body.locator('[data-show-on-board="Repo/Drafts/alpha"]')
+    playwright.expect(alpha).to_have_count(2)
+    assert double.calls == reads
+
+    # A later catalog that moves alpha into the finished stage removes its
+    # buttons while that tick's checkouts read is still held.
+    gate = double.hold()
+    client.payloads[-1] = alpha_in_the_finished_stage(catalog)
+    fire_poll(page)
+    assert double.entered.wait(timeout=5)
+    playwright.expect(alpha).to_have_count(0)
+    assert not gate.is_set()
+    assert show_on_board_paths(body) == ["Repo/Drafts/zeta"]
+    gate.set()
+    wait_for_responses(page, "checkoutsResponses", 2)
+    settle_frames(page)
+    playwright.expect(alpha).to_have_count(0)
+    assert "Repo/Drafts/alpha" in body.text_content()
 
 
 class HexRevisionSettings(BrowserSettings):
