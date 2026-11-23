@@ -1,13 +1,12 @@
 """Loopback-only HTTP surface for the catalog and checkout views.
 
-The catalog is served to either server; the checkout document, its
-remote-check entry point and the active workspace's checkout settings belong to
-the application server, which answers them through the provider object it
-already holds and reads that object's methods on every request.  A standalone
-catalog server therefore hides every checkout path, and every checkout failure
-leaves the server as one safe category.  A checkout settings save refuses a
-malformed folder list as its own ``invalid_checkout_folders`` category carrying
-one problem per submitted index.
+The catalog is served to either server; the checkout document and the active
+workspace's checkout settings belong to the application server, which answers
+them through the provider object it already holds and reads that object's
+methods on every request.  A standalone catalog server therefore hides every
+checkout path, and every checkout failure leaves the server as one safe
+category.  A checkout settings save refuses a malformed folder list as its own
+``invalid_checkout_folders`` category carrying one problem per submitted index.
 """
 
 from __future__ import annotations
@@ -471,43 +470,6 @@ def _handler_for(
                 return
             self._send(HTTPStatus.OK, _json_bytes(envelope), "application/json")
 
-        def _checkouts_remote_check_route(self) -> None:
-            refresh = self._provider_method("refresh_remote_checks")
-            if refresh is None:
-                self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
-                return
-            if self.command != "POST":
-                self._send(
-                    HTTPStatus.METHOD_NOT_ALLOWED,
-                    b"Method not allowed\n",
-                    "text/plain; charset=utf-8",
-                )
-                return
-            if self.headers.get("Content-Type") != "application/json":
-                self._invalid_payload()
-                return
-            length = self._body_length()
-            if length is None or length > 1024:
-                self._invalid_payload()
-                return
-            try:
-                payload = json.loads(self.rfile.read(length))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, RecursionError):
-                self._invalid_payload()
-                return
-            if payload != {}:
-                self._invalid_payload()
-                return
-            try:
-                envelope = refresh()
-            except CatalogError as error:
-                self._checkouts_error(error.code)
-                return
-            except Exception:  # noqa: BLE001 - provider failures must stay category-safe
-                self._checkouts_error("checkouts_failed")
-                return
-            self._send(HTTPStatus.OK, _json_bytes(envelope), "application/json")
-
         def _dispatch(self) -> None:
             if not self._host_allowed():
                 self._send(HTTPStatus.NOT_FOUND, b"Not found\n", "text/plain; charset=utf-8")
@@ -544,9 +506,6 @@ def _handler_for(
                 return
             if self.path == "/api/checkouts":
                 self._checkouts_route()
-                return
-            if self.path == "/api/checkouts/remote-check":
-                self._checkouts_remote_check_route()
                 return
             if self.command not in {"GET", "HEAD"}:
                 self._send(

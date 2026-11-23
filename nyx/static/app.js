@@ -61,7 +61,6 @@
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
   const CHECKOUT_SETTINGS_ROUTE = "/api/checkout-settings";
-  const REMOTE_CHECK_ROUTE = "/api/checkouts/remote-check";
   const VIEW_BOARD = "board";
   const VIEW_CHECKOUTS = "checkouts";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
@@ -351,7 +350,6 @@
       "remotesChecked": "Remotes checked {time}",
       "remoteCheckFailedAt": "Last remote check failed ({outcome}) at {time}",
       "checkingRemotes": "Checking remotes…",
-      "checkRemotes": "Check remotes now",
       "nextCheckAbout": "Next check about {time}",
       "nextCheckAtRefresh": "Next check at the next refresh",
       "lookupLive": "Pull requests live",
@@ -361,9 +359,6 @@
       "notOffered": "This Nyx server does not serve checkout state.",
       "unavailable": "Checkout state is unavailable: {category}.",
       "clearsDefault": "It clears when a later collection succeeds.",
-      "doesNotOfferRemotes": "This server does not offer remote checks.",
-      "runCompleted": "Remote check finished.",
-      "runFailed": "Remote check failed: {category}.",
       "noOriginRemote": "no origin remote",
       "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
@@ -473,13 +468,11 @@
   const viewCheckoutsButton = document.querySelector("#view-checkouts");
   const checkoutsView = document.querySelector("#checkouts");
   const checkoutsStatusLine = document.querySelector("#checkouts-status-line");
-  const checkoutsActionStatus = document.querySelector("#checkouts-action-status");
   const checkoutsBody = document.querySelector("#checkouts-body");
   const checkoutsHeading = document.querySelector("#checkouts-heading");
   // The view's own heading is the last place focus can go when everything it
   // stood on has left.
   checkoutsHeading.setAttribute("tabindex", "-1");
-  const checkRemotesButton = document.querySelector("#check-remotes");
   const foldersEditor = document.querySelector("#checkout-folders-editor");
   const foldersList = document.querySelector("#checkout-folders-list");
   const foldersLookup = document.querySelector("#checkout-folders-github");
@@ -582,11 +575,6 @@
   // to the issues panel, and every settled outcome rewrites the cards' lines.
   let checkoutsOutcome = {state: "idle", envelope: null, failure: null};
   let checkoutsBusy = false;
-  // One press at a time: a press while a request is in flight is remembered as
-  // the single queued POST and sent when that request settles.  The flag stays
-  // set from the press to the POST's settle, so further presses do nothing.
-  let checkoutsCheckRequested = false;
-  let checkoutsQueuedCheck = false;
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
@@ -2855,7 +2843,7 @@
           // installs the new revision, and the one checkouts read (skipped when
           // one is in flight) shows the new folders.
           request("manual");
-          requestCheckouts("read");
+          requestCheckouts();
         } else if (answer.outcome === "failure") {
           foldersEditorStatus(codeWords("text", "foldersFailure"), true);
         } else {
@@ -3244,7 +3232,7 @@
   }
 
   function remoteCheckWords(envelope) {
-    if (checkoutsCheckRequested || envelope.remote_checks.state === "running") {
+    if (envelope.remote_checks.state === "running") {
       return codeWords("text", "checkingRemotes");
     }
     const last = envelope.remote_checks.last;
@@ -5210,82 +5198,17 @@
     }
   });
 
-  // Every settle of a pressed check announces its result once, even when it is
-  // the same words as the previous one: one write per settle is one text
-  // change, so a repeated completion or failure is still announced.
-  function setCheckoutsActionStatus(message) {
-    const text = checkoutsActionStatus.firstChild;
-    if (text !== null && text === checkoutsActionStatus.lastChild &&
-      text.nodeType === Node.TEXT_NODE) {
-      text.data = message;
-    } else {
-      checkoutsActionStatus.textContent = message;
-    }
-  }
-
-  function remoteCheckMessage(outcome) {
-    if (outcome.state === "ready") {
-      const last = outcome.envelope.remote_checks.last;
-      if (last !== null && last.outcome === "completed") {
-        return codeWords("text", "runCompleted");
-      }
-      return wordText("text", "runFailed", {
-        category: last !== null ? last.outcome : "checkouts_failed",
-      });
-    }
-    if (outcome.state === "failed") {
-      return wordText("text", "runFailed", {category: outcome.failure});
-    }
-    return codeWords("text", "doesNotOfferRemotes");
-  }
-
-  // The button is written only when its state changes, so a refresh that finds
-  // nothing new changes nothing outside the status line.
-  function renderCheckRemotesButton() {
-    const label = codeWords("text", checkoutsCheckRequested ? "checkingRemotes" : "checkRemotes");
-    if (checkoutsCheckRequested) setAttributeOnce(checkRemotesButton, "aria-disabled", "true");
-    else if (checkRemotesButton.hasAttribute("aria-disabled")) {
-      checkRemotesButton.removeAttribute("aria-disabled");
-    }
-    if (checkRemotesButton.textContent !== label) checkRemotesButton.textContent = label;
-  }
-
-  // One press asks for one remote check.  It is sent at once when nothing is in
-  // flight, and otherwise as the single queued follow-up of the in-flight
-  // request; a second press before the answer does nothing.
-  function pressCheckRemotes() {
-    if (checkoutsCheckRequested) return;
-    checkoutsCheckRequested = true;
-    renderCheckRemotesButton();
-    renderCheckoutsStatusLine();
-    if (checkoutsBusy) {
-      checkoutsQueuedCheck = true;
-      return;
-    }
-    requestCheckouts("check");
-  }
-
   // One checkouts request at most is in flight: a tick or return check that
-  // finds one running is skipped rather than queued, because the
-  // server answers every request with the document it has and rescans at most
-  // once a minute.  A POST queued by Check remotes now is the one exception.
-  function requestCheckouts(kind = "read") {
+  // finds one running is skipped rather than queued, because the server answers
+  // every request with the document it has and rescans at most once a minute.
+  function requestCheckouts() {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
-    const checking = kind === "check";
-    fetch(checking ? REMOTE_CHECK_ROUTE : CHECKOUTS_ROUTE, checking ? {
-      method: "POST",
-      cache: "no-store",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    } : {cache: "no-store"})
+    fetch(CHECKOUTS_ROUTE, {cache: "no-store"})
       .then(async (response) => {
         if (response.status === 404) {
-          // A 404 on the POST means this provider serves checkout state without
-          // a remote-check method, so the shown outcome stays as it is.
-          return checking
-            ? {state: "unchanged", envelope: null, failure: null}
-            : {state: "not_offered", envelope: null, failure: null};
+          // A 404 means this server does not serve checkout state at all.
+          return {state: "not_offered", envelope: null, failure: null};
         }
         let payload = null;
         try {
@@ -5312,37 +5235,17 @@
       .catch(() => ({state: "failed", envelope: null, failure: "checkouts_unavailable"}))
       .then((outcome) => {
         checkoutsBusy = false;
-        if (outcome.state === "unchanged") {
-          setCheckoutsActionStatus(codeWords("text", "doesNotOfferRemotes"));
-        } else {
-          const changed = outcome.state !== checkoutsOutcome.state ||
-            outcome.failure !== checkoutsOutcome.failure;
-          checkoutsOutcome = outcome;
-          // The cards follow every settled outcome, including one that only
-          // rewrites the text they already show.
-          updateCardCodeStatus();
-          if (changed) syncBoardIssues();
-          syncFoldersEditor();
-          if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
-        }
-        // The press state lasts from the press until the request that answers
-        // it settles.  A read hands the press to its queued POST and keeps the
-        // state, so the button and the status line still say a check is running
-        // while that POST is in flight; only a POST's own settle clears it.
-        const handOff = checkoutsQueuedCheck;
-        if (!handOff) {
-          checkoutsCheckRequested = false;
-          renderCheckRemotesButton();
-        }
+        const changed = outcome.state !== checkoutsOutcome.state ||
+          outcome.failure !== checkoutsOutcome.failure;
+        checkoutsOutcome = outcome;
+        // The cards follow every settled outcome, including one that only
+        // rewrites the text they already show.
+        updateCardCodeStatus();
+        if (changed) syncBoardIssues();
+        syncFoldersEditor();
         // Only the shown view is drawn; switching to Checkouts draws the latest
         // outcome, so a tick while the board is shown leaves the board alone.
         if (shownView === VIEW_CHECKOUTS) renderCheckouts();
-        // The press that arrived while a read was in flight is sent now, on
-        // that read's settle, rather than at the next tick.
-        if (handOff) {
-          checkoutsQueuedCheck = false;
-          requestCheckouts("check");
-        }
       });
   }
 
@@ -5491,10 +5394,6 @@
   viewCheckoutsButton.addEventListener("click", () => {
     if (shownView !== VIEW_CHECKOUTS) setShownView(VIEW_CHECKOUTS);
   });
-  checkRemotesButton.addEventListener("click", () => {
-    if (checkRemotesButton.getAttribute("aria-disabled") === "true") return;
-    pressCheckRemotes();
-  });
   stageOrderList.addEventListener("click", (event) => {
     if (settingsBusy && event.target.closest(".stage-completed-toggle")) {
       event.preventDefault();
@@ -5609,7 +5508,6 @@
   readViewPreference();
   readQuietCheckoutsPreference();
   applyView();
-  renderCheckRemotesButton();
   loadSettings();
   request("manual");
   requestCheckouts();
