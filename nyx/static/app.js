@@ -408,8 +408,6 @@
       "panelPackageId": "Package ID",
       "panelElsewhere": "Also checked out in",
       "showOnBoard": "Show on board",
-      "showOnBoardFinished": "This work item is in a finished row; uncheck Hide terminal rows to show it.",
-      "showOnBoardMissing": "This work item is not on the board. The board shows catalog changes within ten seconds.",
       "uncommittedOperation": "{worktree} has an unfinished git operation",
       "awaitingMergePullRequest": "(pull request #{n})",
       "settingsDiffer": "Collected under different settings from the board shown.",
@@ -1535,6 +1533,12 @@
     renderWorkItemPanel();
     restoreReaderPlace(place);
     renderedCatalog = displayed;
+    // Every board change rebuilds the rendered entry set, and the Repositories
+    // view's buttons follow it, so the writer redraws that view in the same step
+    // instead of leaving it to the next checkouts settle.  Nothing is captured or
+    // restored for the reader's place here: the view keeps its own on redraw, and
+    // captureReaderPlace ignores the board while this view is shown.
+    if (shownView === VIEW_CHECKOUTS && checkoutsOutcome.state === "ready") renderCheckouts();
   }
 
   function renderBoardGrid() {
@@ -3921,7 +3925,16 @@
     return [...bases].sort();
   }
 
+  // Whether the board renders this work item's card right now.  The rendered
+  // entry set is the board's own truth: it already leaves out the finished rows
+  // the reader is hiding, so one predicate serves every Show on board button.
+  function boardShowsWorkItem(path) {
+    return renderedEntries.has(path);
+  }
+
+  // A work item the board does not show keeps its listing and loses the button.
   function showOnBoardButtonHtml(path, key) {
+    if (!boardShowsWorkItem(path)) return "";
     return '<button type="button" class="checkouts-show-on-board" ' +
       `data-show-on-board="${text(path)}" ${controlAttrs(key, `show:${path}`)}>` +
       `${text(codeWords("text", "showOnBoard"))}</button>`;
@@ -4534,8 +4547,11 @@
       `data-code="${text(item.code)}" data-attention-kind="${kind}" ${blockAttrs(key)}>`;
     if (kind === "text") return `${head}<span class="checkouts-attention-words">${words}</span></li>`;
     if (kind === "work-items") {
-      return `${head}<span class="checkouts-attention-words">${words}</span> ` +
-        `${item.packages.map((path) => showOnBoardButtonHtml(path, key)).join(" ")}</li>`;
+      const buttons = item.packages
+        .filter((path) => boardShowsWorkItem(path))
+        .map((path) => showOnBoardButtonHtml(path, key)).join(" ");
+      return `${head}<span class="checkouts-attention-words">${words}</span>` +
+        (buttons === "" ? "" : ` ${buttons}`) + "</li>";
     }
     return `${head}<button type="button" class="checkouts-attention-go" ` +
       `${controlAttrs(key, "go")}>${words}</button></li>`;
@@ -5063,19 +5079,9 @@
   }
 
   // Show one work item on the board: the selection moves to it and is never
-  // toggled off, a search that hides its card is cleared first, and a work item
-  // the board cannot show says why and leaves the view where it is.
+  // toggled off, and a search that hides its card is cleared first.  The button
+  // is drawn only beside a card the board shows, so the path is one of them.
   function showOnBoard(path) {
-    const known = displayed !== null &&
-      displayed.entries.some((entry) => entry.package_path === path);
-    if (!known) {
-      setCheckoutsActionStatus(codeWords("text", "showOnBoardMissing"));
-      return;
-    }
-    if (!renderedEntries.has(path)) {
-      setCheckoutsActionStatus(codeWords("text", "showOnBoardFinished"));
-      return;
-    }
     const card = [...board.querySelectorAll(".card")]
       .find((item) => item.dataset.packagePath === path);
     // The reader's search survives the jump unless it is what hides the card;
