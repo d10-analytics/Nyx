@@ -1563,7 +1563,6 @@ every three minutes while a board page is open, which is what `Next check about`
 counts toward. It reads `Checking remotes…` while the check runs. Only one check
 runs at a time.
 
-
 The view marks how fresh a value is only where it can be old. A comparison with a
 remote says whether it is `live`, `recorded` with the time (`recorded 14:05`) of
 the check it came from, or `cached`. A clone whose default branch is compared
