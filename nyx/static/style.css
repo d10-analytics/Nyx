@@ -171,7 +171,7 @@ input:focus-visible, button:focus-visible, select:focus-visible, summary:focus-v
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
-.toolbar .controls :is(input, button, select):focus-visible {
+.toolbar :is(.controls, .compact-controls) :is(input, button, select):focus-visible {
   outline-color: var(--toolbar-focus-ring);
 }
 button { cursor: pointer; background: var(--surface); color: var(--heading); font-weight: 600; }
