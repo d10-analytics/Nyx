@@ -1174,7 +1174,19 @@ def test_board_settings_starts_collapsed_and_lists_hidden_and_absent_completion_
     editor = page.locator("#stage-order-editor")
     editor.wait_for()
     assert editor.get_attribute("open") is None
+    assert editor.locator("summary").inner_text() == "Settings"
+    toolbar_names = page.locator("header.toolbar *").evaluate_all(
+        """nodes => nodes.flatMap((node) => [
+            node.textContent,
+            node.getAttribute("aria-label"),
+            node.getAttribute("title"),
+        ]).filter((value) => value)"""
+    )
+    assert not [name for name in toolbar_names if "Board settings" in name]
     editor.locator("summary").press("Enter")
+    board_section = editor.get_by_role("heading", name="Board", exact=True)
+    assert board_section.count() == 1
+    playwright.expect(board_section).to_be_visible()
     assert page.locator(
         "#stage-order-list .stage-order-item[data-stage='Under_Development'] .stage-order-name"
     ).inner_text() == "Under Development"
@@ -9799,7 +9811,7 @@ def test_checkouts_attention_items_move_by_keyboard_to_their_destination(
     serve_checkouts(page, double, attention_checkouts.document_no_finished)
     policy = page.locator('li[data-code="finished_stages_not_configured"]')
     assert policy.inner_text() == (
-        "No stage counts as finished; choose one under Counts as finished in Board settings")
+        "No stage counts as finished; choose one under Counts as finished in Settings")
     assert policy.locator("button, a, [tabindex]").count() == 0
 
 
@@ -10248,7 +10260,7 @@ def test_checkouts_show_on_board_follows_a_catalog_that_arrives_later(
 
 
 class HexRevisionSettings(BrowserSettings):
-    """Board settings whose saved revision is one a checkout document can carry."""
+    """A board settings double whose saved revision is one a checkout document can carry."""
 
     def save_settings(self, revision, order, completed):
         result = super().save_settings(revision, order, completed)
@@ -13045,7 +13057,7 @@ def board_save_button(page):
 
 
 def move_second_stage_up(page):
-    """Draft a Board settings change: the second stage row moves up."""
+    """Draft a board settings change: the second stage row moves up."""
     open_stage_editor(page)
     page.locator("#stage-order-list .stage-order-item").nth(1).get_by_role(
         "button", name=re.compile(r"^Move .* up$")
@@ -13054,7 +13066,7 @@ def move_second_stage_up(page):
 
 
 def open_two_editors(open_page, attention_checkouts, settings, double=None):
-    """Open the checkouts view with the folder editor open beside the Board settings."""
+    """Open the checkouts view with the folder editor open beside the Settings panel."""
     double = double or BrowserCheckouts(attention_checkouts.document)
     settings.checkouts = double
     page, double = open_folders_page(open_page, attention_checkouts, settings, double)
@@ -13072,7 +13084,7 @@ def wait_for_catalog_installs(page, count):
 def test_checkout_folders_save_keeps_a_board_settings_draft_current(
     open_page, attention_checkouts
 ):
-    """The reader's own folder save is not a change made elsewhere to the Board settings."""
+    """The reader's own folder save is not a change made elsewhere to the board settings."""
     settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
     settings.folders = ["/work/alpha"]
     page, _ = open_two_editors(open_page, attention_checkouts, settings)
@@ -13097,7 +13109,7 @@ def test_checkout_folders_save_keeps_a_board_settings_draft_current(
 def test_board_settings_save_keeps_a_checkout_folders_draft_current(
     open_page, attention_checkouts
 ):
-    """The reader's own Board settings save is not a change made elsewhere to the folders."""
+    """The reader's own board settings save is not a change made elsewhere to the folders."""
     settings = HexRevisionSettings(revision=CHECKOUTS_REVISION)
     settings.folders = ["/work/alpha"]
     page, double = open_two_editors(open_page, attention_checkouts, settings)
@@ -13131,7 +13143,7 @@ def test_board_settings_save_keeps_a_checkout_folders_draft_current(
 
 
 def test_checkout_folders_failed_save_advances_no_revision(open_page, attention_checkouts):
-    """A failed folder save leaves the Board settings on the revision it holds."""
+    """A failed folder save leaves the board settings on the revision it holds."""
 
     class FailureNamesOtherRevision(HexRevisionSettings):
         def save_checkout_settings(self, revision, folders, github_lookup):
