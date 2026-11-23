@@ -5098,20 +5098,56 @@
     card.focus({preventScroll: true});
   }
 
-  // Scroll just far enough that the card clears the sticky toolbar and column
-  // heads above it and the window's lower edge, so it is never covered.
+  // The board area a revealed card is read against.  It starts where the sticky
+  // heads come to rest once they stick, so the reader's current scroll cannot
+  // change it, and ends at the window's visible lower and right edges.  The row
+  // labels begin at the space the work item panel reserves and the strip painted
+  // after them masks the cards beside the labels, so the area's left start
+  // clears both; the column heads and the corner settle below the toolbar.  A
+  // panel that lies over the board instead of reserving width moves neither
+  // bound, because only the reserved space reaches the labels.
+  function boardCardArea() {
+    const corner = board.querySelector(".board-corner");
+    const rowHead = board.querySelector(".row-head");
+    const labels = [rowHead, corner].filter((head) => head !== null);
+    const heads = [corner, ...board.querySelectorAll(".column-head")]
+      .filter((head) => head !== null);
+    const stuckLeft = Math.max(0, ...labels.map((head) =>
+      parseFloat(getComputedStyle(head).left) || 0));
+    const labelsWidth = Math.max(0, ...labels.map((head) => head.offsetWidth));
+    const strip = rowHead === null ? 0 : (() => {
+      const after = getComputedStyle(rowHead, "::after");
+      return (parseFloat(after.width) || 0) + (parseFloat(after.borderRightWidth) || 0);
+    })();
+    const headHeight = Math.max(0, ...heads.map((head) => head.offsetHeight));
+    const toolbarHeight = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue("--toolbar-height")) || 0;
+    return {
+      left: stuckLeft + labelsWidth + strip,
+      top: Math.max(toolbar.getBoundingClientRect().bottom, toolbarHeight + headHeight),
+      right: document.documentElement.clientWidth,
+      bottom: document.documentElement.clientHeight,
+    };
+  }
+
+  // Bring the card into the middle of that area with one instant scroll, so the
+  // focus and the scroll settle together.  On an axis where the card is larger
+  // than the area its start edge takes the area's start plus the clearance
+  // margin instead, an axis whose difference is under a pixel does not move, and
+  // the browser clamps a target past either end of the page.
   function revealCard(card) {
-    let clearance = 0;
-    document.querySelectorAll(".toolbar, .board-corner, .column-head").forEach((head) => {
-      clearance = Math.max(clearance, head.getBoundingClientRect().bottom);
-    });
+    const area = boardCardArea();
     const rect = card.getBoundingClientRect();
     const margin = 8;
-    if (rect.top < clearance + margin) {
-      window.scrollBy(0, rect.top - clearance - margin);
-    } else if (rect.bottom > window.innerHeight - margin) {
-      window.scrollBy(0, rect.bottom - window.innerHeight + margin);
-    }
+    const offset = (start, size, areaStart, areaEnd) => size > areaEnd - areaStart
+      ? start - areaStart - margin
+      : start + size / 2 - (areaStart + areaEnd) / 2;
+    let left = offset(rect.left, rect.width, area.left, area.right);
+    let top = offset(rect.top, rect.height, area.top, area.bottom);
+    if (Math.abs(left) < 1) left = 0;
+    if (Math.abs(top) < 1) top = 0;
+    if (left === 0 && top === 0) return;
+    window.scrollBy({left, top, behavior: "instant"});
   }
 
   checkoutsBody.addEventListener("click", (event) => {
