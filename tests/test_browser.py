@@ -12295,6 +12295,8 @@ def test_checkout_folders_editor_is_the_panels_second_section(
     playwright.expect(
         page.get_by_role("heading", name="Checkout folders", exact=True)
     ).to_be_visible()
+    # No ready document yet, so the editor shows and suggests no folder.
+    assert folder_buttons(page, "suggest") == []
     gate.set()
     wait_for_responses(page, "checkoutsResponses", 1)
     settle_frames(page)
