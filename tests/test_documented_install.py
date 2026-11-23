@@ -566,9 +566,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the remote-tracking branch pruned with `git fetch --prune`, or when a force-push "
         "moved the remote branch back to an older commit",
         "the saved value then stands until a networked run checks again",        "a size bound, a shallow or partial clone or a git older than 2.39",
-        # The served checkout state: where it is answered, its cadence, its
-        # waits, the recorded values and their time, read-only collection, and
-        # each serving category with what clears it.
+        # The served checkout state: where it is answered, its one
+        # request-driven cycle, its waits, the recorded values and their time,
+        # read-only collection, and each serving category with what clears it.
         "### Served checkout state",
         "answer requests for checkout data at the same loopback address that serves the board",
         "the document `nyx checkouts --json` prints, and `remote_checks`, the schedule "
@@ -577,23 +577,28 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the document's `observed_at` is that collection's time",
         "a `recorded` value keeps the time of the check it came from",
         "Once a document exists, a request is answered at once from it",
-        # A checkout settings save is the one exception to the answer-at-once
-        # rule, and it makes a networked check due outside the five-minute
-        # cadence.
-        "The exception is the first request after a checkout settings save",
-        "the served document was collected under the folders and GitHub lookup from before "
-        "the save",
-        "that request waits for a collection that reads the new settings, and the check it "
-        "waits on is a networked one",
-        "refreshes the served answer in the background about once a minute",
-        "starts a networked check when none has started in this runtime or when five "
-        "minutes have passed since the last one started",
-        "so checks run at most every five minutes",
-        "A checkout settings save also makes the next check due at once, outside that "
-        "five-minute cadence",
-        "the collection that follows a save can start sooner than five minutes after the "
-        "previous check",
-        "while nothing requests checkout data, Nyx makes no network call",
+        # A settings save is the one exception to the answer-at-once rule, and
+        # either save makes a collection start outside the interval.
+        "The exception is the first request after a settings save",
+        "the served document was collected under the settings from before the save",
+        "that request waits for a collection that reads the new settings",
+        "A checkout folders save and a board settings save both mark their inputs "
+        "changed",
+        "the collection that follows either one starts at once, outside the interval "
+        "below",
+        # The one cycle: its interval, that every run checks the remotes network,
+        # that an open window keeps it running, and that nothing runs without a
+        # request.
+        "The cycle is request-driven",
+        "Nyx starts one collection at most about every three minutes, counted from the "
+        "start of the last one",
+        "every collection scans the configured folders and checks their remotes network, "
+        "with the GitHub lookup when it is enabled",
+        "While nothing requests checkout data, Nyx makes no network call",
+        "A board page requests checkout data while it is open, including while its "
+        "window is hidden",
+        "With no checkout folders configured, a collection reaches no repository and "
+        "makes no network call either",
         "One collection runs at a time, and at most one waits",
         "a request that needs a document while one runs shares that collection instead "
         "of starting another",
@@ -603,13 +608,15 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "category",
         "the first request after that minute starts the next collection, which clears "
         "the category if it succeeds",
-        "a failed check is not retried automatically before its next due time",
+        "a failed collection is not retried automatically before its next due time",
         "`remote_checks` reports the schedule and the last check",
-        "`interval_seconds` is 300",
-        "`next_due_at` is when the next check falls due, or null when the next request "
-        "starts one",
-        "`last` is null until the runtime's first check finishes",
-        "gives that check's `started_at` and `finished_at`",
+        "`state` is `running` while a collection is in flight or waiting",
+        "`interval_seconds` is 180",
+        "`next_due_at` is when the next collection falls due, or null when the next "
+        "request starts one",
+        "`last` is null until the runtime's first collection finishes",
+        "it gives that collection's `started_at` and `finished_at`",
+        "`outcome` (`completed` or the category of a failed collection)",
         "each remote's key with its `check` and `pr_lookup` status and reason",
         "Serving never fetches",
         "a collection reads the configured folders with read-only git calls and asks "
@@ -1669,9 +1676,9 @@ def test_application_serving_readme_states_the_checkout_settings_routes_and_core
         "entry does not already hold",
         "answers 400 `invalid_checkout_folders` with every problem's index and reason",
         "answers exactly `{folders, github_lookup, revision, outcome}`",
-        "every successful checkout settings save calls it after the replacement",
-        "so the next request waits for a networked collection of the new folders, outside "
-        "the five-minute cadence",
+        "Both settings saves call it after the replacement",
+        "so the next request waits for a collection of the new settings, outside that "
+        "interval",
         "Board settings and checkout settings are saved through one private "
         "compare-and-save core",
         "Each save supplies its result shaper, so `/api/settings` keeps its `{order, "

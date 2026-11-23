@@ -74,10 +74,11 @@ README is narrative only.
   count and a ring for the Baseline's place, with `?` for what cannot be
   read or counted and an underline for a cached main: the text `nyx checkouts --json` gives and the line's words, searchable
   with the card's other text and rewritten in place on each scan. The text is Nyx's last successful checkout scan, and Nyx rescans
-  about once a minute while a board page is open.
+  about every three minutes while a board page is open.
 - Shows a line only while the served document was scanned under the configuration
   the board displays, so a Board settings save on the same page hides every line
-  until the next scan, for up to about 75 seconds, and a configuration change
+  until that save's own checkouts read answers with a scan of the new settings,
+  and a configuration change
   saved elsewhere hides them until the next check installs the new catalog;
   a checkout folder save on the same page hides them only until its own
   checkouts read answers with a scan of the new folders, and the page installs

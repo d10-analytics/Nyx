@@ -568,25 +568,23 @@ prints, and `remote_checks`, the schedule and the last check. A request is
 answered from the latest finished collection, kept in memory: the document's
 `observed_at` is that collection's time, and a `recorded` value keeps the time
 of the check it came from, so the answer says how old it is. Once a document
-exists, a request is answered at once from it; a refresh runs behind the answer
-and the request does not wait for it. The exception is the first request after a
-checkout settings save: the served document was collected under the folders and
-GitHub lookup from before the save, so that request waits for a collection that
-reads the new settings, and the check it waits on is a networked one.
+exists, a request is answered at once from it; a collection runs behind the
+answer and the request does not wait for it. The exception is the first request
+after a settings save: the served document was collected under the settings
+from before the save, so that request waits for a collection that reads the new
+settings. A checkout folders save and a board settings save both mark their
+inputs changed, so the collection that follows either one starts at once,
+outside the interval below.
 
-While checkout data is requested, Nyx refreshes the served answer in the
-background about once a minute, and starts a networked check when none has
-started in this runtime or when five minutes have passed since the last one
-started, so checks run at most every five minutes; while nothing requests
-checkout data, Nyx makes no network call. A board page requests checkout data
-while it is open, so an open board is what keeps that refresh running: Nyx
-refreshes its served document about once a minute, and makes a networked check,
-with the GitHub lookup when it is enabled, at most every five minutes. With no
-checkout folders configured, a collection reaches no repository and makes no
-network call either. A checkout settings save also makes
-the next check due at once, outside that five-minute cadence, so the collection
-that follows a save can start sooner than five minutes after the previous
-check. One collection runs at a time, and at most one waits: a request that
+The cycle is request-driven. While something requests checkout data, Nyx starts
+one collection at most about every three minutes, counted from the start of the
+last one, and every collection scans the configured folders and checks their
+remotes network, with the GitHub lookup when it is enabled. While nothing
+requests checkout data, Nyx makes no network call. A board page requests
+checkout data while it is open, including while its window is hidden, so an
+open board is what keeps the cycle running. With no checkout folders
+configured, a collection reaches no repository and makes no network call
+either. One collection runs at a time, and at most one waits: a request that
 needs a document while one runs shares that collection instead of starting
 another.
 
@@ -596,17 +594,18 @@ its category, and every request for about a minute after it started is answered
 with that category without starting another collection; the first request after
 that minute starts the next collection, which clears the category if it
 succeeds. Once a document exists, a failed background collection does not
-replace it: the old answer keeps serving, and a failed check is not retried
-automatically before its next due time.
+replace it: the old answer keeps serving, and a failed collection is not
+retried automatically before its next due time.
 
 `remote_checks` reports the schedule and the last check. `state` is `running`
-while a check is in flight or waiting and `idle` otherwise. `interval_seconds`
-is 300, and `next_due_at` is when the next check falls due, or null when the
-next request starts one. `last` is null until the runtime's first check
-finishes; then it gives that check's `started_at` and `finished_at`, its
-`outcome` (`completed` or the category of a failed check), and, after a
-completed check, each remote's key with its `check` and `pr_lookup` status and
-reason.
+while a collection is in flight or waiting and `idle` otherwise.
+`interval_seconds` is 180, and `next_due_at` is when the next collection falls
+due, or null when the next request starts one. `last` is null until the
+runtime's first collection finishes; then it gives that collection's
+`started_at` and `finished_at`, its
+`outcome` (`completed` or the category of a failed collection), and, after a
+completed collection, each remote's key with its `check` and `pr_lookup` status
+and reason.
 
 Serving never fetches: a collection reads the configured folders with read-only
 git calls and asks each remote with `git ls-remote`, exactly as `nyx checkouts`
@@ -871,13 +870,14 @@ means a package may exist that the list does not show; rule 3 below never conclu
 tag under its folder name, holding exactly the text
 `nyx checkouts --json` gives for that package; the browser shows what it is
 served and rebuilds nothing. That text comes from Nyx's last successful checkout
-scan: while a board page is open Nyx rescans about once a minute, and the line
-updates on its own. The line is part of the card's
+scan: while a board page is open Nyx rescans about every three minutes, and the
+line updates on its own. The line is part of the card's
 search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
-A Board settings save on the same page keeps it hidden until a scan under the
-new configuration arrives, up to about 75 seconds. A checkout folder save on the
+A Board settings save on the same page keeps it hidden until that save's own
+checkouts read answers with a scan of the new configuration, which the page
+requests at once. A checkout folder save on the
 same page keeps it hidden only until that save's own checkouts read answers with
 a scan of the new folders, which the page requests at once, and the page installs
 the new catalog itself. When a checkouts read is already in flight at the save,
@@ -1405,16 +1405,17 @@ changed are marked for a few seconds.
 
 A card whose package has a Code Status shows a Code Status tag under its
 folder name, holding the same text `nyx checkouts --json` gives for that package.
-Nyx reads it from its last successful checkout scan, and it rescans about once a
-minute while a board page is open, so the line updates on its own;
+Nyx reads it from its last successful checkout scan, and it rescans about every
+three minutes while a board page is open, so the line updates on its own;
 **Search** covers it. While Nyx has no scan to serve, no card
 shows a line and the issues panel says `Code Status unavailable`. With no scan
 served, every declared prerequisite is outstanding. The board then draws every
 arrow, no marker shows, and only a card that declares no prerequisite is teal.
 The lines are
 also hidden, with no message, while the board displays a configuration other
-than the one the scan was made under: for up to about 75 seconds after a Board
-settings save on the same page, until the checkouts read that a checkout folder
+than the one the scan was made under: after a Board settings save on the same
+page, until that save's own checkouts read answers with a scan of the new
+configuration, or until the checkouts read that a checkout folder
 save on the same page requests answers with a scan of the new folders (or, when
 a checkouts read was already in flight at the save, until the next ten-second
 check), and, after a configuration change saved elsewhere, until the next check
@@ -1489,7 +1490,7 @@ is entered it counts only the quiet repositories that match, and it is hidden
 when none match. **Hide empty rows and columns** and **Hide terminal rows** give
 way to **Hide quiet repositories**. Switching views never waits for an update: the board is
 always current, and every check reads the latest served scan, which Nyx renews
-at most about once a minute.
+at most about every three minutes.
 
 The line under the heading says how current the page is: `Local state` with the
 time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
@@ -1497,10 +1498,10 @@ time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
 time or `Next check at the next refresh`, and whether pull request lookup is
 live, recorded, off or unavailable. When the scan was made under different
 settings from the board shown, the line adds `Collected under different
-settings from the board shown.` Nyx checks the remotes itself at most every
-five minutes while a board page is open, which is what `Next check about` counts
-toward. It reads `Checking remotes…` while the check runs. Only one check runs
-at a time.
+settings from the board shown.` Nyx checks the remotes itself at most about
+every three minutes while a board page is open, which is what `Next check about`
+counts toward. It reads `Checking remotes…` while the check runs. Only one check
+runs at a time.
 
 The **Checkout folders** control beside the status line opens an editor for the
 active workspace's checkout folders and its GitHub lookup. It appears whenever
@@ -1764,8 +1765,8 @@ settings described above, which also clears the
 `finished_stages_not_configured` attention item. If the owner's instance holds
 the control port, run the isolated instance on another free port rather than
 stopping it. Wait until the status line no longer says `Collected under
-different settings from the board shown.`, which follows a Board settings save by
-up to about 75 seconds.
+different settings from the board shown.`, which clears once the checkouts read
+that follows a Board settings save answers with a scan of the new settings.
 
 Before saving the fourth image, read the live `/api/checkouts` document: git is
 `available`, there is exactly one folder and its status is `ok`, `diagnostics`
