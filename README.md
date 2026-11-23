@@ -42,16 +42,16 @@ rows.
 
 The **Repositories** view, chosen with the switch in the header, shows the git
 state of your configured checkout folders beside the board: a **Needs
-attention** list, each repository's clones and branches, and a **Checkout
-folders** editor that changes the active workspace's checkout folders and
-GitHub lookup. The header search filters it by repository, checkout, branch and
-work item names and paths, Code Status text, and the availability, HEAD and
-tree words of clone rows (the guide lists every field). It reads the same state
-as `nyx checkouts` and changes no repository;
-its editor writes only the checkout settings, through the checkout settings
-`PUT`.
-It is described in [Use the Repositories
-view](docs/running-nyx.md#use-the-repositories-view).
+attention** list and each repository's clones and branches. The header search
+filters it by repository, checkout, branch and work item names and paths, Code
+Status text, and the availability, HEAD and tree words of clone rows (the guide
+lists every field). It reads the same state as `nyx checkouts` and changes no
+repository. Set the active workspace's checkout folders and GitHub lookup in
+the **Settings** panel's **Checkout folders** section. That section writes only
+the checkout settings, through the checkout settings `PUT`.
+The view is described in [Use the Repositories
+view](docs/running-nyx.md#use-the-repositories-view), and the section in
+[Change the checkout folders](docs/running-nyx.md#change-the-checkout-folders).
 
 Your plans stay in files you can edit, keep in version control, and use with
 other tools. On Linux, Nyx runs locally as a background service and opens in

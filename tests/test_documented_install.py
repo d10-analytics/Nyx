@@ -107,8 +107,8 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "does not rename or move",
     ),
     "docs/running-nyx.md": (
-        "the toolbar includes a collapsed **Settings** panel with a "
-        "row-order editor",
+        "the toolbar includes a collapsed **Settings** "
+        "panel whose **Board** section holds a row-order editor",
         "Move up",
         "Move down",
         "Cancel",
@@ -346,7 +346,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
-        "The **Repositories** view of the board has a **Checkout folders** editor that "
+        "The **Settings** panel of the board has a **Checkout folders** section that "
         "changes them and the GitHub lookup",
         "The same record can be edited by hand when no board is running",
         "cannot be combined with `--setup`, `--stop` or `--status`",
@@ -1454,8 +1454,8 @@ def test_the_checkout_guides_describe_the_folder_editor():
     board_web = _normalized("docs/systems/board-web/README.md")
     checkouts = _normalized("docs/systems/checkouts/README.md")
     for marker in (
-        "The **Checkout folders** control beside the status line opens an editor for the "
-        "active workspace's checkout folders and its GitHub lookup",
+        "The **Settings** panel holds a **Checkout folders** section for the active "
+        "workspace's checkout folders and its GitHub lookup",
         "until you choose **Save checkout folders**",
         "(`Add /home/me/code (3 work items)`)",
         "A folder it refuses stays in the draft with its reason beside it",
@@ -1486,13 +1486,13 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "The first folder save writes a schema 4 record",
         "A Windows or macOS desktop application built before this version refuses a "
         "schema 4 record",
-        "its only changes are to the checkout folders and GitHub lookup of the active "
-        "workspace",
+        "The active workspace's checkout folders and GitHub lookup are set in the "
+        "**Settings** panel, not in this view",
         "A checkout folder save on the same page keeps it hidden only until that save's "
         "own checkouts read answers with a scan of the new folders",
-        "Choose Checkout folders above to add one.`",
+        "Choose Checkout folders in Settings to add one.`",
         "also describes the hand edit for use without the board",
-        "configure the clones' parent folder through the **Checkout folders** editor",
+        "add the clones' parent folder in its **Checkout folders** section",
     ):
         assert guide.count(marker) == 1, marker
     assert "Without the board" in workspaces
@@ -1518,20 +1518,21 @@ def test_the_checkout_guides_describe_the_folder_editor():
         ):
             assert stale not in text, (name, stale)
     assert (
-        "The **Repositories** view of the board has a **Checkout folders** editor" in guide
+        "The **Settings** panel of the board has a **Checkout folders** section" in guide
     )
     for text in (readme, board_web, checkouts):
         assert "checkout settings `PUT`" in text
     assert (
-        "and a **Checkout folders** editor that changes the active workspace's checkout "
-        "folders and GitHub lookup. The header search filters it by repository"
+        "Set the active workspace's checkout folders and GitHub lookup in the **Settings** "
+        "panel's **Checkout folders** section"
     ) in readme
     assert (
-        "its editor writes only the checkout settings, through the checkout settings `PUT`"
+        "That section writes only the checkout settings, through the checkout settings `PUT`"
     ) in readme
     assert workspaces.count(
-        "lists. Set them in the browser: choose **Repositories**, open **Checkout folders**, "
-        "add or remove folders and the GitHub lookup, and choose **Save checkout folders**."
+        "lists. Set them in the browser: open the **Settings** panel and its **Checkout "
+        "folders** section, add or remove folders and the GitHub lookup, and choose "
+        "**Save checkout folders**."
     ) == 1
     assert workspaces.index("Set them in the browser") < workspaces.index("### Without the board")
     assert (
@@ -1556,6 +1557,32 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "a checkout folder save on the same page requests answers with a scan of the new "
         "folders (or the next tick, when a read was already in flight at the save)"
     ) in checkouts
+    # The editor is a section of Settings, shown unless the server offers no
+    # checkout state, and no document places it on the Repositories view or says
+    # it opens itself.
+    assert "The **Settings** panel holds a **Checkout folders** section" in guide
+    assert "The section is shown unless the server offers no checkout state at all." in guide
+    assert (
+        "The **Checkout folders** section of **Settings** changes it with the folders"
+    ) in workspaces
+    assert (
+        "The **Checkout folders** section is shown in every state except one where the "
+        "server serves no checkout state"
+    ) in board_web
+    for name, text in (
+        ("README.md", readme),
+        ("docs/running-nyx.md", guide),
+        ("docs/workspaces.md", workspaces),
+        ("docs/systems/board-web/README.md", board_web),
+    ):
+        for stale in (
+            "**Checkout folders** control beside the status line",
+            "opens itself",
+            "opens itself once",
+            "Choose **Repositories**, open **Checkout folders**",
+            "The **Repositories** view of the board has a **Checkout folders** editor",
+        ):
+            assert stale not in text, (name, stale)
 
 
 USER_DOCUMENTS = (

@@ -274,12 +274,14 @@ every host can store both spellings.
 ## Checkout folders
 
 Nyx records, per workspace, the folders whose git checkouts `nyx checkouts`
-lists. Set them in the browser: choose **Repositories**, open **Checkout folders**,
-add or remove folders and the GitHub lookup, and choose **Save checkout
-folders**. The editor offers the parent folders that would bring a package's
-`Target repo:` checkout into view and shows what the server refused beside each
-folder; see [Use the Repositories view](running-nyx.md#use-the-repositories-view). It
-saves the account's configuration record for the active workspace.
+lists. Set them in the browser: open the **Settings** panel and its **Checkout
+folders** section, add or remove folders and the GitHub lookup, and choose
+**Save checkout folders**. The section offers the parent folders that would bring
+a package's `Target repo:` checkout into view and shows what the server refused
+beside each folder; see [Change the checkout
+folders](running-nyx.md#change-the-checkout-folders) and [Use the Repositories
+view](running-nyx.md#use-the-repositories-view). It saves the account's
+configuration record for the active workspace.
 
 ### Without the board
 
@@ -312,8 +314,9 @@ folders uses schema 4:
   value. With `true`, a networked run asks GitHub about the pull requests of each
   GitHub repository among the checkouts, through an authenticated `gh` on `PATH`;
   see [Inspect checkouts](running-nyx.md#inspect-checkouts). A workspace with no
-  entry has the lookup on. The **Checkout folders** editor changes it with the
-  folders; saving no folders removes the entry, so the lookup returns to on.
+  entry has the lookup on. The **Checkout folders** section of **Settings**
+  changes it with the folders; saving no folders removes the entry, so the
+  lookup returns to on.
 - Each entry in `folders` must be an absolute path, and the list must be sorted
   by character code, with no duplicates and at least one entry. Write each path
   already normalized in the host's own separators, with no trailing separator

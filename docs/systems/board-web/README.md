@@ -87,11 +87,22 @@ README is narrative only.
   line and adds a `Code Status unavailable` issues-panel part, and a
   configuration mismatch adds no entry.
 
+- Holds the header's **Settings** disclosure, whose content is bounded to a
+  share of the viewport and scrolls. Its **Board** section holds the **Click
+  empty space to deselect** preference, the stage row order and **Counts as
+  finished**, and its **Checkout folders** section loads and saves the checkout
+  settings (folders, GitHub lookup and revision) with the server's answer for
+  each outcome. Each section keeps its own draft, status line and focus
+  restoration, and both read the record's one configuration revision, so a save
+  in one section moves the other only while it holds no draft. The **Checkout
+  folders** section is shown in every state except one where the server serves
+  no checkout state, opening the panel loads the saved folders when no draft is
+  held, and the section offers the document's `folder_suggestions` once a ready
+  document exists while showing the folders the server refused beside them.
 - Shows the Repositories view beside the board, chosen with a header switch whose
   choice and **Hide quiet repositories** are browser-local preferences. The view
-  renders the served checkouts document: a status line and the **Checkout
-  folders** editor, whose save is the view's write (the checkout settings
-  `PUT`), a **Needs attention** bar of pills with page totals whose lists open
+  renders the served checkouts document: a status line, a **Needs attention**
+  bar of pills with page totals whose lists open
   below it and whose items focus the branch, clone, worktree or
   **Work item branches** row they name (a branch item opens the clone's
   **Details** first) or select a work item's card, and one line per repository
@@ -127,14 +138,10 @@ README is narrative only.
   board; a refresh replaces only the blocks that changed, so what the reader
   opened and focused stays. A panel
   replaces the groups when the server serves no checkout state, a collection
-  failed, or no folders are configured. The **Checkout folders** editor, shown
-  while the view has a scan or a failed collection, loads and saves the
-  checkout settings (folders, GitHub lookup and revision) with the server's
-  answer for each outcome, offers the document's `folder_suggestions`, shows the
-  folders the server refused beside them and shares one configuration revision
-  with the stage settings editor. A successful save installs a fresh catalog and
+  failed, or no folders are configured. The view changes no repository and no
+  setting: a folder save in the **Settings** panel installs a fresh catalog and
   asks for a checkouts read at once, unless one is already in flight, when the
-  next tick shows the new folders; the view changes no repository.
+  next tick shows the new folders.
 
 ## Outside this boundary
 
