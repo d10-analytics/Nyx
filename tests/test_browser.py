@@ -10571,57 +10571,299 @@ def test_checkouts_settings_sentence_shows_when_the_catalog_request_failed(
     assert page.locator("#checkouts-body .checkouts-group").count() == 1
 
 
-def covered_card_clearance(page):
-    """How far the focused card's edges lie outside the area the sticky heads leave."""
-    return page.evaluate("""() => {
-      const rect = document.activeElement.getBoundingClientRect();
-      let covered = 0;
-      document.querySelectorAll('.toolbar, .board-corner, .column-head').forEach((head) => {
-        covered = Math.max(covered, head.getBoundingClientRect().bottom);
-      });
-      return {top: rect.top, bottom: rect.bottom, covered, height: window.innerHeight,
-              scrolled: window.scrollY, path: document.activeElement.dataset.packagePath};
-    }""")
+CENTERING_TARGET = "Repo/Drafts/alpha"
+CENTERING_ATTENTION_TARGET = "Repo/Drafts/zeta"
+CENTERING_DEPENDENT = "Repo/Drafts/dependent"
+CENTERING_NEIGHBOUR = "Repo/Drafts/afiller19"
 
 
-def test_checkouts_show_on_board_clears_the_sticky_heads_on_a_tall_board(
+def _project_package_spec(root, project, name, package_id, fields=()):
+    """Write one fictional package under ``<root>/<project>/Drafts/<name>``."""
+    folder = root / project / "Drafts" / name
+    folder.mkdir(parents=True)
+    (folder / "spec.md").write_text(
+        "\n".join([f"# {name.title()}", f"Package ID: {package_id}",
+                   "Status: approved", *fields]) + "\n", encoding="utf-8")
+
+
+def centering_catalog(root):
+    """One catalog whose board is wider than a 1000 px window and taller than 720.
+
+    ``AlphaWorks`` and ``ZuluWorks`` stand on either side of ``Repo``, so the
+    targets' column is neither first nor last.  Their own Drafts cell carries
+    fillers on both sides of the targets and, last, a work item that declares
+    ``alpha`` as its prerequisite, so its panel offers a link to that card.
+    Nothing here reads git: the catalog is scanned from these spec files.
+    """
+    def package_id(number):
+        return f"123e4567-e89b-42d3-a456-426614{number:06d}"
+
+    _project_package_spec(root, "AlphaWorks", "elsewhere", package_id(1))
+    _project_package_spec(root, "ZuluWorks", "further", package_id(2))
+    for number in range(20):
+        _project_package_spec(root, "Repo", f"afiller{number:02d}", package_id(number))
+    _project_package_spec(root, "Repo", "alpha", ATTENTION_PACKAGE_IDS["alpha"])
+    _project_package_spec(root, "Repo", "zeta", ATTENTION_PACKAGE_IDS["zeta"])
+    for number in range(20):
+        _project_package_spec(root, "Repo", f"zfiller{number:02d}", package_id(number + 100))
+    _project_package_spec(root, "Repo", "dependent", package_id(200),
+                          [f"Completion Prerequisite: {ATTENTION_PACKAGE_IDS['alpha']}"])
+    return json.loads(scan_catalog(
+        root, completed_stage_names=["Shipped"],
+        configuration_revision=CHECKOUTS_REVISION))
+
+
+def board_card_geometry(page, path=None):
+    """One card's rectangle, the area it must sit in, and the window scroll.
+
+    The area is the board's own definition (``boardCardArea`` in
+    ``nyx/static/app.js``) recomputed from the real layout, so a layout change
+    that the board no longer accounts for fails here instead of drifting
+    silently: where the sticky heads come to rest once stuck, which the current
+    scroll does not change, the strip painted after the row labels, and the
+    window's visible edges.  ``labelsRight`` is where the labels themselves end,
+    before that strip.  The card is the named one, else the focused one.
+    """
+    return page.evaluate("""(path) => {
+      const focused = document.activeElement instanceof Element
+        ? document.activeElement.closest('.card') : null;
+      const card = path === null ? focused : [...document.querySelectorAll('.card')]
+        .find((item) => item.dataset.packagePath === path);
+      if (card === null || card === undefined) return null;
+      const rect = card.getBoundingClientRect();
+      const corner = document.querySelector('.board-corner');
+      const rowHead = document.querySelector('.row-head');
+      const labels = [rowHead, corner].filter((head) => head !== null);
+      const heads = [corner, ...document.querySelectorAll('.column-head')]
+        .filter((head) => head !== null);
+      const stuckLeft = Math.max(0, ...labels.map((head) =>
+        parseFloat(getComputedStyle(head).left) || 0));
+      const labelsWidth = Math.max(0, ...labels.map((head) => head.offsetWidth));
+      const strip = rowHead === null ? 0 : (() => {
+        const after = getComputedStyle(rowHead, '::after');
+        return (parseFloat(after.width) || 0) + (parseFloat(after.borderRightWidth) || 0);
+      })();
+      const headHeight = Math.max(0, ...heads.map((head) => head.offsetHeight));
+      const toolbarHeight = parseFloat(getComputedStyle(document.documentElement)
+        .getPropertyValue('--toolbar-height')) || 0;
+      const root = document.documentElement;
+      return {
+        path: card.dataset.packagePath,
+        rect: {left: rect.left, top: rect.top, width: rect.width, height: rect.height},
+        area: {
+          left: stuckLeft + labelsWidth + strip,
+          top: Math.max(document.querySelector('.toolbar').getBoundingClientRect().bottom,
+            toolbarHeight + headHeight),
+          right: root.clientWidth,
+          bottom: root.clientHeight,
+        },
+        labelsRight: stuckLeft + labelsWidth,
+        scroll: {x: window.scrollX, y: window.scrollY,
+                 maxX: root.scrollWidth - root.clientWidth,
+                 maxY: root.scrollHeight - root.clientHeight},
+      };
+    }""", path)
+
+
+def assert_card_revealed(geometry):
+    """One revealed card reads the way the board area requires on both axes.
+
+    Each axis is asserted reachable first, so the browser clamped neither target
+    and the exact rule applies: a card that fits is centered in the area, and one
+    larger than it starts 8 px inside, never before the area's start.
+    """
+    rect, area, scroll = geometry["rect"], geometry["area"], geometry["scroll"]
+    for name, start, size, end, offset, limit in (
+        ("horizontal", "left", "width", "right", "x", "maxX"),
+        ("vertical", "top", "height", "bottom", "y", "maxY"),
+    ):
+        assert 0 < scroll[offset] < scroll[limit], (name, geometry)
+        if rect[size] <= area[end] - area[start]:
+            middle = rect[start] + rect[size] / 2
+            assert abs(middle - (area[start] + area[end]) / 2) <= 1, (name, geometry)
+        else:
+            assert abs(rect[start] - (area[start] + 8)) <= 1, (name, geometry)
+        assert rect[start] >= area[start], (name, geometry)
+
+
+def test_checkouts_show_on_board_centers_the_card_in_the_board_area(
     open_page, attention_checkouts, tmp_path
 ):
-    """Whether the card lies above or below the window, it ends fully below the heads."""
-    spec_root = tmp_path / "tall-root"
-    _package_spec(spec_root, "Drafts", "alpha", ATTENTION_PACKAGE_IDS["alpha"], [])
-    _package_spec(spec_root, "Drafts", "zeta", ATTENTION_PACKAGE_IDS["zeta"], [])
-    for number in range(60):
-        _package_spec(spec_root, "Drafts", f"filler-{number:02d}",
-                      f"123e4567-e89b-42d3-a456-4266141750{number:02d}", [])
-    catalog = json.loads(scan_catalog(
-        spec_root, completed_stage_names=["Shipped"],
-        configuration_revision=CHECKOUTS_REVISION,
-    ))
+    """Both callers center a card in the area the sticky heads leave, from any start."""
+    catalog = centering_catalog(tmp_path / "centering-root")
     page, _ = open_attention_checkouts(
         open_page, attention_checkouts, attention_checkouts.document, catalog=catalog)
-    page.locator("#view-board").click()
-    assert page.evaluate("document.documentElement.scrollHeight") > 3 * 720
+    page.set_viewport_size({"width": 1000, "height": 720})
+    page.evaluate("() => document.fonts.ready.then(() => undefined)")
+    settle_frames(page)
+    # Two projects stand on either side of Repo, so its column is neither first
+    # nor last.
+    assert page.locator(".column-head").all_inner_texts() == [
+        "AlphaWorks", "Repo", "ZuluWorks"]
 
-    for target, scroll_to in (("Repo/Drafts/alpha", "bottom"), ("Repo/Drafts/zeta", "top")):
-        page.locator("#view-board").click()
+    def scroll_window(where):
+        """Put the window at the Repositories view's own top or maximum scroll."""
         page.evaluate(
-            "where => window.scrollTo(0, where === 'bottom' ? document.documentElement.scrollHeight : 0)",
-            scroll_to)
-        show_checkouts_view(page)
-        if target == "Repo/Drafts/zeta":
-            page.locator('li[data-code="target_repo_missing"] [data-show-on-board]').click()
-        else:
-            detail = open_clone_detail(page, "Repo Clone 2")
-            detail.locator(f'li[data-package="{target}"] [data-show-on-board]').click()
+            "(where) => window.scrollTo(where === 'maximum'"
+            " ? {left: document.documentElement.scrollWidth,"
+            "    top: document.documentElement.scrollHeight}"
+            " : {left: 0, top: 0})", where)
+        return page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+
+    def ensure_clone_detail():
+        """Open Repo Clone 2's row unless it is already open, and return it."""
+        row = page.locator('tr.checkouts-clone[data-clone="Repo Clone 2"]')
+        group = page.locator(".checkouts-group").filter(has=row)
+        if group.locator(".checkouts-group-body").evaluate("el => el.hidden"):
+            group.locator(".checkouts-line-toggle").click()
+        if row.locator(".checkouts-toggle").get_attribute("aria-expanded") != "true":
+            row.locator(".checkouts-toggle").click()
+        detail = row.locator("xpath=following-sibling::tr[1]")
+        playwright.expect(detail).to_be_visible()
+        return detail
+
+    def scroll_after_a_plain_switch():
+        """Press the board switch alone, then read the board's scroll and its limits."""
+        page.locator("#view-board").click()
         playwright.expect(page.locator("#board")).to_be_visible()
-        # The checkouts toolbar is shorter than the board's, so the heads settle
-        # lower once the switch is painted; the card must clear where they end.
         settle_frames(page)
-        box = covered_card_clearance(page)
-        assert box["path"] == target
-        assert box["top"] >= box["covered"], (target, box)
-        assert box["bottom"] <= box["height"], (target, box)
+        return page.evaluate(
+            "() => ({x: window.scrollX, y: window.scrollY,"
+            " maxX: document.documentElement.scrollWidth"
+            " - document.documentElement.clientWidth,"
+            " maxY: document.documentElement.scrollHeight"
+            " - document.documentElement.clientHeight})")
+
+    def press_show_on_board(site, target):
+        """Press the Show on board button itself, without scrolling it into view."""
+        if site == "details":
+            detail = ensure_clone_detail()
+            button = detail.locator(
+                f'li[data-package="{target}"] [data-show-on-board]')
+        else:
+            button = page.locator(
+                'li[data-code="target_repo_missing"] [data-show-on-board]')
+        assert button.get_attribute("data-show-on-board") == target
+        button.evaluate("node => node.click()")
+
+    def current_scroll():
+        return page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
+
+    # Each caller's button, started from the top of the Repositories view and
+    # from its own maximum scroll.  Switching views keeps the window scroll the
+    # browser clamps it to, so the board starts where the Repositories view left
+    # it: from the view's top it starts at the board's top, where the heads still
+    # sit inside the board's padding rather than at their stuck places.
+    for site, target in (("details", CENTERING_TARGET),
+                         ("attention", CENTERING_ATTENTION_TARGET)):
+        for where in ("top", "maximum"):
+            show_checkouts_view(page)
+            if site == "details":
+                ensure_clone_detail()
+            begun = scroll_window(where)
+            switched = scroll_after_a_plain_switch()
+            assert (switched["x"], switched["y"]) == (
+                min(begun["x"], switched["maxX"]), min(begun["y"], switched["maxY"]))
+            if where == "top":
+                assert (begun["x"], begun["y"]) == (0, 0)
+                assert (switched["x"], switched["y"]) == (0, 0)
+
+            show_checkouts_view(page)
+            if site == "details":
+                ensure_clone_detail()
+            assert scroll_window(where) == begun
+            press_show_on_board(site, target)
+            playwright.expect(page.locator("#board")).to_be_visible()
+            # The work item panel is open, so the board reserves its width.
+            assert page.evaluate(
+                "() => getComputedStyle(document.body)"
+                ".getPropertyValue('--panel-space').trim()") == "22rem"
+            switched = current_scroll()
+            settle_frames(page)
+            geometry = board_card_geometry(page)
+            assert geometry["path"] == target, (site, where)
+            # The one scroll has already settled: the position read right after
+            # the switch is the one the whole page ends at.
+            assert (switched["x"], switched["y"]) == (
+                geometry["scroll"]["x"], geometry["scroll"]["y"]), (site, where, geometry)
+            assert_card_revealed(geometry)
+            # A target whose column is neither first nor last is centered with its
+            # left edge right of the row labels.
+            assert geometry["rect"]["left"] > geometry["labelsRight"], (site, where, geometry)
+
+    # The panel's relationship link centers the card it names, from the board's
+    # top-left and from its bottom-right corner.
+    for where in ("top-left", "bottom-right"):
+        dependent = page.locator(f'.card[data-package-path="{CENTERING_DEPENDENT}"]')
+        if dependent.get_attribute("aria-pressed") != "true":
+            dependent.click()
+        assert dependent.get_attribute("aria-pressed") == "true"
+        link = page.locator(
+            f'#work-item-panel-body [data-select-path="{CENTERING_TARGET}"]')
+        playwright.expect(link).to_be_visible()
+        page.evaluate(
+            "(where) => window.scrollTo(where === 'bottom-right'"
+            " ? {left: document.documentElement.scrollWidth,"
+            "    top: document.documentElement.scrollHeight}"
+            " : {left: 0, top: 0})", where)
+        begun = current_scroll()
+        if where == "top-left":
+            assert (begun["x"], begun["y"]) == (0, 0)
+        link.click()
+        switched = current_scroll()
+        settle_frames(page)
+        geometry = board_card_geometry(page, CENTERING_TARGET)
+        assert geometry["path"] == CENTERING_TARGET, (where, geometry)
+        assert (switched["x"], switched["y"]) == (
+            geometry["scroll"]["x"], geometry["scroll"]["y"]), (where, geometry)
+        assert_card_revealed(geometry)
+        assert geometry["rect"]["left"] > geometry["labelsRight"], (where, geometry)
+
+    # A click on a card moves nothing: the neighbour above the centered target is
+    # wholly inside the area, so pressing it needs no scrolling either.
+    neighbour = board_card_geometry(page, CENTERING_NEIGHBOUR)
+    rect, area = neighbour["rect"], neighbour["area"]
+    assert rect["left"] >= area["left"] and rect["top"] >= area["top"], neighbour
+    assert rect["left"] + rect["width"] <= area["right"], neighbour
+    assert rect["top"] + rect["height"] <= area["bottom"], neighbour
+    before = current_scroll()
+    page.locator(f'.card[data-package-path="{CENTERING_NEIGHBOUR}"]').click()
+    settle_frames(page)
+    assert current_scroll() == before
+
+    # A window small enough that the target is larger than the area on both axes:
+    # its start edge takes the area's start plus the margin instead of its center.
+    page.set_viewport_size({"width": 800, "height": 320})
+    page.evaluate("() => document.fonts.ready.then(() => undefined)")
+    settle_frames(page)
+    show_checkouts_view(page)
+    assert scroll_window("top") == {"x": 0, "y": 0}
+    press_show_on_board("details", CENTERING_TARGET)
+    playwright.expect(page.locator("#board")).to_be_visible()
+    switched = current_scroll()
+    settle_frames(page)
+    geometry = board_card_geometry(page)
+    assert geometry["path"] == CENTERING_TARGET, geometry
+    rect, area, scroll = geometry["rect"], geometry["area"], geometry["scroll"]
+    assert (switched["x"], switched["y"]) == (scroll["x"], scroll["y"]), geometry
+    assert rect["width"] > area["right"] - area["left"], geometry
+    assert rect["height"] > area["bottom"] - area["top"], geometry
+    assert 0 < scroll["x"] < scroll["maxX"], geometry
+    assert 0 < scroll["y"] < scroll["maxY"], geometry
+    assert abs(rect["left"] - (area["left"] + 8)) <= 1, geometry
+    assert abs(rect["top"] - (area["top"] + 8)) <= 1, geometry
+    assert rect["left"] >= area["left"] and rect["top"] >= area["top"], geometry
+
+    # Repeating the same Show on board leaves the scroll exactly where it was.
+    show_checkouts_view(page)
+    assert scroll_window("top") == {"x": 0, "y": 0}
+    press_show_on_board("details", CENTERING_TARGET)
+    playwright.expect(page.locator("#board")).to_be_visible()
+    settle_frames(page)
+    repeated = board_card_geometry(page)
+    assert repeated["path"] == CENTERING_TARGET, repeated
+    assert (repeated["scroll"]["x"], repeated["scroll"]["y"]) == (
+        scroll["x"], scroll["y"]), repeated
 
 
 # ---------------------------------------------------------------------------
