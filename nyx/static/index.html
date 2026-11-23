@@ -21,23 +21,47 @@
         <details id="stage-order-editor" class="stage-order-editor">
           <summary id="stage-order-heading">Settings</summary>
           <div class="stage-order-content">
-            <h3>Board</h3>
-            <label class="selection-preference" for="deselect-on-empty-click">
-              <input id="deselect-on-empty-click" type="checkbox">
-              Click empty space to deselect
-            </label>
-            <p class="selection-preference-help">Applies immediately in this browser.</p>
-            <div id="stage-order-controls" hidden>
-              <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Save to apply these changes.</p>
-              <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
-              <div class="stage-order-actions">
-                <button id="stage-order-save" type="button">Save</button>
-                <button id="stage-order-cancel" type="button">Cancel</button>
-                <button id="stage-order-reset" type="button">Reset</button>
-                <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+            <section id="stage-order-section" class="stage-order-section">
+              <h3>Board</h3>
+              <label class="selection-preference" for="deselect-on-empty-click">
+                <input id="deselect-on-empty-click" type="checkbox">
+                Click empty space to deselect
+              </label>
+              <p class="selection-preference-help">Applies immediately in this browser.</p>
+              <div id="stage-order-controls" hidden>
+                <p id="stage-order-help">Choose the order of stage rows and which stages count as finished. Save to apply these changes.</p>
+                <ol id="stage-order-list" class="stage-order-list" aria-describedby="stage-order-help"></ol>
+                <div class="stage-order-actions">
+                  <button id="stage-order-save" type="button">Save</button>
+                  <button id="stage-order-cancel" type="button">Cancel</button>
+                  <button id="stage-order-reset" type="button">Reset</button>
+                  <button id="stage-order-reload" type="button" hidden>Reload board settings</button>
+                </div>
+                <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
               </div>
-              <p id="stage-order-status" class="stage-order-status" role="status" aria-live="polite"></p>
-            </div>
+            </section>
+            <section id="checkout-folders-editor" class="checkout-folders-editor">
+              <h3>Checkout folders</h3>
+              <div class="checkout-folders-content">
+                <ul id="checkout-folders-list" class="checkout-folders-list" aria-label="Checkout folders"></ul>
+                <div class="checkout-folders-add">
+                  <label for="checkout-folders-path">Checkout folder path</label>
+                  <input id="checkout-folders-path" type="text" autocomplete="off" spellcheck="false">
+                  <button id="checkout-folders-add" type="button">Add</button>
+                </div>
+                <ul id="checkout-folders-suggestions" class="checkout-folders-suggestions" aria-label="Suggested checkout folders"></ul>
+                <label class="compact-control" for="checkout-folders-github">
+                  <input id="checkout-folders-github" type="checkbox">
+                  Look up pull requests with the GitHub CLI (gh)
+                </label>
+                <div class="checkout-folders-actions">
+                  <button id="checkout-folders-save" type="button" aria-disabled="true">Save checkout folders</button>
+                  <button id="checkout-folders-cancel" type="button" aria-disabled="true">Cancel checkout folder changes</button>
+                  <button id="checkout-folders-reload" type="button" hidden>Reload checkout folders</button>
+                </div>
+                <p id="checkout-folders-status" class="checkout-folders-status" role="status" aria-live="polite"></p>
+              </div>
+            </section>
           </div>
         </details>
         <div class="controls">
@@ -79,28 +103,6 @@
       <h1 id="checkouts-heading">Repositories</h1>
       <div class="checkouts-status">
         <p id="checkouts-status-line" class="checkouts-status-line"></p>
-        <details id="checkout-folders-editor" class="checkout-folders-editor" hidden>
-          <summary>Checkout folders</summary>
-          <div class="checkout-folders-content">
-            <ul id="checkout-folders-list" class="checkout-folders-list" aria-label="Checkout folders"></ul>
-            <div class="checkout-folders-add">
-              <label for="checkout-folders-path">Checkout folder path</label>
-              <input id="checkout-folders-path" type="text" autocomplete="off" spellcheck="false">
-              <button id="checkout-folders-add" type="button">Add</button>
-            </div>
-            <ul id="checkout-folders-suggestions" class="checkout-folders-suggestions" aria-label="Suggested checkout folders"></ul>
-            <label class="compact-control" for="checkout-folders-github">
-              <input id="checkout-folders-github" type="checkbox">
-              Look up pull requests with the GitHub CLI (gh)
-            </label>
-            <div class="checkout-folders-actions">
-              <button id="checkout-folders-save" type="button" aria-disabled="true">Save checkout folders</button>
-              <button id="checkout-folders-cancel" type="button" aria-disabled="true">Cancel checkout folder changes</button>
-              <button id="checkout-folders-reload" type="button" hidden>Reload checkout folders</button>
-            </div>
-            <p id="checkout-folders-status" class="checkout-folders-status" role="status" aria-live="polite"></p>
-          </div>
-        </details>
       </div>
       <div id="checkouts-body"></div>
     </main>

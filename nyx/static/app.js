@@ -360,7 +360,7 @@
       "unavailable": "Checkout state is unavailable: {category}.",
       "clearsDefault": "It clears when a later collection succeeds.",
       "noOriginRemote": "no origin remote",
-      "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
+      "noFolders": "No checkout folders are configured. Choose Checkout folders in Settings to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
       "quietLine": "{count} quiet repositories hidden",
@@ -488,6 +488,11 @@
   const workItemPanel = document.querySelector("#work-item-panel");
   const workItemPanelToggle = document.querySelector("#work-item-panel-toggle");
   const workItemPanelBody = document.querySelector("#work-item-panel-body");
+  // The Settings panel holds one section per editor; each editor's controls and
+  // focus restoration stay inside its own section.
+  const stageOrderPanel = document.querySelector("#stage-order-editor");
+  const stageOrderHeading = document.querySelector("#stage-order-heading");
+  const stageOrderSection = document.querySelector("#stage-order-section");
   const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
   const stageOrderSave = document.querySelector("#stage-order-save");
@@ -569,7 +574,6 @@
   // What the editor last drew from the served document, so a tick that
   // settles the same suggestions leaves the editor untouched.
   let foldersSuggestionKey = null;
-  let foldersAutoOpened = false;
   // The last checkouts outcome: "idle", "not_offered", "ready" with its
   // envelope, or "failed" with its category.  "failed" adds a Code Status part
   // to the issues panel, and every settled outcome rewrites the cards' lines.
@@ -813,8 +817,7 @@
   }
 
   function renderStageOrderEditor() {
-    const editor = document.querySelector("#stage-order-editor");
-    const controls = () => [...editor.querySelectorAll("summary, input, button, select")];
+    const controls = () => [...stageOrderSection.querySelectorAll("input, button, select")];
     const focused = document.activeElement;
     const priorControls = controls();
     const priorIndex = priorControls.indexOf(focused);
@@ -837,7 +840,7 @@
       const successor = same || siblings.find((control) => control.dataset.stageMove) ||
         siblings[0] || current.slice(priorIndex + 1).find(operable) ||
         current.slice(0, priorIndex).reverse().find(operable) ||
-        document.querySelector("#stage-order-heading");
+        stageOrderHeading;
       successor.focus();
     };
     stageOrderControls.hidden = !settingsAvailable && !settingsReloadAvailable;
@@ -2679,7 +2682,7 @@
   }
 
   function renderFoldersEditor() {
-    const controls = () => [...foldersEditor.querySelectorAll("summary, input, button")];
+    const controls = () => [...foldersEditor.querySelectorAll("input, button")];
     const focused = document.activeElement;
     const prior = controls();
     const priorIndex = prior.indexOf(focused);
@@ -2741,7 +2744,6 @@
     // A request in flight dims every control without removing it from the tab
     // order, so focus stays where the reader put it.
     controls().forEach((control) => {
-      if (control.tagName === "SUMMARY") return;
       // Cancel and Reload are the way out of a reload hold, so it leaves them operable.
       const exit = control === foldersCancel || control === foldersReload;
       const held = foldersHeld() && !(exit && !foldersBusy &&
@@ -2753,7 +2755,7 @@
     // Focus goes back to the same control; a removed folder or a taken
     // suggestion hands it to the next of its kind, else the previous, else the
     // path input; any other control that stopped being operable hands it to the
-    // next operable control, else the previous, else the summary.
+    // next operable control, else the previous, else the panel's summary.
     const current = controls();
     const operable = (control) => control?.isConnected && !control.disabled &&
       !control.closest("[hidden]");
@@ -2766,7 +2768,7 @@
     }
     successor = successor || current.slice(priorIndex + 1).find(operable) ||
       current.slice(0, priorIndex).reverse().find(operable) ||
-      foldersEditor.querySelector("summary");
+      stageOrderHeading;
     successor.focus();
   }
 
@@ -2912,20 +2914,15 @@
       });
   }
 
-  // The editor is shown for a ready or failed outcome and hidden otherwise.
-  // The attribute is written only when it changes, so a tick that settles the
-  // same outcome leaves the editor alone.  The first time a ready document has
-  // no folders the panel opens itself, once.
+  // The editor is shown for every outcome except one that offers no checkout
+  // state at all.  The attribute is written only when it changes, so a tick that
+  // settles the same outcome leaves the editor alone.
   function syncFoldersEditor() {
-    const available = checkoutsOutcome.state === "ready" || checkoutsOutcome.state === "failed";
+    const available = checkoutsOutcome.state !== "not_offered";
     if (foldersEditor.hidden === available) foldersEditor.hidden = !available;
     const key = checkoutsOutcome.state === "ready"
       ? JSON.stringify(foldersSuggestionList()) : null;
     if (available && key !== foldersSuggestionKey) renderFoldersEditor();
-    if (!available || foldersAutoOpened || checkoutsOutcome.state !== "ready" ||
-      checkoutsOutcome.envelope.checkouts.folders.length > 0) return;
-    foldersAutoOpened = true;
-    foldersEditor.open = true;
   }
 
   // Both editors read and write the record's one revision, and each save leaves
@@ -5439,8 +5436,10 @@
   stageOrderReload.addEventListener("click", () => {
     if (!settingsBusy) loadSettings();
   });
-  foldersEditor.addEventListener("toggle", () => {
-    if (!foldersEditor.open) return;
+  // Opening the panel is what loads the saved folders; a draft in hand is
+  // redrawn instead, and a hidden section asks for nothing.
+  stageOrderPanel.addEventListener("toggle", () => {
+    if (!stageOrderPanel.open || foldersEditor.hidden) return;
     if (foldersDraft === null) loadFolders();
     else renderFoldersEditor();
   });
