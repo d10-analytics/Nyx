@@ -275,7 +275,7 @@ every host can store both spellings.
 
 Nyx records, per workspace, the folders whose git checkouts `nyx checkouts`
 lists. Set them in the browser: open the **Settings** panel and its **Checkout
-folders** section, add or remove folders and the GitHub lookup, and choose
+folders** section. Add or remove folders and the GitHub lookup, and choose
 **Save checkout folders**. The section offers the parent folders that would bring
 a package's `Target repo:` checkout into view and shows what the server refused
 beside each folder; see [Change the checkout

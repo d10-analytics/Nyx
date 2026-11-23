@@ -1531,7 +1531,7 @@ def test_the_checkout_guides_describe_the_folder_editor():
     ) in readme
     assert workspaces.count(
         "lists. Set them in the browser: open the **Settings** panel and its **Checkout "
-        "folders** section, add or remove folders and the GitHub lookup, and choose "
+        "folders** section. Add or remove folders and the GitHub lookup, and choose "
         "**Save checkout folders**."
     ) == 1
     assert workspaces.index("Set them in the browser") < workspaces.index("### Without the board")
@@ -1547,8 +1547,11 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "read of its own and the lines follow at the next tick)"
     ) in board_web
     assert (
-        "asks for a checkouts read at once, unless one is already in flight, when the next "
-        "tick shows the new folders"
+        "A folder save in the **Settings** panel installs a fresh catalog and asks for a "
+        "checkouts read at once"
+    ) in board_web
+    assert (
+        "When a read is already in flight, the next tick shows the new folders"
     ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
     assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
