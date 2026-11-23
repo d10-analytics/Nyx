@@ -3867,7 +3867,10 @@
       verdict.reason !== null && verdict.reason !== undefined) {
       words = `${state} — ${text(codeWords("verdictReason", verdict.reason))}`;
     }
-    return `<span class="checkouts-verdict-words">${words}</span>${basis}`;
+    // Only a merged verdict reads green; every other state keeps the cell's
+    // colour.
+    const tone = verdict.state === "merged" ? ' data-tone="green"' : "";
+    return `<span class="checkouts-verdict-words"${tone}>${words}</span>${basis}`;
   }
 
   function verdictWords(document, group, entry) {
