@@ -122,10 +122,10 @@ README is narrative only.
   names (the most serious one any repository reached), and composes counts with
   their plural nouns and fetch ages (`min`, `h`, `d`) outside the words block. The view is drawn only while it is shown: on
   switching to it with the latest outcome, and whenever the board re-renders
-  while it is shown, so a catalog change, a settings load or a terminal-row
-  toggle redraws it in the same step. A scan that settles while the board is
-  shown does not touch the board; a refresh replaces only the blocks that
-  changed, so what the reader opened and focused stays. A panel
+  while it is shown (a catalog change, a settings load or a terminal-row
+  toggle), so a scan that settles while the board is shown does not touch the
+  board; a refresh replaces only the blocks that changed, so what the reader
+  opened and focused stays. A panel
   replaces the groups when the server serves no checkout state, a collection
   failed, or no folders are configured. The **Checkout folders** editor, shown
   while the view has a scan or a failed collection, loads and saves the
