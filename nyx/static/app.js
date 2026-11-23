@@ -2622,6 +2622,9 @@
       settingsStatus("Board settings saved.");
       renderStageOrderEditor();
       request("settings", payload.revision);
+      // The board settings are new, so the cards' code status follows the read
+      // this save requests, not the next tick's.
+      requestCheckouts();
     }).catch((error) => {
       settingsStatus(`Save failed: ${settingsErrorMessage(error)}`, true);
       renderStageOrderEditor();
@@ -5200,7 +5203,8 @@
 
   // One checkouts request at most is in flight: a tick or return check that
   // finds one running is skipped rather than queued, because the server answers
-  // every request with the document it has and rescans at most once a minute.
+  // every request with the document it has and starts a collection only when
+  // its one refresh interval has passed.
   function requestCheckouts() {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
