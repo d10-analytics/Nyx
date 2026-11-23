@@ -4830,6 +4830,8 @@ def _precedes(first, second):
 def test_checkbox_group_sits_left_of_settings_at_every_width_and_view(open_page):
     """The group reads before Settings on the Board and on Repositories, at every width."""
     page = open_page(StaticClient(board_payload()), settings=BrowserSettings())
+    # The brand's own font decides the toolbar's free width, so settle it first.
+    page.evaluate("() => document.fonts.ready.then(() => undefined)")
     for view in ("board", "checkouts"):
         if view == "checkouts":
             show_checkouts_view(page)
