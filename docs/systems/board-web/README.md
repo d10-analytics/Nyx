@@ -88,11 +88,10 @@ README is narrative only.
 
 - Shows the Repositories view beside the board, chosen with a header switch whose
   choice and **Hide quiet repositories** are browser-local preferences. The view
-  renders the served checkouts document: a status line with **Check remotes
-  now** (a request for a remote check through `application-serving`) and the
-  **Checkout folders** editor, whose save is the view's other write (the
-  checkout settings `PUT`), a **Needs attention** bar of pills with page totals
-  whose lists open below it and whose items focus the branch, clone, worktree or
+  renders the served checkouts document: a status line and the **Checkout
+  folders** editor, whose save is the view's write (the checkout settings
+  `PUT`), a **Needs attention** bar of pills with page totals whose lists open
+  below it and whose items focus the branch, clone, worktree or
   **Work item branches** row they name (a branch item opens the clone's
   **Details** first) or select a work item's card, and one line per repository
   that opens and closes its tables. A line has a coloured left edge, red for work
@@ -138,8 +137,8 @@ README is narrative only.
 
 ## Outside this boundary
 
-- Any write other than the board-settings `PUT`, the checkout settings `PUT` and
-  the remote-check request; editing specification files.
+- Any write other than the board-settings `PUT` and the checkout settings
+  `PUT`; editing specification files.
 
 ## Collaborators
 

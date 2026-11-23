@@ -20,9 +20,8 @@ README is narrative only.
   checkout serving below.
 - The Linux service and the desktop application serve checkout state through
   `ApplicationRuntime`: `GET` and `HEAD /api/checkouts` answer with its
-  `get_checkouts()` envelope, `{"checkouts": <document>, "remote_checks": ...}`,
-  and `POST /api/checkouts/remote-check` queues a networked check through
-  `refresh_remote_checks()`. The standalone catalog server offers neither route.
+  `get_checkouts()` envelope, `{"checkouts": <document>, "remote_checks": ...}`.
+  The standalone catalog server offers no checkout route.
 - Both hosts read and save the active workspace's checkout folder settings
   through `ApplicationRuntime`: `GET`/`HEAD /api/checkout-settings` answers
   exactly `{folders, github_lookup, revision}` from the captured configuration,

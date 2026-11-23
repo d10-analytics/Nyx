@@ -1499,11 +1499,8 @@ live, recorded, off or unavailable. When the scan was made under different
 settings from the board shown, the line adds `Collected under different
 settings from the board shown.` Nyx checks the remotes itself at most every
 five minutes while a board page is open, which is what `Next check about` counts
-toward; **Check remotes now** asks for a check immediately instead of waiting
-for the next due one. It reads `Checking remotes…` while the check runs, and a
-note beside it says `Remote check finished.` or `Remote check failed:` with the
-category. Only one check runs at a time, and a server that does not offer remote
-checks says `This server does not offer remote checks.`
+toward. It reads `Checking remotes…` while the check runs. Only one check runs
+at a time.
 
 The **Checkout folders** control beside the status line opens an editor for the
 active workspace's checkout folders and its GitHub lookup. It appears whenever
@@ -1634,7 +1631,7 @@ branch only the remote holds therefore keeps its row. A branch that no listed
 clone holds has no row when its remote copy reads `not on the remote`. A branch
 of a repository with no remote has no row either, because no copy exists. Such
 a branch has no row only while every listed clone of the repository could be
-read. A branch pushed since the last check appears after **Check remotes now**.
+read. A branch pushed since the last check appears after the next check.
 The clone table has five columns:
 **Checkout**, **HEAD**, `Local main vs remote main` (with the repository's own
 default branch name), **Uncommitted changes** and **Branches**. A cell with
@@ -1744,7 +1741,7 @@ panel. Each board image shows the **Board** and **Repositories** switch in the
 toolbar with **Board** selected.
 
 The fourth image is dark, 1600 × 1200, with **Repositories** selected and **Hide
-quiet repositories** checked. It shows the status line with **Check remotes now** and the closed
+quiet repositories** checked. It shows the status line and the closed
 **Checkout folders** control, the pill bar, the quiet line, and the open
 repository with two clones, whose five-column clone table shows the second
 clone's **Details** open.

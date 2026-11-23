@@ -1543,10 +1543,6 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "tick shows the new folders"
     ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
-    # The board-web README names both writes of the Repositories view.
-    assert "(a request for a remote check through `application-serving`)" in board_web
-    assert "whose save is the view's other write (the checkout settings `PUT`)" in board_web
-    assert "the board-settings `PUT`, the checkout settings `PUT` and the remote-check request" in board_web
     assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
     assert "never through this system" in checkouts
     assert (
