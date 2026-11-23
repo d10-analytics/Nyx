@@ -111,7 +111,7 @@
       "never_fetched": "{clone} has never fetched",
       "no_origin_remote": "{clone} has no origin remote",
       "checkout_unavailable": "{clone} could not be read",
-      "finished_stages_not_configured": "No stage counts as finished; choose one under Counts as finished in Board settings",
+      "finished_stages_not_configured": "No stage counts as finished; choose one under Counts as finished in Settings",
       "package_scan_incomplete": "Some work items could not be read",
       "package_scan_unavailable": "Work items could not be read"
     },
@@ -1284,7 +1284,7 @@
 
   // Finished ("terminal") stages the reader has chosen to hide right now.  The
   // set is recomputed on every render because the completion policy can change
-  // when Board settings are saved.  When the box is unchecked the set is empty,
+  // when board settings are saved.  When the box is unchecked the set is empty,
   // so finished rows are treated like any other row.
   function gatedTerminalStages() {
     if (!hideTerminalRows) return new Set();
