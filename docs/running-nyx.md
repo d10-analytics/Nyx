@@ -1641,7 +1641,8 @@ branch takes at most one phrase, in that order. A branch of a finished work item
 never green. Without a red or amber phrase it takes no phrase, and the **Cleanup**
 column in **Details** names what blocks its removal. A merge verdict reads `merged` with the proof that decided
 it (such as `tip is in main` or `pull request #7 merged`), `not merged`, or `merge
-state unknown` with the reason. **Details** opens a clone's row to show its
+state unknown` with the reason. A `merged` verdict is green in **Work item branches**,
+in **Details** and in the work item panel's **All fields**. **Details** opens a clone's row to show its
 path, branches, linked worktrees and work items. The branch and linked-worktree
 tables there each end with a **Cleanup** column. That column names what blocks a
 branch or worktree that is not removable, such as `not merged`, `merge state
