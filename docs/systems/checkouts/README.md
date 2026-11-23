@@ -112,11 +112,11 @@ README is narrative only.
 - Fetching, writing or locking a repository. The board's Repositories view renders
   the served document as it stands (the status line, the attention list, the
   groups and, for folder problems, git availability and diagnostics, a setup
-  panel) and changes no repository: it shows the folders, and its folder editor
-saves them through the checkout settings `PUT` served by `application-serving`,
-never through this system. It
-  takes every fact and attention item from the document; the only things it
-  decides itself are presentation: which finished work items it leaves out
+  panel) and changes no repository: the checkout folders editor is a section of
+  the **Settings** panel, and it saves the folders through the checkout settings
+  `PUT` served by `application-serving`, never through this system. It takes
+  every fact and attention item from the document; the only things it decides
+  itself are presentation: which finished work items it leaves out
   (those with no Code Status), each repository's signal (red, amber, green or
   grey) and pill counts, which repositories the quiet line hides,
   which pull-request lookup state the status line names, where each attention

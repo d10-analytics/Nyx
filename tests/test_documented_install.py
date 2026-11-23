@@ -1554,8 +1554,12 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "When a read is already in flight, the next tick shows the new folders"
     ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
-    assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
-    assert "never through this system" in checkouts
+    assert (
+        "the checkout folders editor is a section of the **Settings** panel, and it saves "
+        "the folders through the checkout settings `PUT` served by `application-serving`, "
+        "never through this system"
+    ) in checkouts
+    assert "it shows the folders, and its folder editor saves them" not in checkouts
     assert (
         "a checkout folder save on the same page requests answers with a scan of the new "
         "folders (or the next tick, when a read was already in flight at the save)"
