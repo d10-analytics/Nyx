@@ -1626,10 +1626,16 @@ only while it has a Code Status, which then names a merge still to make or a
 branch or worktree still to remove. Such a work item adds no branch row, no
 package name and no search text, and does not make its repository quiet. When the
 remaining work items name branches of the repository, the **Work item branches**
-table has one row for each such branch with its remote copy, its merge verdict,
-its pull requests and the work items that name it, each with **Show on board**
-while the board shows its card, even when no listed clone holds the branch. The
-clone table has five columns:
+table has one row for each branch they name. The row shows its remote copy,
+merge verdict, pull requests and work items. Each work item it names has
+**Show on board** while the board shows its card. A branch keeps its row when a
+listed clone holds it or its remote copy reads `on the remote` or `unknown`. A
+branch only the remote holds therefore keeps its row. A branch that no listed
+clone holds has no row when its remote copy reads `not on the remote`. A branch
+of a repository with no remote has no row either, because no copy exists. Such
+a branch has no row only while every listed clone of the repository could be
+read. A branch pushed since the last check appears after **Check remotes now**.
+The clone table has five columns:
 **Checkout**, **HEAD**, `Local main vs remote main` (with the repository's own
 default branch name), **Uncommitted changes** and **Branches**. A cell with
 nothing to report shows a muted `—`. Coloured phrases are red for uncommitted
