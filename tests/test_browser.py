@@ -4766,9 +4766,10 @@ def test_terminal_preference_uses_storage_and_checked_fallback(open_page):
     assert blocked.get_by_label("Hide terminal rows", exact=True).is_checked()
 
 
-# The closed toolbar's flex children flatten through ``display: contents`` below
-# 700 px, so every visible item witnesses its own line: counting distinct top
-# edges counts the wrapped lines, and a larger count means a taller toolbar band.
+# The toolbar's flex children are what its height budget is measured by.  Below
+# 700 px ``display: contents`` flattens the inner containers, so each visible
+# item counts, and a wrapped line the group adds raises the number of distinct
+# top edges.  The baseline below was recorded with this same count.
 TOOLBAR_ROW_COUNT_JS = """() => {
   const items = [];
   const walk = (parent) => {
