@@ -8477,6 +8477,31 @@ def with_unfinished(document, path):
     return checkout_raw_variant(document, mutate)
 
 
+def without_remote_copy(document, name):
+    """One capture whose named Work item branch serves no remote copy at all.
+
+    The collector serves ``remote: None`` for a repository without a remote, so
+    this is that shape without a git world that has no remote.  The parser's
+    cross-field rules are not the subject, so it is not consulted.
+    """
+    def mutate(variant):
+        entry = next(
+            entry for entry in checkout_group(variant, "remote")["package_branches"]
+            if entry["name"] == name
+        )
+        entry["remote"] = None
+    return checkout_raw_variant(document, mutate)
+
+
+def copy_state(document, name):
+    """The served remote copy state of the group's named Work item branch."""
+    entry = next(
+        entry for entry in checkout_group(document, "remote")["package_branches"]
+        if entry["name"] == name
+    )
+    return None if entry["remote"] is None else entry["remote"]["state"]
+
+
 def open_view_checkouts(launch, view_checkouts, document):
     """Open the checkouts view over this fixture's catalog and ``document``."""
     double = BrowserCheckouts(document)
@@ -8774,9 +8799,27 @@ def test_checkouts_groups_rows_and_branches_follow_the_document(
         'table.checkouts-package-branches tr[data-branch="topic-c"]')
     assert topic_c.count() == 0
     assert topic_a.locator(".checkouts-remote-copy").inner_text() == "on the remote (live)"
+    # Every clone of the group was read in each capture whose missing rows this
+    # test asserts, so a missing row means the branch exists nowhere rather
+    # than that a clone could not be read.
+    for capture in (document, checked, view_checkouts.document_recorded):
+        assert [clone["status"] for clone in checkout_group(capture, "remote")["clones"]] == (
+            ["ok"] * len(checkout_group(capture, "remote")["clones"]))
+    assert copy_state(checked, "topic-c") == "absent"
+    assert copy_state(view_checkouts.document_recorded, "topic-c") == "absent"
+    # A live check and the saved check both recorded the branch absent, and no
+    # clone holds it, so there is no row to show.
     serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
-    assert topic_c.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
-
+    assert topic_c.count() == 0
+    serve_checkouts(
+        page, double,
+        with_unfinished(view_checkouts.document_recorded, "Repo/Shipped/gamma"))
+    assert topic_c.count() == 0
+    # A repository with no remote serves no copy at all, which reads as absent.
+    serve_checkouts(
+        page, double,
+        without_remote_copy(with_unfinished(document, "Repo/Shipped/gamma"), "topic-c"))
+    assert topic_c.count() == 0
 
 
 def test_checkouts_freshness_reads_cached_live_and_recorded(
@@ -8908,6 +8951,20 @@ def test_checkouts_search_shows_only_the_matching_group(open_page, view_checkout
     playwright.expect(group).to_be_visible()
     assert group.locator(".checkouts-line-toggle").get_attribute("aria-expanded") == "true"
     playwright.expect(group.locator(".checkouts-group-body")).to_be_visible()
+
+    # A branch that exists nowhere leaves the search text too: the checked
+    # capture recorded its copy absent, while the work item that names it stays
+    # searchable through its target clone.
+    checked = with_unfinished(view_checkouts.document_checked, "Repo/Shipped/gamma")
+    assert copy_state(checked, "topic-c") == "absent"
+    serve_checkouts(page, double, checked)
+    search = group.get_attribute("data-search")
+    assert "topic-c" not in search
+    assert "repo/shipped/gamma" in search
+    page.fill("#filter", "topic-c")
+    playwright.expect(group).to_be_hidden()
+    page.fill("#filter", "repo/shipped/gamma")
+    playwright.expect(group).to_be_visible()
 
 
 def test_checkouts_search_counts_the_quiet_repositories_it_matches(
@@ -9256,10 +9313,35 @@ def test_checkouts_word_tables_show_their_served_values(
     serve_checkouts(page, double, checked)
     assert page.locator(".checkouts-group-check").first.inner_text() == "checked live"
     shows("on the remote (live)")
-    serve_checkouts(page, double, with_unfinished(checked, "Repo/Shipped/gamma"))
-    shows("not on the remote")
     shows("live")
+    # A branch whose copy the check found absent keeps its row while a readable
+    # clone holds it, and its cell reads the absent words.
+    def absent_topic_a(variant):
+        entry = next(
+            entry for entry in checkout_group(variant, "remote")["package_branches"]
+            if entry["name"] == "topic-a"
+        )
+        entry["remote"] = {"state": "absent", "sha": None, "basis": None}
+
+    def absent_while_unreadable(variant):
+        absent_topic_a(variant)
+        _, clone_two = checkout_clone(variant, "Repo Clone 2")
+        set_clone_status(clone_two, "failed")
+
+    serve_checkouts(page, double, checkout_raw_variant(checked, absent_topic_a))
+    topic_a_row = body.locator('table.checkouts-package-branches tr[data-branch="topic-a"]')
+    assert topic_a_row.count() == 1
+    assert topic_a_row.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
+    assert topic_a_row.locator(
+        ".checkouts-work-items .checkouts-package-path").inner_text() == "Repo/Drafts/alpha"
+    # The same branch keeps its row while the only clone that holds it cannot be
+    # read, because the view cannot tell what that clone holds.
+    serve_checkouts(
+        page, double, checkout_raw_variant(checked, absent_while_unreadable))
+    assert topic_a_row.count() == 1
+    assert topic_a_row.locator(".checkouts-remote-copy").inner_text() == "not on the remote"
     # A branch only the remote holds reads its unknown reason in the cell's colour.
+    serve_checkouts(page, double, checked)
     words, ink, cell = verdict_ink(work_item_branches, "topic-d")
     assert words == "merge state unknown — no clone holds its commits"
     assert ink == cell and ink != done
