@@ -4766,31 +4766,55 @@ def test_terminal_preference_uses_storage_and_checked_fallback(open_page):
     assert blocked.get_by_label("Hide terminal rows", exact=True).is_checked()
 
 
-# The toolbar's flex children are what its height budget is measured by.  Below
-# 700 px ``display: contents`` flattens the inner containers, so each visible
-# item counts, and a wrapped line the group adds raises the number of distinct
-# top edges.  The baseline below was recorded with this same count.
-TOOLBAR_ROW_COUNT_JS = """() => {
-  const items = [];
-  const walk = (parent) => {
-    for (const child of parent.children) {
-      if (child.hidden) continue;
-      const display = getComputedStyle(child).display;
-      if (display === 'none') continue;
-      if (display === 'contents') { walk(child); continue; }
-      if (child.getBoundingClientRect().height > 0) items.push(child);
+# The closed toolbar's row count: the wrapped lines its visible controls occupy,
+# counted on the container that lays them out (``.toolbar-actions``, or the
+# toolbar itself once ``display: contents`` flattens that container below 700 px).
+# Items of one flex line overlap vertically, so a line is one group of overlapping
+# boxes.  The bar's font decides those line breaks, so the baseline is measured on
+# the same page: ``baseline`` puts the group back where it was before the move -
+# inside ``.controls`` after the search input, the quiet label beside it - and
+# restores the shipped markup before returning.  Counting rows this way is
+# host-independent; a count of distinct box tops is not, because centred items of
+# one line have different tops whose spread depends on the font.
+TOOLBAR_ROW_COUNT_JS = """(reposition) => {
+  const rowCount = () => {
+    let band = document.querySelector('.toolbar-actions');
+    while (getComputedStyle(band).display === 'contents') band = band.parentElement;
+    const boxes = [];
+    const walk = (parent) => {
+      for (const child of parent.children) {
+        if (child.hidden) continue;
+        const display = getComputedStyle(child).display;
+        if (display === 'none') continue;
+        if (display === 'contents') { walk(child); continue; }
+        const rect = child.getBoundingClientRect();
+        if (rect.height > 0) boxes.push(rect);
+      }
+    };
+    walk(band);
+    boxes.sort((first, second) => first.top - second.top || second.bottom - first.bottom);
+    let rows = 0;
+    let reach = -Infinity;
+    for (const box of boxes) {
+      if (rows === 0 || box.top >= reach - 1) rows += 1;
+      reach = Math.max(reach, box.bottom);
     }
+    return rows;
   };
-  walk(document.querySelector('header.toolbar'));
-  return new Set(items.map((item) =>
-    Math.round(item.getBoundingClientRect().top))).size;
+  if (reposition === 'shipped') return rowCount();
+  const group = document.querySelector('.compact-controls');
+  const filter = document.querySelector('#filter');
+  const quiet = group.querySelector('label[for="hide-quiet-checkouts"]');
+  const actions = document.querySelector('.toolbar-actions');
+  try {
+    filter.after(group);
+    group.after(quiet);
+    return rowCount();
+  } finally {
+    group.append(quiet);
+    actions.prepend(group);
+  }
 }"""
-
-# Measured on the same page and by the same count before the group moved.
-TOOLBAR_BASELINE_ROWS = {
-    ("board", 1280): 2, ("board", 700): 7, ("board", 520): 7,
-    ("checkouts", 1280): 2, ("checkouts", 700): 7, ("checkouts", 520): 7,
-}
 
 TOOLBAR_CONTROLS_JS = """() => {
   const measure = (selector) => {
@@ -4839,6 +4863,12 @@ def test_checkbox_group_sits_left_of_settings_at_every_width_and_view(open_page)
         for width in (1280, 700, 520, 390):
             page.set_viewport_size({"width": width, "height": 800})
             settle_frames(page)
+            # The toolbar keeps no more rows than the same page had before the
+            # group moved, both counted on this browser's own fonts.
+            if width in (1280, 700, 520):
+                rows = page.evaluate(TOOLBAR_ROW_COUNT_JS, "shipped")
+                baseline_rows = page.evaluate(TOOLBAR_ROW_COUNT_JS, "baseline")
+                assert rows <= baseline_rows, (view, width, rows, baseline_rows)
             layout = page.evaluate(TOOLBAR_CONTROLS_JS)
             if view == "board":
                 group = [layout["compact"], layout["terminal"]]
@@ -4865,9 +4895,6 @@ def test_checkbox_group_sits_left_of_settings_at_every_width_and_view(open_page)
                 else:
                     assert _precedes(control, layout["summary"]), (view, width)
             assert _precedes(layout["summary"], layout["viewSwitch"]), (view, width)
-            if width in (1280, 700, 520):
-                rows = page.evaluate(TOOLBAR_ROW_COUNT_JS)
-                assert rows <= TOOLBAR_BASELINE_ROWS[(view, width)], (view, width, rows)
     # One container before the panel holds all three labels, the quiet one last,
     # so no view shows an empty box beside the other view's controls.
     assert page.locator(".toolbar-actions > .compact-controls").count() == 1
