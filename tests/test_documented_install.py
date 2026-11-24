@@ -634,9 +634,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "when the service or application starts again",
         "`checkouts_failed`: the collection failed unexpectedly; it clears when a later "
         "collection publishes a document",
-        "`checkouts_timeout`: the collection did not finish within its budget, 30 "
-        "seconds locally or 60 seconds networked; it clears when a later collection "
-        "finishes in time",
+        "`checkouts_timeout`: the collection did not finish within its budget "
+        "of 60 seconds; it clears when a later collection finishes in time",
         "`checkouts_output_too_large`: the collection's document exceeded the 2 MiB "
         "bound; it clears when a later collection's document fits",
         "`checkouts_protocol_error`: the collection returned a document Nyx could not "

@@ -12,9 +12,9 @@ README is narrative only.
 - `CatalogWorkerManager` serves two worker kinds through one reservation,
   spawn, reader, collect and finalizer path. A catalog fetch scans the
   specification root on a 5-second budget and publishes the `producer_*`
-  categories; a checkouts fetch collects the configured checkout folders once,
-  locally on 30 seconds or networked on 60, and publishes the `checkouts_*`
-  categories. A fetch names its kind, so a catalog worker's command line and
+  categories; a checkouts fetch collects the configured checkout folders once
+  on a 60-second budget, asking each remote as `nyx checkouts` does by default,
+  and publishes the `checkouts_*` categories. A fetch names its kind, so a catalog worker's command line and
   categories are unchanged, and the manager never stores a kind. Both the
   service and the desktop application call `fetch_checkouts` through the
   checkout serving below.
