@@ -1492,7 +1492,7 @@ def test_a_saved_folder_removed_from_disk_still_saves_and_lists_as_missing(
 
 
 def test_reads_inside_the_interval_serve_the_document_and_the_one_at_it_starts_a_run(serving):
-    """S2: a read one second before the interval starts nothing; the next one run."""
+    """A read one second before the interval starts nothing; the next one run."""
 
     runtime, manager, clock = serving.runtime, serving.manager, serving.clock
     observed = _establish_document(serving)
@@ -1525,7 +1525,7 @@ def test_reads_inside_the_interval_serve_the_document_and_the_one_at_it_starts_a
 
 
 def test_an_idle_runtime_starts_nothing_and_its_next_request_checks(serving):
-    """S1: ten intervals with no request start no run and leave no thread."""
+    """Ten intervals with no request start no run and leave no thread."""
 
     runtime, manager, clock = serving.runtime, serving.manager, serving.clock
     _establish_document(serving)

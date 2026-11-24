@@ -12957,7 +12957,7 @@ def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switch
 
     # Installing a changed catalog rewrites the stage section and leaves the
     # folders section alone: focus stays on the second folder's Remove, the same
-    # node (S10).  A restorer that collected both sections would pick the first
+    # node.  A restorer that collected both sections would pick the first
     # control it cannot tell apart.
     page.get_by_role(
         "button", name="Remove checkout folder /work/draft", exact=True).focus()
@@ -12986,7 +12986,7 @@ def test_checkout_folders_draft_and_focus_survive_ticks_installs_and_view_switch
     assert settings.folder_gets == 1
 
     # A checkouts tick that rewrites the folders suggestions leaves the stage
-    # list's focus on the stage control it was on (S11).
+    # list's focus on the stage control it was on.
     page.locator("#stage-order-list .stage-order-item").nth(1).get_by_role(
         "button", name=re.compile(r"^Move .* up$")).focus()
     page.evaluate("() => { window.stageNode = document.activeElement; }")
