@@ -541,10 +541,10 @@ With no folders configured it says `no checkout folders are configured` and
 exits 0.
 
 Checkout folders are set per workspace, in the account's configuration record.
-The **Repositories** view of the board has a **Checkout folders** editor that
-changes them and the GitHub lookup; see [Use the Repositories
-view](#use-the-repositories-view). The same record can be edited by hand when no
-board is running; see [Your specification
+The **Settings** panel of the board has a **Checkout folders** section that
+changes them and the GitHub lookup; see [Change the checkout
+folders](#change-the-checkout-folders). The same record can be edited by hand
+when no board is running; see [Your specification
 workspace](workspaces.md#checkout-folders).
 
 The `--json` document records the revision of the configuration the collection
@@ -568,25 +568,23 @@ prints, and `remote_checks`, the schedule and the last check. A request is
 answered from the latest finished collection, kept in memory: the document's
 `observed_at` is that collection's time, and a `recorded` value keeps the time
 of the check it came from, so the answer says how old it is. Once a document
-exists, a request is answered at once from it; a refresh runs behind the answer
-and the request does not wait for it. The exception is the first request after a
-checkout settings save: the served document was collected under the folders and
-GitHub lookup from before the save, so that request waits for a collection that
-reads the new settings, and the check it waits on is a networked one.
+exists, a request is answered at once from it; a collection runs behind the
+answer and the request does not wait for it. The exception is the first request
+after a settings save: the served document was collected under the settings
+from before the save, so that request waits for a collection that reads the new
+settings. A checkout folders save and a board settings save both mark their
+inputs changed, so the collection that follows either one starts at once,
+outside the interval below.
 
-While checkout data is requested, Nyx refreshes the served answer in the
-background about once a minute, and starts a networked check when none has
-started in this runtime or when five minutes have passed since the last one
-started, so checks run at most every five minutes; while nothing requests
-checkout data, Nyx makes no network call. A board page requests checkout data
-while it is open, so an open board is what keeps that refresh running: Nyx
-refreshes its served document about once a minute, and makes a networked check,
-with the GitHub lookup when it is enabled, at most every five minutes. With no
-checkout folders configured, a collection reaches no repository and makes no
-network call either. A checkout settings save also makes
-the next check due at once, outside that five-minute cadence, so the collection
-that follows a save can start sooner than five minutes after the previous
-check. One collection runs at a time, and at most one waits: a request that
+The cycle is request-driven. While something requests checkout data, Nyx starts
+one collection at most about every three minutes, counted from the start of the
+last one, and every collection scans the configured folders and checks their
+remotes network, with the GitHub lookup when it is enabled. While nothing
+requests checkout data, Nyx makes no network call. A board page requests
+checkout data while it is open, including while its window is hidden, so an
+open board is what keeps the cycle running. With no checkout folders
+configured, a collection reaches no repository and makes no network call
+either. One collection runs at a time, and at most one waits: a request that
 needs a document while one runs shares that collection instead of starting
 another.
 
@@ -596,17 +594,18 @@ its category, and every request for about a minute after it started is answered
 with that category without starting another collection; the first request after
 that minute starts the next collection, which clears the category if it
 succeeds. Once a document exists, a failed background collection does not
-replace it: the old answer keeps serving, and a failed check is not retried
-automatically before its next due time.
+replace it: the old answer keeps serving, and a failed collection is not
+retried automatically before its next due time.
 
 `remote_checks` reports the schedule and the last check. `state` is `running`
-while a check is in flight or waiting and `idle` otherwise. `interval_seconds`
-is 300, and `next_due_at` is when the next check falls due, or null when the
-next request starts one. `last` is null until the runtime's first check
-finishes; then it gives that check's `started_at` and `finished_at`, its
-`outcome` (`completed` or the category of a failed check), and, after a
-completed check, each remote's key with its `check` and `pr_lookup` status and
-reason.
+while a collection is in flight or waiting and `idle` otherwise.
+`interval_seconds` is 180, and `next_due_at` is when the next collection falls
+due, or null when the next request starts one. `last` is null until the
+runtime's first collection finishes; then it gives that collection's
+`started_at` and `finished_at`, its
+`outcome` (`completed` or the category of a failed collection), and, after a
+completed collection, each remote's key with its `check` and `pr_lookup` status
+and reason.
 
 Serving never fetches: a collection reads the configured folders with read-only
 git calls and asks each remote with `git ls-remote`, exactly as `nyx checkouts`
@@ -625,9 +624,8 @@ fails with one category, and each clears in its own way:
   when the service or application starts again.
 - `checkouts_failed`: the collection failed unexpectedly; it clears when a
   later collection publishes a document.
-- `checkouts_timeout`: the collection did not finish within its budget, 30
-  seconds locally or 60 seconds networked; it clears when a later collection
-  finishes in time.
+- `checkouts_timeout`: the collection did not finish within its budget
+  of 60 seconds; it clears when a later collection finishes in time.
 - `checkouts_output_too_large`: the collection's document exceeded the 2 MiB
   bound; it clears when a later collection's document fits.
 - `checkouts_protocol_error`: the collection returned a document Nyx could not
@@ -871,13 +869,14 @@ means a package may exist that the list does not show; rule 3 below never conclu
 tag under its folder name, holding exactly the text
 `nyx checkouts --json` gives for that package; the browser shows what it is
 served and rebuilds nothing. That text comes from Nyx's last successful checkout
-scan: while a board page is open Nyx rescans about once a minute, and the line
-updates on its own. The line is part of the card's
+scan: while a board page is open Nyx rescans about every three minutes, and the
+line updates on its own. The line is part of the card's
 search text. It is hidden while Nyx has no scan to serve, and the issues panel
 then says `Code Status unavailable`. It is also hidden, with no message, while
 the board displays a configuration other than the one the scan was made under.
-A Board settings save on the same page keeps it hidden until a scan under the
-new configuration arrives, up to about 75 seconds. A checkout folder save on the
+A board settings save on the same page keeps it hidden until that save's own
+checkouts read answers with a scan of the new configuration. The page requests
+that read at once. A checkout folder save on the
 same page keeps it hidden only until that save's own checkouts read answers with
 a scan of the new folders, which the page requests at once, and the page installs
 the new catalog itself. When a checkouts read is already in flight at the save,
@@ -1050,8 +1049,9 @@ worktrees` instead. The `--json` document keeps every path.
 
 ## Choose board row order
 
-When account settings are available, the toolbar includes a collapsed **Board settings**
-panel with a row-order editor. It lists the literal stage names known to the current workspace. Use
+When account settings are available, the toolbar includes a collapsed **Settings**
+panel whose **Board** section holds a row-order editor. It lists the literal stage
+names known to the current workspace. Use
 **Move up** and **Move down** to arrange them, then choose **Save**. Save writes
 the order to this account's configuration and the board applies it without moving
 any folders or changing work item state. The saved order is shared by this
@@ -1069,7 +1069,7 @@ can retry. A conflict or reload-needed Save requires that reload, which replaces
 the unsaved draft with the current saved order. Any other failed Save leaves the
 prior saved order and unsaved draft in place so you can retry.
 
-The same collapsed **Board settings** panel also lists **Counts as finished**
+The same collapsed **Settings** panel also lists **Counts as finished**
 beside every literal stage name. Select the stages whose names count as finished,
 then choose **Save** to persist the row order and completion policy together.
 **Cancel** drops both kinds of unsaved change; **Reset** clears the
@@ -1088,7 +1088,7 @@ it loads the saved settings. With an unsaved draft it keeps the draft, disables
 replace this unsaved draft." Choose **Reload board settings** to replace the
 draft with the saved settings; Nyx never discards the draft on its own.
 
-**Click empty space to deselect** is a separate checkbox in Board settings.
+**Click empty space to deselect** is a separate checkbox in **Settings**.
 It starts unchecked, so clicking a selected card again clears the selection.
 When checked, clicking an empty cell, row label, or other empty board space
 also clears it; clicking another card selects that card. The choice applies
@@ -1097,12 +1097,69 @@ available if saved board settings cannot load. **Save**, **Cancel**, and
 **Reset** affect the saved row settings, not this checkbox.
 
 Selecting a stage as finished also marks its rows as terminal on the board. The
-**Hide terminal rows** checkbox in the top bar starts checked, so finished rows
-are hidden until you reveal them, and the choice is stored in the browser like
-**Hide empty rows and columns**. This grouping is presentation only: it does not
-change setup, the catalog, or which dependencies count as satisfied. Every
-discovered stage remains in the catalog; uncheck **Hide terminal rows** to reveal
-finished rows. This is the only control that hides populated stage rows.
+**Hide terminal rows** checkbox left of **Settings** in the top bar starts
+checked. It hides finished rows until you reveal them, and the choice is stored
+in the browser like **Hide empty rows and columns**. This grouping is
+presentation only: it does not change setup, the catalog, or which dependencies
+count as satisfied. Every discovered stage remains in the catalog; uncheck
+**Hide terminal rows** to reveal finished rows. This is the only control that
+hides populated stage rows.
+
+## Change the checkout folders
+
+The **Settings** panel holds a **Checkout folders** section for the active
+workspace's checkout folders and its GitHub lookup. The section is shown unless
+the server offers no checkout state at all. Opening the panel loads the saved
+folders, each listed with a remove button. Type an absolute path in **Checkout
+folder path** and choose **Add** (or press **Enter**); the list changes only as
+a draft until you choose **Save checkout folders**, and **Cancel checkout
+folder changes** drops the draft. Under the path field, **Add** buttons offer the
+parent folders that would bring a package's unseen `Target repo:` checkout into
+view, each with the number of work items it would reveal (`Add /home/me/code (3
+work items)`); these are the `folder_suggestions` of the document, offered once
+a scan is ready, and a folder already in the list is not offered. The checkbox
+**Look up pull requests with the GitHub CLI (gh)** is the workspace's lookup
+switch described under [Inspect checkouts](#inspect-checkouts). It is checked
+for a workspace with no saved settings; clear it to turn the lookup off for this
+workspace.
+
+A save is checked by the server. A folder it refuses stays in the draft with its
+reason beside it (`This folder does not exist.`, `This path is not absolute.`,
+`This path is not a folder.`, `This folder cannot be read.` or `This is not a
+usable path.`) and the status line says `The checkout folders were not saved. Fix
+the marked folders and save again.`; nothing was saved. A folder that is already
+saved is not refused for being missing, so a list keeps saving while one of its
+drives is away. The saved list is sorted and keeps each folder once, so the list
+shown after a save can differ in order from the draft. Saving an empty list
+stores no folders and removes the workspace's saved settings, so the lookup
+returns to its default, on; when the box was cleared before the save, the editor
+adds `With no folders the pull-request lookup setting is not kept.` to its saved
+message.
+
+When the record changed after the editor loaded it, such as a save from another
+page, the save is not applied. (A running board does not notice a hand edit of
+the record, and a save from the editor overwrites it; stop Nyx before editing by
+hand, as [Without the board](workspaces.md#without-the-board) says.) Your draft
+stays, and the status
+says `Save not applied: the checkout folders changed elsewhere.` (or, when the
+saved folders cannot be compared, `the saved checkout folders are not available
+to compare`) beside **Reload checkout folders**, which replaces the draft with
+the saved folders. An editor with no draft reloads quietly when it sees a
+changed record, and one with a draft says `The checkout folders changed elsewhere.`
+and offers the same reload. While that reload is offered, the list, the path
+field, the suggestions and the checkbox take no edits; **Cancel checkout folder
+changes** still drops the draft. The **Board** section and this one share one
+record revision, so a board settings save never marks a folder draft as changed
+elsewhere, and a folder save never marks a board settings draft.
+
+A successful save installs the new catalog on the page and asks at once for a
+scan of the new folders, so the view shows them without waiting for the next
+scan. When a checkouts read is already in flight at the save, that read answers
+with the folders as they were, the page sends no second read, and the view shows
+the new folders at the next ten-second check. The first folder save writes a schema 4 record. A Windows or macOS desktop
+application built before this version refuses a schema 4 record, so rebuild the
+desktop application at this version before the first save there; see [Your
+specification workspace](workspaces.md#checkout-folders).
 
 ## Windows and macOS: the private desktop application
 
@@ -1400,21 +1457,22 @@ is not shown in **Repositories**.
 Nyx checks for changed information every ten seconds, and at once when you return
 to the window. A changed catalog is installed at the next check, at most ten
 seconds after the change, without any button. Your selection, keyboard focus,
-scroll position, search and **Board settings** draft are kept, and the cards that
+scroll position, search and **Settings** draft are kept, and the cards that
 changed are marked for a few seconds.
 
 A card whose package has a Code Status shows a Code Status tag under its
 folder name, holding the same text `nyx checkouts --json` gives for that package.
-Nyx reads it from its last successful checkout scan, and it rescans about once a
-minute while a board page is open, so the line updates on its own;
+Nyx reads it from its last successful checkout scan, and it rescans about every
+three minutes while a board page is open, so the line updates on its own;
 **Search** covers it. While Nyx has no scan to serve, no card
 shows a line and the issues panel says `Code Status unavailable`. With no scan
 served, every declared prerequisite is outstanding. The board then draws every
 arrow, no marker shows, and only a card that declares no prerequisite is teal.
 The lines are
 also hidden, with no message, while the board displays a configuration other
-than the one the scan was made under: for up to about 75 seconds after a Board
-settings save on the same page, until the checkouts read that a checkout folder
+than the one the scan was made under: after a board settings save on the same
+page, until that save's own checkouts read answers with a scan of the new
+configuration, or until the checkouts read that a checkout folder
 save on the same page requests answers with a scan of the new folders (or, when
 a checkouts read was already in flight at the save, until the next ten-second
 check), and, after a configuration change saved elsewhere, until the next check
@@ -1467,9 +1525,12 @@ the same checkout state that `nyx checkouts` prints, read from Nyx's last
 successful checkout scan: the repositories under your configured checkout
 folders, their clones, branches and linked worktrees, and the work items whose
 `Target repo:` or `Branch:` names them. The view shows this state. It never
-changes a repository or a specification file; its only changes are to the
-checkout folders and GitHub lookup of the active workspace, through the **Checkout
-folders** editor described below. See [Inspect checkouts](#inspect-checkouts) for what each value means,
+changes a repository or a specification file. The active workspace's checkout
+folders and GitHub lookup are set in the **Settings** panel, not in this view.
+Its **Checkout folders** section saves them and asks for a scan of the new
+folders, so this view shows them without waiting for the next scan.
+[Change the checkout folders](#change-the-checkout-folders) describes that
+section. [Inspect checkouts](#inspect-checkouts) explains what each value means,
 including the explanation of every code the view shows, which this section does
 not repeat. While **Repositories** is shown, **Search** keeps the repositories
 that match what you type, ignoring case, and hides the others (the field's hint
@@ -1489,7 +1550,7 @@ is entered it counts only the quiet repositories that match, and it is hidden
 when none match. **Hide empty rows and columns** and **Hide terminal rows** give
 way to **Hide quiet repositories**. Switching views never waits for an update: the board is
 always current, and every check reads the latest served scan, which Nyx renews
-at most about once a minute.
+at most about every three minutes.
 
 The line under the heading says how current the page is: `Local state` with the
 time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
@@ -1497,67 +1558,10 @@ time of the scan, `Remotes not checked yet` or `Remotes checked` with a time (or
 time or `Next check at the next refresh`, and whether pull request lookup is
 live, recorded, off or unavailable. When the scan was made under different
 settings from the board shown, the line adds `Collected under different
-settings from the board shown.` Nyx checks the remotes itself at most every
-five minutes while a board page is open, which is what `Next check about` counts
-toward; **Check remotes now** asks for a check immediately instead of waiting
-for the next due one. It reads `Checking remotes…` while the check runs, and a
-note beside it says `Remote check finished.` or `Remote check failed:` with the
-category. Only one check runs at a time, and a server that does not offer remote
-checks says `This server does not offer remote checks.`
-
-The **Checkout folders** control beside the status line opens an editor for the
-active workspace's checkout folders and its GitHub lookup. It appears whenever
-the view shows a scan or a failed collection, and it is closed unless no folder is
-configured, when it opens itself once. Opening it loads the saved folders, each
-listed with a remove button. Type an absolute path in **Checkout folder path**
-and choose **Add** (or press **Enter**); the list changes only as a draft until
-you choose **Save checkout folders**, and **Cancel checkout folder changes**
-drops the draft. Under the path field, **Add** buttons offer the parent folders
-that would bring a package's unseen `Target repo:` checkout into view, each with
-the number of work items it would reveal (`Add /home/me/code (3 work items)`);
-these are the `folder_suggestions` of the document, and a folder already in the
-list is not offered. The checkbox **Look up pull requests with the GitHub CLI
-(gh)** is the workspace's lookup switch described under [Inspect
-checkouts](#inspect-checkouts). It is checked for a workspace with no saved
-settings; clear it to turn the lookup off for this workspace.
-
-A save is checked by the server. A folder it refuses stays in the draft with its
-reason beside it (`This folder does not exist.`, `This path is not absolute.`,
-`This path is not a folder.`, `This folder cannot be read.` or `This is not a
-usable path.`) and the status line says `The checkout folders were not saved. Fix
-the marked folders and save again.`; nothing was saved. A folder that is already
-saved is not refused for being missing, so a list keeps saving while one of its
-drives is away. The saved list is sorted and keeps each folder once, so the list
-shown after a save can differ in order from the draft. Saving an empty list
-stores no folders and removes the workspace's saved settings, so the lookup
-returns to its default, on; when the box was cleared before the save, the editor
-adds `With no folders the pull-request lookup setting is not kept.` to its saved
-message.
-
-When the record changed after the editor loaded it, such as a save from another
-page, the save is not applied. (A running board does not notice a hand edit of
-the record, and a save from the editor overwrites it; stop Nyx before editing by
-hand, as [Without the board](workspaces.md#without-the-board) says.) Your draft
-stays, and the status
-says `Save not applied: the checkout folders changed elsewhere.` (or, when the
-saved folders cannot be compared, `the saved checkout folders are not available
-to compare`) beside **Reload checkout folders**, which replaces the draft with
-the saved folders. An editor with no draft reloads quietly when it sees a
-changed record, and one with a draft says `The checkout folders changed elsewhere.`
-and offers the same reload. While that reload is offered, the list, the path
-field, the suggestions and the checkbox take no edits; **Cancel checkout folder
-changes** still drops the draft. The Board settings editor and this editor share one
-record revision, so a Board settings save never marks a folder draft as changed
-elsewhere, and a folder save never marks a Board settings draft.
-
-A successful save installs the new catalog on the page and asks at once for a
-scan of the new folders, so the view shows them without waiting for the next
-scan. When a checkouts read is already in flight at the save, that read answers
-with the folders as they were, the page sends no second read, and the view shows
-the new folders at the next ten-second check. The first folder save writes a schema 4 record. A Windows or macOS desktop
-application built before this version refuses a schema 4 record, so rebuild the
-desktop application at this version before the first save there; see [Your
-specification workspace](workspaces.md#checkout-folders).
+settings from the board shown.` Nyx checks the remotes itself at most about
+every three minutes while a board page is open, which is what `Next check about`
+counts toward. It reads `Checking remotes…` while the check runs. Only one check
+runs at a time.
 
 The view marks how fresh a value is only where it can be old. A comparison with a
 remote says whether it is `live`, `recorded` with the time (`recorded 14:05`) of
@@ -1634,7 +1638,7 @@ branch only the remote holds therefore keeps its row. A branch that no listed
 clone holds has no row when its remote copy reads `not on the remote`. A branch
 of a repository with no remote has no row either, because no copy exists. Such
 a branch has no row only while every listed clone of the repository could be
-read. A branch pushed since the last check appears after **Check remotes now**.
+read. A branch pushed since the last check appears after the next check.
 The clone table has five columns:
 **Checkout**, **HEAD**, `Local main vs remote main` (with the repository's own
 default branch name), **Uncommitted changes** and **Branches**. A cell with
@@ -1674,10 +1678,11 @@ with the category and when it clears; or, for a scan that ran, a **Checkout
 setup** panel listing a missing Git, a configured folder that does not exist,
 cannot be read or is not a folder, a GitHub CLI that was not found, and the
 scan's own diagnostics. With no folders configured the panel says `No checkout
-folders are configured. Choose Checkout folders above to add one.` and the
-**Checkout folders** editor above the panel opens itself once; the panel holds no
-control of its own. [Checkout folders](workspaces.md#checkout-folders) also
-describes the hand edit for use without the board.
+folders are configured. Choose Checkout folders in Settings to add one.` and the
+panel holds no control of its own. The **Settings** panel's **Checkout folders**
+section is where you add one, and
+[Checkout folders](workspaces.md#checkout-folders) also describes the hand edit
+for use without the board.
 
 ## Capture and review the fictional example
 
@@ -1695,7 +1700,7 @@ example.
 Use an isolated temporary account home outside the repository for every fixture
 setup, start, status, and stop command and the browser session. Stop the owner's
 Nyx instance first, record the SHA-256 of the owner's `.nyx/config/config.json`,
-and verify that `/api/workspace` reports the fixture root before saving Board
+and verify that `/api/workspace` reports the fixture root before saving board
 settings. After visual acceptance, stop the isolated
 instance, remove its temporary home, and confirm the owner's configuration hash
 is unchanged.
@@ -1703,7 +1708,7 @@ is unchanged.
 Capture the views from the running browser at a `1600 × 1200` viewport. Use a
 fresh browser context so the compact preference starts checked and **Board** is
 the selected view. Before saving the
-first image, open **Board settings**, use the row-order editor to move **Queue**
+first image, open **Settings**, use the row-order editor to move **Queue**
 above **Needs Fixes**, check **Counts as finished** beside `Done`, and choose
 **Save**. Keep that saved account-local order and completion policy, and keep
 **Hide terminal rows** checked for all three board images.
@@ -1717,7 +1722,7 @@ and `Community_Resources` project. Confirm the festival's completion prerequisit
 still targets the permit and is served with reason `resolved`. In the actual
 browser, verify there is no workspace or
 refresh issues panel (`#board-issues` must be absent, not merely collapsed or
-hidden). Keep **Board settings** closed in every image.
+hidden). Keep **Settings** closed in every image.
 
 1. Choose **Light**, select **Organize the neighborhood festival**, and save the
    minimal board view as `docs/images/sample-board.png`.
@@ -1744,8 +1749,8 @@ panel. Each board image shows the **Board** and **Repositories** switch in the
 toolbar with **Board** selected.
 
 The fourth image is dark, 1600 × 1200, with **Repositories** selected and **Hide
-quiet repositories** checked. It shows the status line with **Check remotes now** and the closed
-**Checkout folders** control, the pill bar, the quiet line, and the open
+quiet repositories** checked. It shows the status line and the closed
+**Settings** panel, the pill bar, the quiet line, and the open
 repository with two clones, whose five-column clone table shows the second
 clone's **Details** open.
 Create its fictional fixture outside the repository, beside the workspace
@@ -1757,18 +1762,18 @@ without pushing. Run `git fetch` once in each of the three clones before Nyx
 starts: a fresh clone writes no `FETCH_HEAD`, and Nyx would then report it as
 never fetched. Use a short, neutral fixture path such as `/tmp/nyx-capture-fixture`
 (a path under your home directory would show your username).
-Start the isolated instance, choose **Repositories**, and configure the clones'
-parent folder through the **Checkout folders** editor (see [Use the Repositories
-view](#use-the-repositories-view)): add the parent folder, clear the GitHub lookup
-checkbox, and choose **Save checkout folders**; a Board settings save keeps
-that entry. Close the editor again before the capture so only its summary shows.
-Then save the Board
+Start the isolated instance, choose **Repositories**, and open **Settings** (see
+[Change the checkout folders](#change-the-checkout-folders)): add the clones'
+parent folder in its **Checkout folders** section, clear the GitHub lookup
+checkbox, and choose **Save checkout folders**; a board settings save keeps that
+entry. Close **Settings** before the capture so only its summary shows.
+Then save the board
 settings described above, which also clears the
 `finished_stages_not_configured` attention item. If the owner's instance holds
 the control port, run the isolated instance on another free port rather than
 stopping it. Wait until the status line no longer says `Collected under
-different settings from the board shown.`, which follows a Board settings save by
-up to about 75 seconds.
+different settings from the board shown.`, which clears once the checkouts read
+that follows a board settings save answers with a scan of the new settings.
 
 Before saving the fourth image, read the live `/api/checkouts` document: git is
 `available`, there is exactly one folder and its status is `ok`, `diagnostics`

@@ -61,7 +61,6 @@
   const SETTINGS_ROUTE = "/api/settings";
   const WORKSPACE_ROUTE = "/api/workspace";
   const CHECKOUT_SETTINGS_ROUTE = "/api/checkout-settings";
-  const REMOTE_CHECK_ROUTE = "/api/checkouts/remote-check";
   const VIEW_BOARD = "board";
   const VIEW_CHECKOUTS = "checkouts";
   const COMPACT_STORAGE_KEY = "spec-tracker-compact-view";
@@ -112,7 +111,7 @@
       "never_fetched": "{clone} has never fetched",
       "no_origin_remote": "{clone} has no origin remote",
       "checkout_unavailable": "{clone} could not be read",
-      "finished_stages_not_configured": "No stage counts as finished; choose one under Counts as finished in Board settings",
+      "finished_stages_not_configured": "No stage counts as finished; choose one under Counts as finished in Settings",
       "package_scan_incomplete": "Some work items could not be read",
       "package_scan_unavailable": "Work items could not be read"
     },
@@ -351,7 +350,6 @@
       "remotesChecked": "Remotes checked {time}",
       "remoteCheckFailedAt": "Last remote check failed ({outcome}) at {time}",
       "checkingRemotes": "Checking remotes…",
-      "checkRemotes": "Check remotes now",
       "nextCheckAbout": "Next check about {time}",
       "nextCheckAtRefresh": "Next check at the next refresh",
       "lookupLive": "Pull requests live",
@@ -361,11 +359,8 @@
       "notOffered": "This Nyx server does not serve checkout state.",
       "unavailable": "Checkout state is unavailable: {category}.",
       "clearsDefault": "It clears when a later collection succeeds.",
-      "doesNotOfferRemotes": "This server does not offer remote checks.",
-      "runCompleted": "Remote check finished.",
-      "runFailed": "Remote check failed: {category}.",
       "noOriginRemote": "no origin remote",
-      "noFolders": "No checkout folders are configured. Choose Checkout folders above to add one.",
+      "noFolders": "No checkout folders are configured. Choose Checkout folders in Settings to add one.",
       "ghMissing": "The GitHub CLI (gh) was not found; pull request states are not shown.",
       "setupHeading": "Checkout setup",
       "quietLine": "{count} quiet repositories hidden",
@@ -473,13 +468,11 @@
   const viewCheckoutsButton = document.querySelector("#view-checkouts");
   const checkoutsView = document.querySelector("#checkouts");
   const checkoutsStatusLine = document.querySelector("#checkouts-status-line");
-  const checkoutsActionStatus = document.querySelector("#checkouts-action-status");
   const checkoutsBody = document.querySelector("#checkouts-body");
   const checkoutsHeading = document.querySelector("#checkouts-heading");
   // The view's own heading is the last place focus can go when everything it
   // stood on has left.
   checkoutsHeading.setAttribute("tabindex", "-1");
-  const checkRemotesButton = document.querySelector("#check-remotes");
   const foldersEditor = document.querySelector("#checkout-folders-editor");
   const foldersList = document.querySelector("#checkout-folders-list");
   const foldersLookup = document.querySelector("#checkout-folders-github");
@@ -495,6 +488,11 @@
   const workItemPanel = document.querySelector("#work-item-panel");
   const workItemPanelToggle = document.querySelector("#work-item-panel-toggle");
   const workItemPanelBody = document.querySelector("#work-item-panel-body");
+  // The Settings panel holds one section per editor; each editor's controls and
+  // focus restoration stay inside its own section.
+  const stageOrderPanel = document.querySelector("#stage-order-editor");
+  const stageOrderHeading = document.querySelector("#stage-order-heading");
+  const stageOrderSection = document.querySelector("#stage-order-section");
   const stageOrderControls = document.querySelector("#stage-order-controls");
   const stageOrderList = document.querySelector("#stage-order-list");
   const stageOrderSave = document.querySelector("#stage-order-save");
@@ -576,17 +574,11 @@
   // What the editor last drew from the served document, so a tick that
   // settles the same suggestions leaves the editor untouched.
   let foldersSuggestionKey = null;
-  let foldersAutoOpened = false;
   // The last checkouts outcome: "idle", "not_offered", "ready" with its
   // envelope, or "failed" with its category.  "failed" adds a Code Status part
   // to the issues panel, and every settled outcome rewrites the cards' lines.
   let checkoutsOutcome = {state: "idle", envelope: null, failure: null};
   let checkoutsBusy = false;
-  // One press at a time: a press while a request is in flight is remembered as
-  // the single queued POST and sent when that request settles.  The flag stays
-  // set from the press to the POST's settle, so further presses do nothing.
-  let checkoutsCheckRequested = false;
-  let checkoutsQueuedCheck = false;
   // The Code Status line of each rendered card, and the entry it was rendered
   // from, so the in-place update rewrites exactly the line and the search text.
   let cardCodeStatus = new Map();
@@ -825,8 +817,7 @@
   }
 
   function renderStageOrderEditor() {
-    const editor = document.querySelector("#stage-order-editor");
-    const controls = () => [...editor.querySelectorAll("summary, input, button, select")];
+    const controls = () => [...stageOrderSection.querySelectorAll("input, button, select")];
     const focused = document.activeElement;
     const priorControls = controls();
     const priorIndex = priorControls.indexOf(focused);
@@ -849,7 +840,7 @@
       const successor = same || siblings.find((control) => control.dataset.stageMove) ||
         siblings[0] || current.slice(priorIndex + 1).find(operable) ||
         current.slice(0, priorIndex).reverse().find(operable) ||
-        document.querySelector("#stage-order-heading");
+        stageOrderHeading;
       successor.focus();
     };
     stageOrderControls.hidden = !settingsAvailable && !settingsReloadAvailable;
@@ -1296,7 +1287,7 @@
 
   // Finished ("terminal") stages the reader has chosen to hide right now.  The
   // set is recomputed on every render because the completion policy can change
-  // when Board settings are saved.  When the box is unchecked the set is empty,
+  // when board settings are saved.  When the box is unchecked the set is empty,
   // so finished rows are treated like any other row.
   function gatedTerminalStages() {
     if (!hideTerminalRows) return new Set();
@@ -2634,6 +2625,9 @@
       settingsStatus("Board settings saved.");
       renderStageOrderEditor();
       request("settings", payload.revision);
+      // The board settings are new, so the cards' code status follows the read
+      // this save requests, not the next tick's.
+      requestCheckouts();
     }).catch((error) => {
       settingsStatus(`Save failed: ${settingsErrorMessage(error)}`, true);
       renderStageOrderEditor();
@@ -2688,7 +2682,7 @@
   }
 
   function renderFoldersEditor() {
-    const controls = () => [...foldersEditor.querySelectorAll("summary, input, button")];
+    const controls = () => [...foldersEditor.querySelectorAll("input, button")];
     const focused = document.activeElement;
     const prior = controls();
     const priorIndex = prior.indexOf(focused);
@@ -2750,7 +2744,6 @@
     // A request in flight dims every control without removing it from the tab
     // order, so focus stays where the reader put it.
     controls().forEach((control) => {
-      if (control.tagName === "SUMMARY") return;
       // Cancel and Reload are the way out of a reload hold, so it leaves them operable.
       const exit = control === foldersCancel || control === foldersReload;
       const held = foldersHeld() && !(exit && !foldersBusy &&
@@ -2762,7 +2755,7 @@
     // Focus goes back to the same control; a removed folder or a taken
     // suggestion hands it to the next of its kind, else the previous, else the
     // path input; any other control that stopped being operable hands it to the
-    // next operable control, else the previous, else the summary.
+    // next operable control, else the previous, else the panel's summary.
     const current = controls();
     const operable = (control) => control?.isConnected && !control.disabled &&
       !control.closest("[hidden]");
@@ -2775,7 +2768,7 @@
     }
     successor = successor || current.slice(priorIndex + 1).find(operable) ||
       current.slice(0, priorIndex).reverse().find(operable) ||
-      foldersEditor.querySelector("summary");
+      stageOrderHeading;
     successor.focus();
   }
 
@@ -2855,7 +2848,7 @@
           // installs the new revision, and the one checkouts read (skipped when
           // one is in flight) shows the new folders.
           request("manual");
-          requestCheckouts("read");
+          requestCheckouts();
         } else if (answer.outcome === "failure") {
           foldersEditorStatus(codeWords("text", "foldersFailure"), true);
         } else {
@@ -2921,20 +2914,15 @@
       });
   }
 
-  // The editor is shown for a ready or failed outcome and hidden otherwise.
-  // The attribute is written only when it changes, so a tick that settles the
-  // same outcome leaves the editor alone.  The first time a ready document has
-  // no folders the panel opens itself, once.
+  // The editor is shown for every outcome except one that offers no checkout
+  // state at all.  The attribute is written only when it changes, so a tick that
+  // settles the same outcome leaves the editor alone.
   function syncFoldersEditor() {
-    const available = checkoutsOutcome.state === "ready" || checkoutsOutcome.state === "failed";
+    const available = checkoutsOutcome.state !== "not_offered";
     if (foldersEditor.hidden === available) foldersEditor.hidden = !available;
     const key = checkoutsOutcome.state === "ready"
       ? JSON.stringify(foldersSuggestionList()) : null;
     if (available && key !== foldersSuggestionKey) renderFoldersEditor();
-    if (!available || foldersAutoOpened || checkoutsOutcome.state !== "ready" ||
-      checkoutsOutcome.envelope.checkouts.folders.length > 0) return;
-    foldersAutoOpened = true;
-    foldersEditor.open = true;
   }
 
   // Both editors read and write the record's one revision, and each save leaves
@@ -3244,7 +3232,7 @@
   }
 
   function remoteCheckWords(envelope) {
-    if (checkoutsCheckRequested || envelope.remote_checks.state === "running") {
+    if (envelope.remote_checks.state === "running") {
       return codeWords("text", "checkingRemotes");
     }
     const last = envelope.remote_checks.last;
@@ -5210,82 +5198,18 @@
     }
   });
 
-  // Every settle of a pressed check announces its result once, even when it is
-  // the same words as the previous one: one write per settle is one text
-  // change, so a repeated completion or failure is still announced.
-  function setCheckoutsActionStatus(message) {
-    const text = checkoutsActionStatus.firstChild;
-    if (text !== null && text === checkoutsActionStatus.lastChild &&
-      text.nodeType === Node.TEXT_NODE) {
-      text.data = message;
-    } else {
-      checkoutsActionStatus.textContent = message;
-    }
-  }
-
-  function remoteCheckMessage(outcome) {
-    if (outcome.state === "ready") {
-      const last = outcome.envelope.remote_checks.last;
-      if (last !== null && last.outcome === "completed") {
-        return codeWords("text", "runCompleted");
-      }
-      return wordText("text", "runFailed", {
-        category: last !== null ? last.outcome : "checkouts_failed",
-      });
-    }
-    if (outcome.state === "failed") {
-      return wordText("text", "runFailed", {category: outcome.failure});
-    }
-    return codeWords("text", "doesNotOfferRemotes");
-  }
-
-  // The button is written only when its state changes, so a refresh that finds
-  // nothing new changes nothing outside the status line.
-  function renderCheckRemotesButton() {
-    const label = codeWords("text", checkoutsCheckRequested ? "checkingRemotes" : "checkRemotes");
-    if (checkoutsCheckRequested) setAttributeOnce(checkRemotesButton, "aria-disabled", "true");
-    else if (checkRemotesButton.hasAttribute("aria-disabled")) {
-      checkRemotesButton.removeAttribute("aria-disabled");
-    }
-    if (checkRemotesButton.textContent !== label) checkRemotesButton.textContent = label;
-  }
-
-  // One press asks for one remote check.  It is sent at once when nothing is in
-  // flight, and otherwise as the single queued follow-up of the in-flight
-  // request; a second press before the answer does nothing.
-  function pressCheckRemotes() {
-    if (checkoutsCheckRequested) return;
-    checkoutsCheckRequested = true;
-    renderCheckRemotesButton();
-    renderCheckoutsStatusLine();
-    if (checkoutsBusy) {
-      checkoutsQueuedCheck = true;
-      return;
-    }
-    requestCheckouts("check");
-  }
-
   // One checkouts request at most is in flight: a tick or return check that
-  // finds one running is skipped rather than queued, because the
-  // server answers every request with the document it has and rescans at most
-  // once a minute.  A POST queued by Check remotes now is the one exception.
-  function requestCheckouts(kind = "read") {
+  // finds one running is skipped rather than queued, because the server answers
+  // every request with the document it has and starts a collection only when
+  // its one refresh interval has passed.
+  function requestCheckouts() {
     if (checkoutsBusy) return;
     checkoutsBusy = true;
-    const checking = kind === "check";
-    fetch(checking ? REMOTE_CHECK_ROUTE : CHECKOUTS_ROUTE, checking ? {
-      method: "POST",
-      cache: "no-store",
-      headers: {"Content-Type": "application/json"},
-      body: "{}",
-    } : {cache: "no-store"})
+    fetch(CHECKOUTS_ROUTE, {cache: "no-store"})
       .then(async (response) => {
         if (response.status === 404) {
-          // A 404 on the POST means this provider serves checkout state without
-          // a remote-check method, so the shown outcome stays as it is.
-          return checking
-            ? {state: "unchanged", envelope: null, failure: null}
-            : {state: "not_offered", envelope: null, failure: null};
+          // A 404 means this server does not serve checkout state at all.
+          return {state: "not_offered", envelope: null, failure: null};
         }
         let payload = null;
         try {
@@ -5312,37 +5236,17 @@
       .catch(() => ({state: "failed", envelope: null, failure: "checkouts_unavailable"}))
       .then((outcome) => {
         checkoutsBusy = false;
-        if (outcome.state === "unchanged") {
-          setCheckoutsActionStatus(codeWords("text", "doesNotOfferRemotes"));
-        } else {
-          const changed = outcome.state !== checkoutsOutcome.state ||
-            outcome.failure !== checkoutsOutcome.failure;
-          checkoutsOutcome = outcome;
-          // The cards follow every settled outcome, including one that only
-          // rewrites the text they already show.
-          updateCardCodeStatus();
-          if (changed) syncBoardIssues();
-          syncFoldersEditor();
-          if (checking) setCheckoutsActionStatus(remoteCheckMessage(outcome));
-        }
-        // The press state lasts from the press until the request that answers
-        // it settles.  A read hands the press to its queued POST and keeps the
-        // state, so the button and the status line still say a check is running
-        // while that POST is in flight; only a POST's own settle clears it.
-        const handOff = checkoutsQueuedCheck;
-        if (!handOff) {
-          checkoutsCheckRequested = false;
-          renderCheckRemotesButton();
-        }
+        const changed = outcome.state !== checkoutsOutcome.state ||
+          outcome.failure !== checkoutsOutcome.failure;
+        checkoutsOutcome = outcome;
+        // The cards follow every settled outcome, including one that only
+        // rewrites the text they already show.
+        updateCardCodeStatus();
+        if (changed) syncBoardIssues();
+        syncFoldersEditor();
         // Only the shown view is drawn; switching to Checkouts draws the latest
         // outcome, so a tick while the board is shown leaves the board alone.
         if (shownView === VIEW_CHECKOUTS) renderCheckouts();
-        // The press that arrived while a read was in flight is sent now, on
-        // that read's settle, rather than at the next tick.
-        if (handOff) {
-          checkoutsQueuedCheck = false;
-          requestCheckouts("check");
-        }
       });
   }
 
@@ -5491,10 +5395,6 @@
   viewCheckoutsButton.addEventListener("click", () => {
     if (shownView !== VIEW_CHECKOUTS) setShownView(VIEW_CHECKOUTS);
   });
-  checkRemotesButton.addEventListener("click", () => {
-    if (checkRemotesButton.getAttribute("aria-disabled") === "true") return;
-    pressCheckRemotes();
-  });
   stageOrderList.addEventListener("click", (event) => {
     if (settingsBusy && event.target.closest(".stage-completed-toggle")) {
       event.preventDefault();
@@ -5536,8 +5436,10 @@
   stageOrderReload.addEventListener("click", () => {
     if (!settingsBusy) loadSettings();
   });
-  foldersEditor.addEventListener("toggle", () => {
-    if (!foldersEditor.open) return;
+  // Opening the panel is what loads the saved folders; a draft in hand is
+  // redrawn instead, and a hidden section asks for nothing.
+  stageOrderPanel.addEventListener("toggle", () => {
+    if (!stageOrderPanel.open || foldersEditor.hidden) return;
     if (foldersDraft === null) loadFolders();
     else renderFoldersEditor();
   });
@@ -5609,7 +5511,6 @@
   readViewPreference();
   readQuietCheckoutsPreference();
   applyView();
-  renderCheckRemotesButton();
   loadSettings();
   request("manual");
   requestCheckouts();

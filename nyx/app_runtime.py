@@ -4,23 +4,24 @@ The application answers checkout requests from the document it last published
 and refreshes that answer behind the request.  One serial run queue keeps a
 single collection running and at most one waiting; a request without a current
 document is answered by the run it shares or queues, while a request served from
-the published document starts one background refresh only after the local
-refresh interval has passed.  A networked check runs when its interval is due or
-when the remote-check entry point asks for one.  A run that fails with no
+the published document starts one background run only after the one refresh
+interval has passed since the last run started.  Every run collects the
+configured folders and checks their remotes network.  A run that fails with no
 current document answers its waiters with its category and holds further
-requests for one refresh interval, and a configuration change announced through
-``mark_checkouts_changed`` keeps a run that started before it from replacing the
-served document.  Shutdown and start-failure cleanup close the queue first, so
+requests for ``min(REFRESH_INTERVAL, 60)`` seconds from its start, and a
+configuration change announced through ``mark_checkouts_changed`` keeps a run
+that started before it from replacing the served document.  Shutdown and
+start-failure cleanup close the queue first, so
 no run starts once cleanup begins: a queued run's waiters are answered as
 cancelled, and every started run thread is joined within the same deadline.
 
 The active workspace's checkout settings are read and saved beside the board
 settings through one compare-and-save core: the revision compare, the caller's
 content check, the replacement, and the commit-verification reconciliation.  A
-successful checkout settings save replaces the record, updates the captured
+successful save of either kind replaces the record, updates the captured
 configuration and then marks the checkout inputs changed, so the next request
-collects the new folders rather than answering from a document collected
-before them.
+collects a document under the new settings rather than answering from one
+collected before them.
 """
 
 from __future__ import annotations
@@ -45,12 +46,11 @@ from .server import (
 )
 from .worker import CatalogWorkerManager, WorkerError
 
-# A published document is refreshed in the background at most once per local
-# interval and a networked check is due once per remote interval.
-LOCAL_REFRESH_INTERVAL = 60.0
-REMOTE_CHECK_INTERVAL = 300.0
-_CHECK = "check"
-_LOCAL = "local"
+# One interval gates the start of every background run, and every run collects
+# the configured folders and checks their remotes network.
+REFRESH_INTERVAL = 180.0
+# A run that fails with no current document holds further requests this long.
+_CHECKOUTS_FAILURE_HOLD = min(REFRESH_INTERVAL, 60.0)
 
 Deadline = float | Callable[[], float]
 ServerFactory = Callable[..., TrackerServer]
@@ -114,12 +114,11 @@ def _utc_timestamp(instant: float) -> str:
 class _CheckoutsRun:
     """One checkout collection the application has started or queued.
 
-    A queued run decides its kind, change count and start instant only when it
-    starts, so a check requested while it waits is still honoured.
+    A queued run takes its change count and start instant only when it starts,
+    so a mark that arrives while it waits keeps it from publishing.
     """
 
     def __init__(self) -> None:
-        self.kind: str | None = None
         self.change = 0
         self.started_at = ""
         self.started_wall = 0.0
@@ -176,13 +175,11 @@ class ApplicationRuntime:
         self._checkouts_latest_change = 0
         self._checkouts_failure: tuple[str, int, float] | None = None
         self._checkouts_change = 0
-        self._checkouts_local_refresh: float | None = None
         self._checkouts_last_check: dict[str, Any] | None = None
         self._checkouts_last_check_started_at = ""
         self._checkouts_last_check_started_wall = 0.0
         self._checkouts_last_check_started_monotonic: float | None = None
         self._checkouts_last_check_change = 0
-        self._checkouts_check_requested = False
         self._checkouts_running: _CheckoutsRun | None = None
         self._checkouts_pending: _CheckoutsRun | None = None
         self._checkouts_threads: set[threading.Thread] = set()
@@ -398,6 +395,7 @@ class ApplicationRuntime:
             write=write,
             holds=holds,
             shape=self._settings_result,
+            announce=self.mark_checkouts_changed,
         )
 
     def _save_settings_change(
@@ -521,34 +519,6 @@ class ApplicationRuntime:
                     return self._checkouts_envelope(run.document)
                 raise CatalogError(run.error)
 
-    def refresh_remote_checks(self) -> dict[str, Any]:
-        """Queue one networked check for the remote-check entry point.
-
-        The answer is the document of the first run that starts after the
-        request arrives.  A check that fails answers with the served document
-        and its recorded outcome while one is current, and with its category
-        when none is.
-        """
-
-        if not self.catalog_admitted:
-            raise CatalogError("checkouts_unavailable")
-        with self._checkouts_condition:
-            if self._checkouts_queue_closed:
-                raise CatalogError("checkouts_cancelled")
-            self._checkouts_check_requested = True
-            run = self._checkouts_pending
-            if run is None:
-                run = self._queue_checkouts_run()
-            while not run.done:
-                self._checkouts_condition.wait()
-            if run.document is not None:
-                return self._checkouts_envelope(run.document)
-            if run.error == "checkouts_cancelled":
-                raise CatalogError("checkouts_cancelled")
-            if self._checkouts_document_is_current():
-                return self._checkouts_envelope(self._checkouts_latest)
-            raise CatalogError(run.error)
-
     def _checkouts_document_is_current(self) -> bool:
         return (
             self._checkouts_latest is not None
@@ -561,7 +531,7 @@ class ApplicationRuntime:
         if self._checkouts_last_check_change != self._checkouts_change:
             return True
         elapsed = self._clock() - self._checkouts_last_check_started_monotonic
-        return elapsed >= REMOTE_CHECK_INTERVAL
+        return elapsed >= REFRESH_INTERVAL
 
     def _checkouts_open_failure(self) -> tuple[str, int, float] | None:
         failure = self._checkouts_failure
@@ -570,7 +540,7 @@ class ApplicationRuntime:
         _code, change, started = failure
         if change != self._checkouts_change:
             return None
-        if self._clock() - started >= LOCAL_REFRESH_INTERVAL:
+        if self._clock() - started >= _CHECKOUTS_FAILURE_HOLD:
             return None
         return failure
 
@@ -585,11 +555,6 @@ class ApplicationRuntime:
             return
         if self._checkouts_check_is_due():
             self._queue_checkouts_run()
-            return
-        clock = self._checkouts_local_refresh
-        if clock is not None and self._clock() - clock < LOCAL_REFRESH_INTERVAL:
-            return
-        self._queue_checkouts_run()
 
     def _queue_checkouts_run(self) -> _CheckoutsRun:
         run = self._checkouts_pending
@@ -623,15 +588,10 @@ class ApplicationRuntime:
         run.started_wall = time.time()
         run.started_at = _utc_timestamp(run.started_wall)
         run.started_monotonic = self._clock()
-        if self._checkouts_check_requested or self._checkouts_check_is_due():
-            run.kind = _CHECK
-            self._checkouts_check_requested = False
-            self._checkouts_last_check_started_at = run.started_at
-            self._checkouts_last_check_started_wall = run.started_wall
-            self._checkouts_last_check_started_monotonic = run.started_monotonic
-            self._checkouts_last_check_change = run.change
-        else:
-            run.kind = _LOCAL
+        self._checkouts_last_check_started_at = run.started_at
+        self._checkouts_last_check_started_wall = run.started_wall
+        self._checkouts_last_check_started_monotonic = run.started_monotonic
+        self._checkouts_last_check_change = run.change
         thread = threading.Thread(
             target=self._collect_checkouts,
             args=(run,),
@@ -649,7 +609,7 @@ class ApplicationRuntime:
         document: dict[str, Any] | None = None
         failure: str | None = None
         try:
-            payload = self.workers.fetch_checkouts(network=run.kind == _CHECK)
+            payload = self.workers.fetch_checkouts(network=True)
         except WorkerError as error:
             failure = error.code if error.code in _CHECKOUTS_ERRORS else "checkouts_failed"
         except Exception:  # noqa: BLE001 - a run failure must stay category-safe
@@ -700,16 +660,11 @@ class ApplicationRuntime:
                 self._checkouts_latest = document
                 self._checkouts_latest_change = run.change
                 self._checkouts_failure = None
-                self._checkouts_local_refresh = run.started_monotonic
-            if run.kind == _CHECK:
-                self._record_checkouts_check(run, "completed", document)
+            self._record_checkouts_check(run, "completed", document)
         elif failure != "checkouts_cancelled":
             if current and not self._checkouts_document_is_current():
                 self._checkouts_failure = (failure, run.change, run.started_monotonic)
-            if run.kind == _LOCAL and current:
-                self._checkouts_local_refresh = run.started_monotonic
-            if run.kind == _CHECK:
-                self._record_checkouts_check(run, failure, None)
+            self._record_checkouts_check(run, failure, None)
 
     def _record_checkouts_check(
         self,
@@ -748,25 +703,20 @@ class ApplicationRuntime:
             "checkouts": document,
             "remote_checks": {
                 "state": "running" if self._checkouts_check_is_running() else "idle",
-                "interval_seconds": REMOTE_CHECK_INTERVAL,
+                "interval_seconds": REFRESH_INTERVAL,
                 "next_due_at": self._checkouts_next_due_at(),
                 "last": self._checkouts_last_check,
             },
         }
 
     def _checkouts_check_is_running(self) -> bool:
-        running = self._checkouts_running
-        if running is not None and running.kind == _CHECK:
-            return True
-        if self._checkouts_pending is None:
-            return False
-        return self._checkouts_check_requested or self._checkouts_check_is_due()
+        return self._checkouts_running is not None or self._checkouts_pending is not None
 
     def _checkouts_next_due_at(self) -> str | None:
         if self._checkouts_check_is_due():
             return None
         return _utc_timestamp(
-            self._checkouts_last_check_started_wall + REMOTE_CHECK_INTERVAL
+            self._checkouts_last_check_started_wall + REFRESH_INTERVAL
         )
 
     def _close_checkouts_queue(self) -> None:
@@ -1000,6 +950,5 @@ __all__ = [
     "ApplicationPortUnavailableError",
     "ApplicationReadinessError",
     "ApplicationRuntime",
-    "LOCAL_REFRESH_INTERVAL",
-    "REMOTE_CHECK_INTERVAL",
+    "REFRESH_INTERVAL",
 ]

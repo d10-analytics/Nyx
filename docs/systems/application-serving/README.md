@@ -12,17 +12,16 @@ README is narrative only.
 - `CatalogWorkerManager` serves two worker kinds through one reservation,
   spawn, reader, collect and finalizer path. A catalog fetch scans the
   specification root on a 5-second budget and publishes the `producer_*`
-  categories; a checkouts fetch collects the configured checkout folders once,
-  locally on 30 seconds or networked on 60, and publishes the `checkouts_*`
-  categories. A fetch names its kind, so a catalog worker's command line and
+  categories; a checkouts fetch collects the configured checkout folders once
+  on a 60-second budget, asking each remote as `nyx checkouts` does by default,
+  and publishes the `checkouts_*` categories. A fetch names its kind, so a catalog worker's command line and
   categories are unchanged, and the manager never stores a kind. Both the
   service and the desktop application call `fetch_checkouts` through the
   checkout serving below.
 - The Linux service and the desktop application serve checkout state through
   `ApplicationRuntime`: `GET` and `HEAD /api/checkouts` answer with its
-  `get_checkouts()` envelope, `{"checkouts": <document>, "remote_checks": ...}`,
-  and `POST /api/checkouts/remote-check` queues a networked check through
-  `refresh_remote_checks()`. The standalone catalog server offers neither route.
+  `get_checkouts()` envelope, `{"checkouts": <document>, "remote_checks": ...}`.
+  The standalone catalog server offers no checkout route.
 - Both hosts read and save the active workspace's checkout folder settings
   through `ApplicationRuntime`: `GET`/`HEAD /api/checkout-settings` answers
   exactly `{folders, github_lookup, revision}` from the captured configuration,
@@ -36,18 +35,17 @@ README is narrative only.
   entry and answers the same. Both routes share the board settings admission counter
   and operation lock, they answer 503 `settings_unavailable` while admission is
   closed, and the standalone catalog server answers 404.
-- A served document is refreshed in the background once
-  `LOCAL_REFRESH_INTERVAL` (60 s) has passed since the start of the run that
-  published it, or of the latest local run that failed, and a networked check is
-  due once `REMOTE_CHECK_INTERVAL` (300 s) has passed since the last check
-  started; both happen only while a request asks for checkout data. One serial
+- A served document is refreshed by a background run only after
+  `REFRESH_INTERVAL` (180 s) has passed since the start of the last run. Every
+  run collects the configured folders and checks their remotes network. Nothing
+  runs while no request asks for checkout data. One serial
   run queue runs one collection at a time with at most one waiting, and a run
   that publishes replaces the served document only if it started at the current
   change count. `mark_checkouts_changed()` increments that count and starts
-  nothing; every successful checkout settings save calls it after the
-  replacement, so the next request waits for a networked collection of the new
-  folders, outside the five-minute cadence. A board settings save does not mark,
-  because the next local refresh carries a changed stage within a minute.
+  nothing. Both settings saves call it after the replacement, so the next
+  request waits for a collection of the new settings, outside that interval. A
+  run that fails with no current document holds further requests for
+  `min(REFRESH_INTERVAL, 60)` seconds from its start.
 - Board settings and checkout settings are saved through one private
   compare-and-save core that runs, in order, the revision compare, the caller's
   content check, the replacement, and the commit-verification reconciliation

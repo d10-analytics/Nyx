@@ -98,7 +98,7 @@ DESKTOP_GUIDANCE_MARKERS = (
 )
 STAGE_ORDER_GUIDANCE_MARKERS = {
     "README.md": (
-        "The **Board settings** panel saves the board row order in the same "
+        "The **Settings** panel saves the board row order in the same "
         "account-local configuration",
         "account-local",
         "browser and desktop views",
@@ -107,8 +107,8 @@ STAGE_ORDER_GUIDANCE_MARKERS = {
         "does not rename or move",
     ),
     "docs/running-nyx.md": (
-        "the toolbar includes a collapsed **Board settings** panel with a "
-        "row-order editor",
+        "the toolbar includes a collapsed **Settings** "
+        "panel whose **Board** section holds a row-order editor",
         "Move up",
         "Move down",
         "Cancel",
@@ -141,12 +141,12 @@ COMPLETION_GUIDANCE_MARKERS = {
         "Completion Prerequisite: UUID",
         "is the one prerequisite row",
         "literal set of stage names",
-        "Board settings",
+        "**Settings**",
         "workspace root",
         "evidence verification",
     ),
     "docs/running-nyx.md": (
-        "collapsed **Board settings**",
+        "collapsed **Settings**",
         "Counts as finished",
         "**Save** to persist the row order and completion policy together",
         "**Cancel** drops both kinds of unsaved change",
@@ -177,7 +177,7 @@ COMPLETION_GUIDANCE_MARKERS = {
     "docs/specification-reference.md": (
         "is the one prerequisite row",
         "outstanding until the board reads its target as served merged",
-        "collapsed **Board settings**",
+        "collapsed **Settings**",
         "temporarily absent names",
         "recorded workflow assertion",
     ),
@@ -346,7 +346,7 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "The entries are in natural path order",
         "The list is empty when the package scan is unavailable, and it is read from the "
         "filesystem alone, so git's availability cannot change it",
-        "The **Repositories** view of the board has a **Checkout folders** editor that "
+        "The **Settings** panel of the board has a **Checkout folders** section that "
         "changes them and the GitHub lookup",
         "The same record can be edited by hand when no board is running",
         "cannot be combined with `--setup`, `--stop` or `--status`",
@@ -566,9 +566,9 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the remote-tracking branch pruned with `git fetch --prune`, or when a force-push "
         "moved the remote branch back to an older commit",
         "the saved value then stands until a networked run checks again",        "a size bound, a shallow or partial clone or a git older than 2.39",
-        # The served checkout state: where it is answered, its cadence, its
-        # waits, the recorded values and their time, read-only collection, and
-        # each serving category with what clears it.
+        # The served checkout state: where it is answered, its one
+        # request-driven cycle, its waits, the recorded values and their time,
+        # read-only collection, and each serving category with what clears it.
         "### Served checkout state",
         "answer requests for checkout data at the same loopback address that serves the board",
         "the document `nyx checkouts --json` prints, and `remote_checks`, the schedule "
@@ -577,23 +577,28 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "the document's `observed_at` is that collection's time",
         "a `recorded` value keeps the time of the check it came from",
         "Once a document exists, a request is answered at once from it",
-        # A checkout settings save is the one exception to the answer-at-once
-        # rule, and it makes a networked check due outside the five-minute
-        # cadence.
-        "The exception is the first request after a checkout settings save",
-        "the served document was collected under the folders and GitHub lookup from before "
-        "the save",
-        "that request waits for a collection that reads the new settings, and the check it "
-        "waits on is a networked one",
-        "refreshes the served answer in the background about once a minute",
-        "starts a networked check when none has started in this runtime or when five "
-        "minutes have passed since the last one started",
-        "so checks run at most every five minutes",
-        "A checkout settings save also makes the next check due at once, outside that "
-        "five-minute cadence",
-        "the collection that follows a save can start sooner than five minutes after the "
-        "previous check",
-        "while nothing requests checkout data, Nyx makes no network call",
+        # A settings save is the one exception to the answer-at-once rule, and
+        # either save makes a collection start outside the interval.
+        "The exception is the first request after a settings save",
+        "the served document was collected under the settings from before the save",
+        "that request waits for a collection that reads the new settings",
+        "A checkout folders save and a board settings save both mark their inputs "
+        "changed",
+        "the collection that follows either one starts at once, outside the interval "
+        "below",
+        # The one cycle: its interval, that every run checks the remotes network,
+        # that an open window keeps it running, and that nothing runs without a
+        # request.
+        "The cycle is request-driven",
+        "Nyx starts one collection at most about every three minutes, counted from the "
+        "start of the last one",
+        "every collection scans the configured folders and checks their remotes network, "
+        "with the GitHub lookup when it is enabled",
+        "While nothing requests checkout data, Nyx makes no network call",
+        "A board page requests checkout data while it is open, including while its "
+        "window is hidden",
+        "With no checkout folders configured, a collection reaches no repository and "
+        "makes no network call either",
         "One collection runs at a time, and at most one waits",
         "a request that needs a document while one runs shares that collection instead "
         "of starting another",
@@ -603,13 +608,15 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "category",
         "the first request after that minute starts the next collection, which clears "
         "the category if it succeeds",
-        "a failed check is not retried automatically before its next due time",
+        "a failed collection is not retried automatically before its next due time",
         "`remote_checks` reports the schedule and the last check",
-        "`interval_seconds` is 300",
-        "`next_due_at` is when the next check falls due, or null when the next request "
-        "starts one",
-        "`last` is null until the runtime's first check finishes",
-        "gives that check's `started_at` and `finished_at`",
+        "`state` is `running` while a collection is in flight or waiting",
+        "`interval_seconds` is 180",
+        "`next_due_at` is when the next collection falls due, or null when the next "
+        "request starts one",
+        "`last` is null until the runtime's first collection finishes",
+        "it gives that collection's `started_at` and `finished_at`",
+        "`outcome` (`completed` or the category of a failed collection)",
         "each remote's key with its `check` and `pr_lookup` status and reason",
         "Serving never fetches",
         "a collection reads the configured folders with read-only git calls and asks "
@@ -627,9 +634,8 @@ CHECKOUT_GUIDANCE_MARKERS = {
         "when the service or application starts again",
         "`checkouts_failed`: the collection failed unexpectedly; it clears when a later "
         "collection publishes a document",
-        "`checkouts_timeout`: the collection did not finish within its budget, 30 "
-        "seconds locally or 60 seconds networked; it clears when a later collection "
-        "finishes in time",
+        "`checkouts_timeout`: the collection did not finish within its budget "
+        "of 60 seconds; it clears when a later collection finishes in time",
         "`checkouts_output_too_large`: the collection's document exceeded the 2 MiB "
         "bound; it clears when a later collection's document fits",
         "`checkouts_protocol_error`: the collection returned a document Nyx could not "
@@ -852,7 +858,7 @@ def test_documents_remove_stage_hiding_and_retain_finished_rows(name):
         document, re.IGNORECASE,
     )
     assert "Hide terminal rows" in document
-    assert "Board settings" in document
+    assert "**Settings**" in document
 
 
 def test_documents_publish_the_saved_stage_order_contract():
@@ -1217,7 +1223,7 @@ def test_dependency_and_completion_policy_text_matches_the_board():
     assert "asks you to configure completed stages" not in _normalized("docs/workspaces.md")
     assert "actionable configuration explanation" not in _normalized(
         "docs/specification-reference.md")
-    assert ("The completion policy is configured in the collapsed **Board settings** "
+    assert ("The completion policy is configured in the collapsed **Settings** "
             "panel") in _normalized("docs/specification-reference.md")
 
 
@@ -1447,8 +1453,8 @@ def test_the_checkout_guides_describe_the_folder_editor():
     board_web = _normalized("docs/systems/board-web/README.md")
     checkouts = _normalized("docs/systems/checkouts/README.md")
     for marker in (
-        "The **Checkout folders** control beside the status line opens an editor for the "
-        "active workspace's checkout folders and its GitHub lookup",
+        "The **Settings** panel holds a **Checkout folders** section for the active "
+        "workspace's checkout folders and its GitHub lookup",
         "until you choose **Save checkout folders**",
         "(`Add /home/me/code (3 work items)`)",
         "A folder it refuses stays in the draft with its reason beside it",
@@ -1479,13 +1485,13 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "The first folder save writes a schema 4 record",
         "A Windows or macOS desktop application built before this version refuses a "
         "schema 4 record",
-        "its only changes are to the checkout folders and GitHub lookup of the active "
-        "workspace",
+        "The active workspace's checkout folders and GitHub lookup are set in the "
+        "**Settings** panel, not in this view",
         "A checkout folder save on the same page keeps it hidden only until that save's "
         "own checkouts read answers with a scan of the new folders",
-        "Choose Checkout folders above to add one.`",
+        "Choose Checkout folders in Settings to add one.`",
         "also describes the hand edit for use without the board",
-        "configure the clones' parent folder through the **Checkout folders** editor",
+        "add the clones' parent folder in its **Checkout folders** section",
     ):
         assert guide.count(marker) == 1, marker
     assert "Without the board" in workspaces
@@ -1511,20 +1517,21 @@ def test_the_checkout_guides_describe_the_folder_editor():
         ):
             assert stale not in text, (name, stale)
     assert (
-        "The **Repositories** view of the board has a **Checkout folders** editor" in guide
+        "The **Settings** panel of the board has a **Checkout folders** section" in guide
     )
     for text in (readme, board_web, checkouts):
         assert "checkout settings `PUT`" in text
     assert (
-        "and a **Checkout folders** editor that changes the active workspace's checkout "
-        "folders and GitHub lookup. The header search filters it by repository"
+        "Set the active workspace's checkout folders and GitHub lookup in the **Settings** "
+        "panel's **Checkout folders** section"
     ) in readme
     assert (
-        "its editor writes only the checkout settings, through the checkout settings `PUT`"
+        "That section writes only the checkout settings, through the checkout settings `PUT`"
     ) in readme
     assert workspaces.count(
-        "lists. Set them in the browser: choose **Repositories**, open **Checkout folders**, "
-        "add or remove folders and the GitHub lookup, and choose **Save checkout folders**."
+        "lists. Set them in the browser: open the **Settings** panel and its **Checkout "
+        "folders** section. Add or remove folders and the GitHub lookup, and choose "
+        "**Save checkout folders**."
     ) == 1
     assert workspaces.index("Set them in the browser") < workspaces.index("### Without the board")
     assert (
@@ -1539,20 +1546,49 @@ def test_the_checkout_guides_describe_the_folder_editor():
         "read of its own and the lines follow at the next tick)"
     ) in board_web
     assert (
-        "asks for a checkouts read at once, unless one is already in flight, when the next "
-        "tick shows the new folders"
+        "A folder save in the **Settings** panel installs a fresh catalog and asks for a "
+        "checkouts read at once"
+    ) in board_web
+    assert (
+        "When a read is already in flight, the next tick shows the new folders"
     ) in board_web
     assert "change the active workspace's checkout folders and GitHub lookup" in readme
-    # The board-web README names both writes of the Repositories view.
-    assert "(a request for a remote check through `application-serving`)" in board_web
-    assert "whose save is the view's other write (the checkout settings `PUT`)" in board_web
-    assert "the board-settings `PUT`, the checkout settings `PUT` and the remote-check request" in board_web
-    assert "its folder editor saves them through the checkout settings `PUT`" in checkouts
-    assert "never through this system" in checkouts
+    assert (
+        "the checkout folders editor is a section of the **Settings** panel, and it saves "
+        "the folders through the checkout settings `PUT` served by `application-serving`, "
+        "never through this system"
+    ) in checkouts
+    assert "it shows the folders, and its folder editor saves them" not in checkouts
     assert (
         "a checkout folder save on the same page requests answers with a scan of the new "
         "folders (or the next tick, when a read was already in flight at the save)"
     ) in checkouts
+    # The editor is a section of Settings, shown unless the server offers no
+    # checkout state, and no document places it on the Repositories view or says
+    # it opens itself.
+    assert "The **Settings** panel holds a **Checkout folders** section" in guide
+    assert "The section is shown unless the server offers no checkout state at all." in guide
+    assert (
+        "The **Checkout folders** section of **Settings** changes it with the folders"
+    ) in workspaces
+    assert (
+        "The **Checkout folders** section is shown in every state except one where the "
+        "server serves no checkout state"
+    ) in board_web
+    for name, text in (
+        ("README.md", readme),
+        ("docs/running-nyx.md", guide),
+        ("docs/workspaces.md", workspaces),
+        ("docs/systems/board-web/README.md", board_web),
+    ):
+        for stale in (
+            "**Checkout folders** control beside the status line",
+            "opens itself",
+            "opens itself once",
+            "Choose **Repositories**, open **Checkout folders**",
+            "The **Repositories** view of the board has a **Checkout folders** editor",
+        ):
+            assert stale not in text, (name, stale)
 
 
 USER_DOCUMENTS = (
@@ -1573,7 +1609,7 @@ def test_documents_describe_the_automatic_board_update():
         "Nyx checks for changed information every ten seconds, and at once when you "
         "return to the window. A changed catalog is installed at the next check, at "
         "most ten seconds after the change, without any button. Your selection, "
-        "keyboard focus, scroll position, search and **Board settings** draft are "
+        "keyboard focus, scroll position, search and **Settings** draft are "
         "kept, and the cards that changed are marked for a few seconds.",
         "- **An edit has not appeared:** the edit appears at the next check, within "
         "ten seconds, or at once when you return to the window.",
@@ -1673,9 +1709,9 @@ def test_application_serving_readme_states_the_checkout_settings_routes_and_core
         "entry does not already hold",
         "answers 400 `invalid_checkout_folders` with every problem's index and reason",
         "answers exactly `{folders, github_lookup, revision, outcome}`",
-        "every successful checkout settings save calls it after the replacement",
-        "so the next request waits for a networked collection of the new folders, outside "
-        "the five-minute cadence",
+        "Both settings saves call it after the replacement",
+        "so the next request waits for a collection of the new settings, outside that "
+        "interval",
         "Board settings and checkout settings are saved through one private "
         "compare-and-save core",
         "Each save supplies its result shaper, so `/api/settings` keeps its `{order, "

@@ -70,7 +70,7 @@ for `Route preview` to focus on that work.
 
 ## Focus on unfinished work
 
-Open **Board settings**, select **Counts as finished** beside `Done` only, and
+Open **Settings**, select **Counts as finished** beside `Done` only, and
 choose **Save**. Check **Hide terminal rows** to hide its finished row. This
 records `Done` as a finished stage for whole work items. It changes no arrow: a
 target that stays unmerged is still an outstanding prerequisite.

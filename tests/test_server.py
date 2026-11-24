@@ -16,7 +16,7 @@ import pytest
 from test_checkouts import NOT_ROOT, isolate_git
 
 from nyx import server, state
-from nyx.app_runtime import REMOTE_CHECK_INTERVAL, ApplicationRuntime
+from nyx.app_runtime import REFRESH_INTERVAL, ApplicationRuntime
 from nyx.models import (
     SCHEMA_VERSION,
     ProtocolError,
@@ -241,6 +241,11 @@ def head_request(port, path):
     body = response.read()
     connection.close()
     return response.status, headers, body
+
+
+# A path no server routes, so a proof can compare a path against the answer an
+# address outside the published surface receives.
+_UNROUTED_PATH = "/api/checkouts/unrouted"
 
 
 class SettingsStub:
@@ -884,7 +889,7 @@ def test_application_checkouts_route_serves_the_published_envelope(tmp_path, mon
         remote_checks = envelope["remote_checks"]
         assert set(remote_checks) == {"state", "interval_seconds", "next_due_at", "last"}
         assert remote_checks["state"] == "idle"
-        assert remote_checks["interval_seconds"] == REMOTE_CHECK_INTERVAL
+        assert remote_checks["interval_seconds"] == REFRESH_INTERVAL
         assert isinstance(remote_checks["next_due_at"], str)
         document = parse_checkouts(envelope["checkouts"])
         assert document["folders"] == []
@@ -905,12 +910,13 @@ def test_application_checkouts_routes_reject_other_methods_and_foreign_hosts():
         for method in ("POST", "PUT", "DELETE"):
             assert request(port, method, "/api/checkouts")[0] == 405
         for method in ("GET", "PUT", "OPTIONS"):
-            assert request(port, method, "/api/checkouts/remote-check")[0] == 405
+            assert request(port, method, "/api/checkouts/remote-check") == request(
+                port, method, _UNROUTED_PATH
+            )
         assert request(port, "GET", "/api/checkouts", host=f"outside.invalid:{port}")[0] == 404
-        status, _, _ = request(
+        assert request(
             port, "GET", "/api/checkouts/remote-check", host=f"127.0.0.1:{port + 1}"
-        )
-        assert status == 404
+        ) == request(port, "GET", _UNROUTED_PATH, host=f"127.0.0.1:{port + 1}")
 
 
 def test_standalone_server_hides_the_checkout_paths():
@@ -918,8 +924,12 @@ def test_standalone_server_hides_the_checkout_paths():
         assert request(port, "GET", "/api/checkouts")[0] == 404
         assert request(port, "HEAD", "/api/checkouts")[0] == 404
         assert request(port, "POST", "/api/checkouts")[0] == 404
-        assert request(port, "GET", "/api/checkouts/remote-check")[0] == 404
-        assert request(port, "POST", "/api/checkouts/remote-check", body="{}")[0] == 404
+        assert request(port, "GET", "/api/checkouts/remote-check") == request(
+            port, "GET", _UNROUTED_PATH
+        )
+        assert request(port, "POST", "/api/checkouts/remote-check", body="{}") == request(
+            port, "POST", _UNROUTED_PATH, body="{}"
+        )
 
 
 def _checkouts_double_envelope():
@@ -927,7 +937,7 @@ def _checkouts_double_envelope():
         "checkouts": {"marker": "served by the installed provider"},
         "remote_checks": {
             "state": "idle",
-            "interval_seconds": REMOTE_CHECK_INTERVAL,
+            "interval_seconds": REFRESH_INTERVAL,
             "next_due_at": None,
             "last": None,
         },
@@ -960,63 +970,12 @@ def test_application_checkouts_route_maps_an_unexpected_provider_failure():
     assert b"private capture details" not in body
 
 
-def test_application_remote_check_route_requires_a_json_object_body():
-    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
-    envelope = _checkouts_double_envelope()
-    calls = []
-
-    def refresh():
-        calls.append(True)
-        return envelope
-
-    application.refresh_remote_checks = refresh
-    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
-        status, _, body = request(
-            port,
-            "POST",
-            "/api/checkouts/remote-check",
-            body="{}",
-            content_type="text/plain",
+def test_the_remote_check_path_is_answered_as_any_unrouted_path():
+    """The removed check entry point answers exactly as an unknown path does."""
+    with RunningServer(StubClient(catalog=valid_catalog()), SettingsStub()) as port:
+        assert request(port, "POST", "/api/checkouts/remote-check", body="{}") == request(
+            port, "POST", _UNROUTED_PATH, body="{}"
         )
-        assert status == 400
-        assert json.loads(body) == {"error": "invalid_payload"}
-        assert request(port, "POST", "/api/checkouts/remote-check", body="[]")[0] == 400
-        assert request(port, "POST", "/api/checkouts/remote-check", body="")[0] == 400
-        assert calls == []
-
-        status, content_type, body = request(
-            port, "POST", "/api/checkouts/remote-check", body="{}"
-        )
-    assert status == 200
-    assert content_type == "application/json"
-    assert json.loads(body) == envelope
-    assert calls == [True]
-
-
-def test_application_remote_check_route_rejects_a_body_over_the_limit():
-    application = ApplicationRuntime(port=0, deadline=time.monotonic() + 5)
-    envelope = _checkouts_double_envelope()
-    calls = []
-
-    def refresh():
-        calls.append(True)
-        return envelope
-
-    application.refresh_remote_checks = refresh
-    with RunningServer(StubClient(catalog=valid_catalog()), application) as port:
-        padded = "{}" + " " * 1024
-        assert len(padded.encode("utf-8")) > 1024
-        status, content_type, body = request(
-            port,
-            "POST",
-            "/api/checkouts/remote-check",
-            body=padded,
-            content_type="application/json",
-        )
-        assert status == 400
-        assert content_type == "application/json"
-        assert json.loads(body) == {"error": "invalid_payload"}
-        assert calls == []
 
 
 def test_real_application_settings_http_rejects_stale_and_invalid_writes_and_preserves_failure():

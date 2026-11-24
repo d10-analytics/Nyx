@@ -31,7 +31,7 @@ README is narrative only.
   when the page becomes visible or the window regains focus, with no button and
   no pending state. It keeps the reader's place across an install: the selected
   card and its panel, the position of the focused or selected card when it keeps
-  its row and column, the window scroll, the search and the Board settings draft,
+  its row and column, the window scroll, the search and the **Settings** draft,
   and it marks the new or changed cards for a few seconds. Keyboard focus on a
   card that still exists stays with it; focus inside the work item panel is kept
   by the panel's own rewrite on every cause (an install, a checkout scan, a
@@ -74,10 +74,11 @@ README is narrative only.
   count and a ring for the Baseline's place, with `?` for what cannot be
   read or counted and an underline for a cached main: the text `nyx checkouts --json` gives and the line's words, searchable
   with the card's other text and rewritten in place on each scan. The text is Nyx's last successful checkout scan, and Nyx rescans
-  about once a minute while a board page is open.
+  about every three minutes while a board page is open.
 - Shows a line only while the served document was scanned under the configuration
-  the board displays, so a Board settings save on the same page hides every line
-  until the next scan, for up to about 75 seconds, and a configuration change
+  the board displays, so a board settings save on the same page hides every line
+  until that save's own checkouts read answers with a scan of the new settings,
+  and a configuration change
   saved elsewhere hides them until the next check installs the new catalog;
   a checkout folder save on the same page hides them only until its own
   checkouts read answers with a scan of the new folders, and the page installs
@@ -86,13 +87,23 @@ README is narrative only.
   line and adds a `Code Status unavailable` issues-panel part, and a
   configuration mismatch adds no entry.
 
+- Holds the header's **Settings** disclosure, whose content is bounded to a
+  share of the viewport and scrolls. Its **Board** section holds the **Click
+  empty space to deselect** preference, the stage row order and **Counts as
+  finished**. Its **Checkout folders** section loads and saves the checkout
+  settings, with the server's answer for each outcome. Each section keeps its
+  own draft, status line and focus restoration. Both read the record's one
+  configuration revision, so a save in one section moves the other only while
+  it holds no draft. The **Checkout folders** section is shown in every state
+  except one where the server serves no checkout state. Opening the panel loads
+  the saved folders when no draft is held. The section offers the document's
+  `folder_suggestions` once a ready document exists, and shows the folders the
+  server refused beside them.
 - Shows the Repositories view beside the board, chosen with a header switch whose
   choice and **Hide quiet repositories** are browser-local preferences. The view
-  renders the served checkouts document: a status line with **Check remotes
-  now** (a request for a remote check through `application-serving`) and the
-  **Checkout folders** editor, whose save is the view's other write (the
-  checkout settings `PUT`), a **Needs attention** bar of pills with page totals
-  whose lists open below it and whose items focus the branch, clone, worktree or
+  renders the served checkouts document: a status line, a **Needs attention**
+  bar of pills with page totals whose lists open
+  below it and whose items focus the branch, clone, worktree or
   **Work item branches** row they name (a branch item opens the clone's
   **Details** first) or select a work item's card, and one line per repository
   that opens and closes its tables. A line has a coloured left edge, red for work
@@ -127,19 +138,15 @@ README is narrative only.
   board; a refresh replaces only the blocks that changed, so what the reader
   opened and focused stays. A panel
   replaces the groups when the server serves no checkout state, a collection
-  failed, or no folders are configured. The **Checkout folders** editor, shown
-  while the view has a scan or a failed collection, loads and saves the
-  checkout settings (folders, GitHub lookup and revision) with the server's
-  answer for each outcome, offers the document's `folder_suggestions`, shows the
-  folders the server refused beside them and shares one configuration revision
-  with the Board settings editor. A successful save installs a fresh catalog and
-  asks for a checkouts read at once, unless one is already in flight, when the
-  next tick shows the new folders; the view changes no repository.
+  failed, or no folders are configured. The view changes no repository and no
+  setting. A folder save in the **Settings** panel installs a fresh catalog and
+  asks for a checkouts read at once. When a read is already in flight, the next
+  tick shows the new folders.
 
 ## Outside this boundary
 
-- Any write other than the board-settings `PUT`, the checkout settings `PUT` and
-  the remote-check request; editing specification files.
+- Any write other than the board-settings `PUT` and the checkout settings
+  `PUT`; editing specification files.
 
 ## Collaborators
 

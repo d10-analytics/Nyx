@@ -112,11 +112,11 @@ README is narrative only.
 - Fetching, writing or locking a repository. The board's Repositories view renders
   the served document as it stands (the status line, the attention list, the
   groups and, for folder problems, git availability and diagnostics, a setup
-  panel) and changes no repository: it shows the folders, and its folder editor
-saves them through the checkout settings `PUT` served by `application-serving`,
-never through this system. It
-  takes every fact and attention item from the document; the only things it
-  decides itself are presentation: which finished work items it leaves out
+  panel) and changes no repository: the checkout folders editor is a section of
+  the **Settings** panel, and it saves the folders through the checkout settings
+  `PUT` served by `application-serving`, never through this system. It takes
+  every fact and attention item from the document; the only things it decides
+  itself are presentation: which finished work items it leaves out
   (those with no Code Status), each repository's signal (red, amber, green or
   grey) and pill counts, which repositories the quiet line hides,
   which pull-request lookup state the status line names, where each attention
@@ -124,11 +124,12 @@ never through this system. It
   document's Code Status as a card tag, and the work item's other served facts
   in its work item panel, and never derives, rescans or ages them:
   the line holds the text `nyx checkouts --json` gives from the last successful
-  scan, refreshed about once a minute by `application-serving` and updated in
-  place on its own, searchable with the card's other
+  scan, refreshed about every three minutes by `application-serving` and updated
+  in place on its own, searchable with the card's other
   text, and hidden while the served document's `configuration_revision` differs
-  from the displayed catalog's, which adds no entry and lasts for up to about
-  75 seconds after a Board settings save on the same page, until the checkouts
+  from the displayed catalog's, which adds no entry and lasts after a board
+  settings save on the same page until that save's own checkouts read answers
+  with a scan of the new settings, until the checkouts
   read that a checkout folder save on the same page requests answers with a scan
   of the new folders (or the next tick, when a read was already in flight at the
   save), or, after a configuration change saved elsewhere, until

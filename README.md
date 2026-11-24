@@ -36,22 +36,22 @@ document. The work item panel's **Needs** list names the selected card's
 outstanding prerequisites, with the reason for each.
 
 Search helps you find work by its title, project, or program—a named group of
-related specifications. Mark finished stages in **Board settings** and use
+related specifications. Mark finished stages in **Settings** and use
 **Hide terminal rows** to focus on unfinished work. Uncheck it to reveal finished
 rows.
 
 The **Repositories** view, chosen with the switch in the header, shows the git
 state of your configured checkout folders beside the board: a **Needs
-attention** list, each repository's clones and branches, a **Check remotes
-now** button, and a **Checkout folders** editor that changes the active
-workspace's checkout folders and GitHub lookup. The header search filters it by
-repository, checkout, branch and work item names and paths, Code Status text,
-and the availability, HEAD and tree words of clone rows (the guide lists every
-field). It reads the same state as `nyx checkouts` and changes no repository;
-its editor writes only the checkout settings, through the checkout settings
-`PUT`.
-It is described in [Use the Repositories
-view](docs/running-nyx.md#use-the-repositories-view).
+attention** list and each repository's clones and branches. The header search
+filters it by repository, checkout, branch and work item names and paths, Code
+Status text, and the availability, HEAD and tree words of clone rows (the guide
+lists every field). It reads the same state as `nyx checkouts` and changes no
+repository. Set the active workspace's checkout folders and GitHub lookup in
+the **Settings** panel's **Checkout folders** section. That section writes only
+the checkout settings, through the checkout settings `PUT`.
+The view is described in [Use the Repositories
+view](docs/running-nyx.md#use-the-repositories-view), and the section in
+[Change the checkout folders](docs/running-nyx.md#change-the-checkout-folders).
 
 Your plans stay in files you can edit, keep in version control, and use with
 other tools. On Linux, Nyx runs locally as a background service and opens in
@@ -99,7 +99,7 @@ finished.
 Setup saves the workspace location for your account on this host. This setup
 choice is separate from the browser's personal
 **Hide empty rows and columns** and **Hide terminal rows** preferences, which are
-stored only in that browser. The **Board settings** panel saves the board row order in the same account-local
+stored only in that browser. The **Settings** panel saves the board row order in the same account-local
 configuration, shared by that account's browser and desktop views. The saved order
 survives browser reload and a supported Nyx restart, and is keyed by workspace root:
 switching from workspace A to workspace B does not apply A's order, while returning
@@ -111,7 +111,7 @@ options.
 
 `Completion Prerequisite: UUID` is the one prerequisite row. It names one whole
 work item as a prerequisite. A prerequisite is outstanding until the board reads
-its target as served merged on `main`. **Board settings** holds a
+its target as served merged on `main`. **Settings** holds a
 literal set of stage names that you pick beside **Counts as finished**. That
 setting decides only which cards are finished rows, which rows **Hide terminal
 rows** hides, and the Code Status that `nyx checkouts` reports. Nyx does not
@@ -121,12 +121,13 @@ the account-local configuration for the current workspace root. Another root can
 use a different set, and returning to this root restores its own choice.
 
 The same finished-stage selection drives the board's **Hide terminal rows**
-control in the top bar. It starts checked, so rows for finished stages are hidden
-until you reveal them, and the preference lives in the browser like **Hide empty
-rows and columns**. This is presentation only: it never changes setup, the
-catalog, or which prerequisites are outstanding. Every discovered stage has rows
-in the catalog; **Hide terminal rows** is the only control that hides populated
-stage rows. Unchecking it reveals finished rows and their cards.
+control left of **Settings** in the top bar. It starts checked, so rows for
+finished stages are hidden until you reveal them, and the preference lives in
+the browser like **Hide empty rows and columns**. This is presentation only: it
+never changes setup, the catalog, or which prerequisites are outstanding. Every
+discovered stage has rows in the catalog; **Hide terminal rows** is the only
+control that hides populated stage rows. Unchecking it reveals finished rows and
+their cards.
 
 Nyx stores configuration and runtime state in `.nyx` inside your home directory.
 This is intentionally a fresh state root: legacy Linux state is neither read nor
